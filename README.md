@@ -26,7 +26,7 @@ Run:
 
 The portable output is `release\NetBootDhcpTool`. Copy this folder to another Windows x64 computer and run `NetBootDhcpTool.exe`.
 
-For the full packaging and GitHub release standard, see `docs\RELEASE_PROCESS.md`.
+For maintenance, packaging, and GitHub release standards, see `docs\MAINTENANCE_GUIDE.md` and `docs\RELEASE_PROCESS.md`.
 
 The build scripts use an existing .NET SDK when available. If no SDK is installed, they download a .NET 8 SDK into `.dotnet` under this project.
 

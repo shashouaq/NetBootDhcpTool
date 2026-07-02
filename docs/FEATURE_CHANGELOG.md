@@ -2,6 +2,12 @@
 
 ## 2026-07-02
 
+- Type: Documentation
+- Affected files/modules: `docs/MAINTENANCE_GUIDE.md`, `docs/RELEASE_PROCESS.md`, `README.md`, `docs/FEATURE_CHANGELOG.md`
+- Concrete change: Added a maintenance guide covering standard change flow, required change-log entries, validation expectations, GitHub commit/push requirements, version upgrade steps, GitHub Release asset handling, cleanup policy, and future upgrade detection contract. Linked the guide from README and release process documentation.
+- Verification: Lightweight documentation checks passed with conflict-marker scan, `git diff --check`, and local secret scan outside generated/release/log folders. `git status -sb` confirmed only intended documentation files were changed.
+- User impact: Future maintenance and upgrade work has a single operating manual, and completed changes must be synchronized to GitHub before handoff.
+
 - Type: Repository housekeeping
 - Affected files/modules: `release/`, `src/**/bin`, `src/**/obj`, `docs/FEATURE_CHANGELOG.md`
 - Concrete change: Removed stale local release directories and archives for versions older than `v1.0.6`, removed the obsolete `NetBootDhcpTool-fd` release folder, and cleared generated `bin`/`obj` build caches from all source projects. Kept the current portable release, tools folder, versioned `v1.0.6` folder, archive, checksum, `latest.json`, and run instructions.

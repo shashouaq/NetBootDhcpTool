@@ -2,6 +2,8 @@
 
 This project uses a single repeatable release path for local packaging and GitHub distribution.
 
+For day-to-day maintenance, required change-log practice, GitHub synchronization, and upgrade work, start with `docs\MAINTENANCE_GUIDE.md`.
+
 ## Version Source
 
 - The application version is defined in `src/NetBootDhcpTool.App/NetBootDhcpTool.App.csproj`.
@@ -44,6 +46,8 @@ The publish script must test the `.7z` archive before the release is considered 
 
 ## GitHub Release Standard
 
+Every finished source change must be committed and pushed to `https://github.com/shashouaq/NetBootDhcpTool` before handoff. Every version upgrade must also push its tag and update the GitHub Release assets.
+
 Create a GitHub Release with:
 
 - Tag: `v<version>`
@@ -55,12 +59,20 @@ Create a GitHub Release with:
 
 Release notes must be extracted and polished from `docs/FEATURE_CHANGELOG.md`. Do not write release notes without a matching change log entry.
 
+After creating or updating a release, verify:
+
+```powershell
+& "C:\Program Files\GitHub CLI\gh.exe" release view v<version> --repo shashouaq/NetBootDhcpTool
+$r = Invoke-WebRequest -Uri "https://github.com/shashouaq/NetBootDhcpTool/releases/latest/download/latest.json" -UseBasicParsing
+[System.Text.Encoding]::UTF8.GetString($r.Content)
+```
+
 ## Future Upgrade Detection
 
 The application should later check this URL:
 
 ```text
-https://github.com/owner/repo/releases/latest/download/latest.json
+https://github.com/shashouaq/NetBootDhcpTool/releases/latest/download/latest.json
 ```
 
 The manifest contains:
