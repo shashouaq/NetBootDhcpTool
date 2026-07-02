@@ -2,6 +2,12 @@
 
 ## 2026-07-02
 
+- Type: Repository housekeeping
+- Affected files/modules: `release/`, `src/**/bin`, `src/**/obj`, `docs/FEATURE_CHANGELOG.md`
+- Concrete change: Removed stale local release directories and archives for versions older than `v1.0.6`, removed the obsolete `NetBootDhcpTool-fd` release folder, and cleared generated `bin`/`obj` build caches from all source projects. Kept the current portable release, tools folder, versioned `v1.0.6` folder, archive, checksum, `latest.json`, and run instructions.
+- Verification: Confirmed `release/` only contains current `v1.0.6` release assets and confirmed no `src/**/bin` or `src/**/obj` directories remain. Full build was skipped to keep generated caches removed; prior `v1.0.6` release build and GitHub asset verification remain current.
+- User impact: The workspace is smaller and easier to maintain while preserving the current release and future upgrade-check assets.
+
 - Type: Release process standardization
 - Affected files/modules: `build/publish.ps1`, `docs/RELEASE_PROCESS.md`, `docs/RELEASE_NOTES.md`, `README.md`
 - Concrete change: Standardized packaging around the app project version, added SHA256 and `latest.json` release manifest generation, documented the GitHub release asset standard, added release notes extracted from the change log, and defined the future upgrade-check manifest URL and verification expectations.
