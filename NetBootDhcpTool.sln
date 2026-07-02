@@ -1,0 +1,48 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NetBootDhcpTool.App", "src\NetBootDhcpTool.App\NetBootDhcpTool.App.csproj", "{1C47E2AD-4838-4D02-8F20-7A9D65B17F42}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NetBootDhcpTool.Core", "src\NetBootDhcpTool.Core\NetBootDhcpTool.Core.csproj", "{9C7F4B55-6F8C-4C36-A915-D2F11C4D0485}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NetBootDhcpTool.Network", "src\NetBootDhcpTool.Network\NetBootDhcpTool.Network.csproj", "{64F82A77-D55D-438E-A2E3-058F4D680128}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NetBootDhcpTool.Dhcp", "src\NetBootDhcpTool.Dhcp\NetBootDhcpTool.Dhcp.csproj", "{A02B0671-BE0F-44B0-B612-5AA3478FA892}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NetBootDhcpTool.Tests", "src\NetBootDhcpTool.Tests\NetBootDhcpTool.Tests.csproj", "{E1989B10-733A-4334-9474-A929EA94B188}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NetBootDhcpTool.DhcpVerifier", "src\NetBootDhcpTool.DhcpVerifier\NetBootDhcpTool.DhcpVerifier.csproj", "{E9578BA5-2789-4639-A030-F180A57724CD}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{1C47E2AD-4838-4D02-8F20-7A9D65B17F42}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{1C47E2AD-4838-4D02-8F20-7A9D65B17F42}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{1C47E2AD-4838-4D02-8F20-7A9D65B17F42}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{1C47E2AD-4838-4D02-8F20-7A9D65B17F42}.Release|Any CPU.Build.0 = Release|Any CPU
+		{9C7F4B55-6F8C-4C36-A915-D2F11C4D0485}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{9C7F4B55-6F8C-4C36-A915-D2F11C4D0485}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{9C7F4B55-6F8C-4C36-A915-D2F11C4D0485}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{9C7F4B55-6F8C-4C36-A915-D2F11C4D0485}.Release|Any CPU.Build.0 = Release|Any CPU
+		{64F82A77-D55D-438E-A2E3-058F4D680128}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{64F82A77-D55D-438E-A2E3-058F4D680128}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{64F82A77-D55D-438E-A2E3-058F4D680128}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{64F82A77-D55D-438E-A2E3-058F4D680128}.Release|Any CPU.Build.0 = Release|Any CPU
+		{A02B0671-BE0F-44B0-B612-5AA3478FA892}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{A02B0671-BE0F-44B0-B612-5AA3478FA892}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{A02B0671-BE0F-44B0-B612-5AA3478FA892}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{A02B0671-BE0F-44B0-B612-5AA3478FA892}.Release|Any CPU.Build.0 = Release|Any CPU
+		{E1989B10-733A-4334-9474-A929EA94B188}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{E1989B10-733A-4334-9474-A929EA94B188}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{E1989B10-733A-4334-9474-A929EA94B188}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{E1989B10-733A-4334-9474-A929EA94B188}.Release|Any CPU.Build.0 = Release|Any CPU
+		{E9578BA5-2789-4639-A030-F180A57724CD}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{E9578BA5-2789-4639-A030-F180A57724CD}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{E9578BA5-2789-4639-A030-F180A57724CD}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{E9578BA5-2789-4639-A030-F180A57724CD}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal

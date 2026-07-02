@@ -1,0 +1,8 @@
+bin/
+obj/
+release/
+logs/*.log
+.dotnet/
+.vs/
+*.user
+*.suo

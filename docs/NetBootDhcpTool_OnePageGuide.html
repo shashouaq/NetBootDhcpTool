@@ -1,0 +1,122 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NetBoot DHCP Tool 涓€椤电焊璇存槑</title>
+  <style>
+    *{box-sizing:border-box}
+    body{margin:0;background:#f4f7fb;color:#162033;font-family:"Microsoft YaHei UI","Segoe UI",Arial,sans-serif}
+    .page{width:210mm;min-height:297mm;margin:0 auto;background:#fff;padding:14mm;box-shadow:0 12px 36px rgba(30,43,67,.14)}
+    header{display:flex;align-items:center;justify-content:space-between;border-bottom:3px solid #1769aa;padding-bottom:12px}
+    .brand{display:flex;align-items:center;gap:14px}
+    .logo{width:62px;height:62px}
+    h1{font-size:28px;margin:0;color:#0d4f86}
+    .sub{font-size:12px;line-height:1.7;color:#526070;text-align:right}
+    .grid{display:grid;grid-template-columns:1.05fr .95fr;gap:14px;margin-top:14px}
+    .card{border:1px solid #d8e2ef;border-radius:8px;padding:12px;background:#fbfdff}
+    h2{font-size:16px;margin:0 0 8px;color:#163b63}
+    ol,ul{margin:0;padding-left:20px;font-size:12px;line-height:1.8}
+    .flow{width:100%;height:auto;border-radius:8px;background:#edf6ff;border:1px solid #d8e2ef}
+    .tips{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:14px}
+    .tip{border-radius:8px;padding:10px;background:#eef7f1;border:1px solid #cde7d5;font-size:12px;line-height:1.65}
+    .tip b{display:block;color:#15643a;margin-bottom:4px}
+    table{width:100%;border-collapse:collapse;font-size:12px}
+    th,td{border:1px solid #d8e2ef;padding:7px;text-align:left;vertical-align:top}
+    th{background:#edf4fb;color:#163b63}
+    .warn{background:#fff8e6;border-color:#f1d18a}
+    .warn b{color:#8a5a00}
+    footer{margin-top:12px;padding-top:10px;border-top:1px solid #d8e2ef;font-size:11px;color:#647083;display:flex;justify-content:space-between}
+    @media print{body{background:#fff}.page{box-shadow:none;margin:0;width:auto;min-height:auto}}
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header>
+      <div class="brand">
+        <img class="logo" src="../assets/logo.png" alt="NetBoot DHCP Tool">
+        <div>
+          <h1>NetBoot DHCP Tool v1.0.5</h1>
+          <div>渚挎惡寮?IPv4 DHCP銆佹墜鍔?IP銆佽繛閫氭€ф帰娴嬪拰璁惧鏀惰棌宸ュ叿</div>
+        </div>
+      </div>
+      <div class="sub">Authors: Joel & Codex<br>Joel: 1406829360@qq.com<br>Windows x64 / 绠＄悊鍛樿繍琛?/div>
+    </header>
+
+    <section class="grid">
+      <div class="card">
+        <h2>鑷姩 DHCP 蹇€熸祦绋?/h2>
+        <ol>
+          <li>閫夋嫨宸茶繛鎺ョ殑浠ュお缃戝崱锛岀‘璁ゅ綋鍓嶇綉缁滄槸闅旂璋冭瘯缃戠粶銆?/li>
+          <li>璁剧疆鏈満 IP銆佹帺鐮併€佸湴鍧€姹狅紝鐐瑰嚮鈥滃紑濮?DHCP鈥濄€?/li>
+          <li>瀹㈡埛绔墽琛?renew锛屾垨绂佺敤/鍚敤缃戝崱銆佹嫈鎻掔綉绾裤€侀噸鍚鎴风缃戠粶銆?/li>
+          <li>鏄庣粏鎸?MAC 鍘婚噸鍒锋柊锛岀姸鎬佹樉绀?Assigned/Online/Offline 鍜?ping 寤惰繜銆?/li>
+          <li>鐐瑰嚮 IP 浠?http://IP 鎵撳紑锛屾棩蹇楀湪 logs 鐩綍銆?/li>
+        </ol>
+      </div>
+      <svg class="flow" viewBox="0 0 520 230" role="img" aria-label="DHCP flow">
+        <rect x="22" y="30" width="138" height="76" rx="12" fill="#dcefff" stroke="#1769aa" stroke-width="3"/>
+        <text x="91" y="62" text-anchor="middle" font-size="18" fill="#163b63">鏈満缃戝崱</text>
+        <text x="91" y="88" text-anchor="middle" font-size="13" fill="#526070">192.168.100.1</text>
+        <rect x="360" y="30" width="138" height="76" rx="12" fill="#e8f7ec" stroke="#20884f" stroke-width="3"/>
+        <text x="429" y="62" text-anchor="middle" font-size="18" fill="#15643a">瀹㈡埛绔?/text>
+        <text x="429" y="88" text-anchor="middle" font-size="13" fill="#526070">DHCP / PXE</text>
+        <path d="M164 57 C230 20 290 20 356 57" fill="none" stroke="#1769aa" stroke-width="4" marker-end="url(#arrow)"/>
+        <text x="260" y="36" text-anchor="middle" font-size="13" fill="#163b63">Discover / Request</text>
+        <path d="M356 86 C290 128 230 128 164 86" fill="none" stroke="#20884f" stroke-width="4" marker-end="url(#arrow2)"/>
+        <text x="260" y="125" text-anchor="middle" font-size="13" fill="#15643a">Offer / ACK</text>
+        <path d="M91 146 H429" fill="none" stroke="#d97706" stroke-width="4" stroke-dasharray="8 8" marker-end="url(#arrow3)"/>
+        <text x="260" y="172" text-anchor="middle" font-size="14" fill="#8a5a00">鎸佺画 Ping 鎺㈡祴锛岄€氬悗瀹氭椂鍒锋柊鐘舵€?/text>
+        <defs>
+          <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M2 2 L10 6 L2 10 Z" fill="#1769aa"/></marker>
+          <marker id="arrow2" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M2 2 L10 6 L2 10 Z" fill="#20884f"/></marker>
+          <marker id="arrow3" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M2 2 L10 6 L2 10 Z" fill="#d97706"/></marker>
+        </defs>
+      </svg>
+    </section>
+
+    <section class="grid">
+      <div class="card">
+        <h2>鎵嬪姩 IP / 鎵弿</h2>
+        <ul>
+          <li>杈撳叆鏈満 IP銆佹帺鐮佸拰鍙€夆€滃绔?IP鈥濄€?/li>
+          <li>鏈夊绔?IP 鏃跺彧鎺㈡祴璇?IP锛屽苟鎸佺画 ping 鍒拌繛閫氫负姝€?/li>
+          <li>娌℃湁瀵圭 IP 鏃舵寜缃戞鎵弿锛岀粨鏋滄樉绀轰富鏈哄悕銆丮AC銆丠TTP/HTTPS銆佺姸鎬佸拰 ping銆?/li>
+          <li>鎵嬪姩閰嶇疆涓嶄細鍐欏叆缃戝叧鍜?DNS锛岄伩鍏嶅奖鍝?PC 鍚庣画缃戠粶銆?/li>
+        </ul>
+      </div>
+      <div class="card">
+        <h2>鏀惰棌澶?/h2>
+        <ul>
+          <li>鍚嶇О銆佹湰鏈?IP銆佹帺鐮佷负蹇呭～椤癸紱璁惧鍙枫€佸娉ㄣ€佽处瀵嗐€佽蹇嗘枃鏈彲閫夈€?/li>
+          <li>鏀寔鑷畾涔夊瓧娈靛鍒犮€丣SON 瀵煎叆/瀵煎嚭锛屼究浜庤褰曡澶囨壒娆°€佽处鍙枫€佹満鏌滀綅缃瓑淇℃伅銆?/li>
+          <li>鍐呯疆甯歌鏈嶅姟鍣?BMC 绠＄悊鍙ｆā鏉匡紝瀹為檯 IP 鍜屽瘑鐮佽鎸夎澶囬摥鐗屻€侀」鐩鑼冩牳瀵广€?/li>
+          <li>鍔犺浇鏀惰棌鍚庤嚜鍔ㄥ垏鎹㈠埌鎵嬪姩 IP 椤甸潰锛屾寜瀵圭 IP 鎵ц瀹氬悜鎺㈡祴銆?/li>
+        </ul>
+      </div>
+    </section>
+
+    <section class="tips">
+      <div class="tip"><b>鐘舵€佽鏄?/b>Assigned/宸插垎閰嶏細宸插搷搴?DHCP锛汷nline/鍦ㄧ嚎锛歱ing 閫氾紱Offline/绂荤嚎锛氬綋鍓?ping 涓嶉€氥€?/div>
+      <div class="tip warn"><b>瀹夊叏杈圭晫</b>鍙湪闅旂璋冭瘯缃戠粶浣跨敤锛屼笉瑕佹帴鍏ュ姙鍏綉銆佺敓浜х綉鎴栧凡鏈?DHCP 鐨勭綉缁溿€?/div>
+      <div class="tip"><b>鍏抽棴娓呯悊</b>閫€鍑烘垨鐐?X 浼氬仠姝?DHCP銆佸彇娑堟壂鎻忋€侀噴鏀?UDP 67/68锛屽苟鎸夎缃仮澶嶇綉鍗°€?/div>
+    </section>
+
+    <section class="card" style="margin-top:14px">
+      <h2>甯歌澶勭悊</h2>
+      <table>
+        <tr><th>鐜拌薄</th><th>寤鸿</th></tr>
+        <tr><td>瀹㈡埛绔秴鏃舵湭鎷垮埌 IP</td><td>瀹㈡埛绔?renew锛涚鐢?鍚敤缃戝崱锛涙嫈鎻掑绔綉绾匡紱妫€鏌ラ摼璺伅锛涢噸鍚鎴风缃戠粶鏈嶅姟鎴栬澶囥€?/td></tr>
+        <tr><td>宸ュ叿鏄剧ず宸插垎閰嶄絾鏈湪绾?/td><td>绛夊緟 ping 鍒锋柊锛涚‘璁ゅ鎴风闃茬伀澧欐槸鍚︾ ping锛涚‘璁ゅ鎴风 IP 鏈鍥哄畾鍒板叾瀹冪綉娈点€?/td></tr>
+        <tr><td>鍚姩 DHCP 琚嫤鎴?/td><td>纭绠＄悊鍛樿繍琛岋紝鍏抽棴鍗犵敤 UDP 67 鐨勬湇鍔★紝鍏佽宸ュ叿鍒涘缓闃茬伀澧欒鍒欍€?/td></tr>
+      </table>
+    </section>
+
+    <footer>
+      <span>鍙戝竷鍖咃細release\NetBootDhcpTool-v1.0.5</span>
+      <span>閰嶇疆锛歝onfig / 鏃ュ織锛歭ogs / 璇存槑锛歞ocs</span>
+    </footer>
+  </main>
+</body>
+</html>
+

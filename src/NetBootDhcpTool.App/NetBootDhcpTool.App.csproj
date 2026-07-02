@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>NetBootDhcpTool</AssemblyName>
+    <RootNamespace>NetBootDhcpTool.App</RootNamespace>
+    <Version>1.0.6</Version>
+    <AssemblyVersion>1.0.6.0</AssemblyVersion>
+    <FileVersion>1.0.6.0</FileVersion>
+    <ApplicationIcon>..\..\assets\app.ico</ApplicationIcon>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\NetBootDhcpTool.Core\NetBootDhcpTool.Core.csproj" />
+    <ProjectReference Include="..\NetBootDhcpTool.Network\NetBootDhcpTool.Network.csproj" />
+    <ProjectReference Include="..\NetBootDhcpTool.Dhcp\NetBootDhcpTool.Dhcp.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <Content Include="..\..\config\**\*.*" Link="config\%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\i18n\**\*.*" Link="i18n\%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\assets\**\*.*" Link="assets\%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

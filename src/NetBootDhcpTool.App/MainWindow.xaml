@@ -1,0 +1,253 @@
+﻿<Window x:Class="NetBootDhcpTool.App.MainWindow" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Title="NetBoot DHCP Tool" Width="1240" Height="800" MinWidth="1040" MinHeight="660">
+  <Window.Resources>
+    <Style TargetType="TextBlock">
+      <Setter Property="TextWrapping" Value="Wrap"/>
+      <Setter Property="VerticalAlignment" Value="Center"/>
+    </Style>
+    <Style TargetType="Button">
+      <Setter Property="MinWidth" Value="86"/>
+      <Setter Property="MinHeight" Value="28"/>
+      <Setter Property="Margin" Value="4"/>
+      <Setter Property="Padding" Value="10,3"/>
+    </Style>
+    <Style x:Key="CellText" TargetType="TextBlock">
+      <Setter Property="TextWrapping" Value="Wrap"/>
+      <Setter Property="Padding" Value="4,2"/>
+    </Style>
+    <Style x:Key="FavoriteCellText" TargetType="TextBlock" BasedOn="{StaticResource CellText}">
+      <Setter Property="TextTrimming" Value="CharacterEllipsis"/>
+      <Setter Property="ToolTip" Value="{Binding Text, RelativeSource={RelativeSource Self}}"/>
+    </Style>
+    <Style x:Key="StatusText" TargetType="TextBlock" BasedOn="{StaticResource CellText}">
+      <Setter Property="ToolTip" Value="{Binding StatusHelp}"/>
+      <Style.Triggers>
+        <DataTrigger Binding="{Binding Status}" Value="Online">
+          <Setter Property="Foreground" Value="#137333"/>
+          <Setter Property="FontWeight" Value="SemiBold"/>
+        </DataTrigger>
+        <DataTrigger Binding="{Binding Status}" Value="Offline">
+          <Setter Property="Foreground" Value="#B3261E"/>
+          <Setter Property="FontWeight" Value="SemiBold"/>
+        </DataTrigger>
+        <DataTrigger Binding="{Binding Status}" Value="Assigned">
+          <Setter Property="Foreground" Value="#B06000"/>
+          <Setter Property="FontWeight" Value="SemiBold"/>
+        </DataTrigger>
+      </Style.Triggers>
+    </Style>
+  </Window.Resources>
+  <Grid x:Name="RootGrid">
+  <DockPanel Margin="10">
+    <ToolBar DockPanel.Dock="Top">
+      <TextBlock x:Name="LblLanguage"/>
+      <ComboBox x:Name="LanguageBox" Width="110" SelectionChanged="LanguageBox_SelectionChanged">
+        <ComboBoxItem Content="Auto" Tag="auto"/>
+        <ComboBoxItem Content="中文" Tag="zh-CN"/>
+        <ComboBoxItem Content="English" Tag="en-US"/>
+      </ComboBox>
+      <Button x:Name="BtnRefresh" Click="RefreshAdapters_Click"/>
+      <Button x:Name="BtnRollback" Content="Rollback / 回滚" Click="Rollback_Click"/>
+      <Button x:Name="BtnExport" Content="Export / 导出" Click="ExportResults_Click"/>
+      <Button x:Name="BtnDiagnostics" Content="Diagnostics / 诊断" Click="Diagnostics_Click"/>
+      <Button x:Name="BtnPackageLogs" Content="Support / 支持包" Click="PackageLogs_Click"/>
+      <Button x:Name="BtnTheme" Content="Theme / 主题" Click="Theme_Click"/>
+      <Button x:Name="BtnOpenLogs" Click="OpenLogs_Click"/>
+      <Button x:Name="BtnAbout" Click="About_Click"/>
+    </ToolBar>
+    <Border DockPanel.Dock="Top" BorderBrush="#C8D1DC" Background="#F8FAFC" BorderThickness="1" Padding="10" Margin="0,8,0,8" CornerRadius="6">
+      <Grid>
+        <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="Auto"/>
+          <ColumnDefinition Width="2.6*"/>
+          <ColumnDefinition Width="180"/>
+          <ColumnDefinition Width="Auto"/>
+          <ColumnDefinition Width="1.1*"/>
+          <ColumnDefinition Width="Auto"/>
+          <ColumnDefinition Width="1.1*"/>
+          <ColumnDefinition Width="Auto"/>
+          <ColumnDefinition Width="70"/>
+        </Grid.ColumnDefinitions>
+        <TextBlock x:Name="LblAdapter" Grid.Column="0" Margin="0,0,8,0"/>
+        <ComboBox x:Name="AdapterBox" Grid.Column="1" Margin="0,0,8,0" DisplayMemberPath="DisplayName" SelectionChanged="AdapterBox_SelectionChanged"/>
+        <Border Grid.Column="2" Background="White" BorderBrush="#D8E0EA" BorderThickness="1" CornerRadius="4" Padding="8,3" Margin="0,0,12,0"><TextBlock x:Name="TxtCurrentIp" FontWeight="SemiBold" Foreground="#0B5394"/></Border>
+        <TextBlock x:Name="LblMac" Grid.Column="3" Margin="0,0,8,0"/>
+        <TextBlock x:Name="TxtMac" Grid.Column="4" Margin="0,0,16,0"/>
+        <TextBlock x:Name="LblGateway" Grid.Column="5" Margin="0,0,8,0"/>
+        <TextBlock x:Name="TxtGateway" Grid.Column="6" Margin="0,0,16,0"/>
+        <TextBlock x:Name="LblStatus" Grid.Column="7" Margin="0,0,8,0"/>
+        <TextBlock x:Name="TxtStatus" Grid.Column="8" FontWeight="SemiBold"/>
+        <ItemsControl x:Name="IpHistoryList" Grid.Row="1" Grid.Column="1" Grid.ColumnSpan="7" Margin="0,8,0,0" ItemsSource="{Binding AdapterIpHistory}">
+          <ItemsControl.ItemsPanel><ItemsPanelTemplate><WrapPanel/></ItemsPanelTemplate></ItemsControl.ItemsPanel>
+          <ItemsControl.ItemTemplate><DataTemplate><Border Background="White" BorderBrush="#D8E0EA" BorderThickness="1" CornerRadius="10" Padding="8,3" Margin="0,0,6,0"><TextBlock Text="{Binding DisplayText}" Foreground="#57606A"/></Border></DataTemplate></ItemsControl.ItemTemplate>
+        </ItemsControl>
+      </Grid>
+    </Border>
+    <Grid DockPanel.Dock="Bottom" Height="150" Margin="0,8,0,0">
+      <Grid.RowDefinitions>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="*"/>
+      </Grid.RowDefinitions>
+      <StackPanel Orientation="Horizontal">
+        <Button x:Name="BtnClearLog" Click="ClearLog_Click"/>
+        <Button x:Name="BtnOpenLogs2" Click="OpenLogs_Click"/>
+        <Button x:Name="BtnCopyLog" Click="CopyLog_Click"/>
+      </StackPanel>
+      <RichTextBox x:Name="LogBox" Grid.Row="1" IsReadOnly="True" IsDocumentEnabled="False" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto" FontFamily="Consolas" BorderThickness="1" BorderBrush="#D0D7DE"/>
+    </Grid>
+    <TabControl x:Name="Tabs" SelectionChanged="Tabs_SelectionChanged">
+      <TabItem x:Name="TabDhcp">
+        <Grid Margin="8">
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+          </Grid.RowDefinitions>
+          <WrapPanel>
+            <TextBlock x:Name="LblServerIp"/>
+            <TextBox x:Name="DhcpServerIp" Width="120" Margin="6" TextChanged="DhcpNetworkInput_TextChanged"/>
+            <TextBlock x:Name="LblSubnetMask"/>
+            <TextBox x:Name="DhcpMask" Width="120" Margin="6" TextChanged="DhcpNetworkInput_TextChanged"/>
+            <TextBlock x:Name="LblPoolStart"/>
+            <TextBox x:Name="DhcpStart" Width="120" Margin="6" TextChanged="DhcpNetworkInput_TextChanged"/>
+            <TextBlock x:Name="LblPoolEnd"/>
+            <TextBox x:Name="DhcpEnd" Width="120" Margin="6" TextChanged="DhcpNetworkInput_TextChanged"/>
+            <Button x:Name="BtnShowDhcpGateway" Content="+ Gateway / 网关" Click="ShowDhcpGateway_Click"/>
+            <TextBlock x:Name="LblDhcpGateway" Visibility="Collapsed"/>
+            <TextBox x:Name="DhcpGateway" Width="120" Margin="6" Visibility="Collapsed"/>
+            <Button x:Name="BtnShowDhcpDns" Content="+ DNS" Click="ShowDhcpDns_Click"/>
+            <TextBlock x:Name="LblDhcpDns" Visibility="Collapsed"/>
+            <TextBox x:Name="DhcpDns" Width="120" Margin="6" Visibility="Collapsed"/>
+            <TextBlock x:Name="LblLeaseSeconds"/>
+            <TextBox x:Name="DhcpLeaseSeconds" Width="80" Margin="6"/>
+            <CheckBox x:Name="DhcpConfirm" Margin="6"/>
+            <CheckBox x:Name="RestoreOnStop" Margin="6"/>
+            <Button x:Name="BtnStartDhcp" Click="StartDhcp_Click"/>
+            <Button x:Name="BtnStopDhcp" Click="StopDhcp_Click"/>
+          </WrapPanel>
+          <TextBlock x:Name="DhcpHint" Grid.Row="1" Margin="2,4,2,6" Foreground="#B06000" FontWeight="SemiBold"/>
+          <DataGrid x:Name="LeaseGrid" Grid.Row="2" ItemsSource="{Binding Leases}" AutoGenerateColumns="False" IsReadOnly="False" CanUserResizeColumns="True" CanUserResizeRows="True">
+            <DataGrid.Columns>
+              <DataGridTextColumn Header="Last Online / 最后上线" Binding="{Binding Time}" Width="155" ElementStyle="{StaticResource CellText}"/>
+              <DataGridTextColumn Header="MAC" Binding="{Binding MacAddress}" Width="145" ElementStyle="{StaticResource CellText}"/>
+              <DataGridTemplateColumn Header="IP" Width="120">
+                <DataGridTemplateColumn.CellTemplate>
+                  <DataTemplate>
+                    <TextBlock Padding="4,2"><Hyperlink Click="OpenHttpLink_Click" CommandParameter="{Binding IpAddress}"><TextBlock Text="{Binding IpAddress}"/></Hyperlink></TextBlock>
+                  </DataTemplate>
+                </DataGridTemplateColumn.CellTemplate>
+              </DataGridTemplateColumn>
+              <DataGridTextColumn Header="Hostname / 主机名" Binding="{Binding Hostname}" Width="145" ElementStyle="{StaticResource CellText}"/>
+              <DataGridTextColumn Header="Start / 开始" Binding="{Binding LeaseStart}" Width="145" ElementStyle="{StaticResource CellText}"/>
+              <DataGridTextColumn Header="End / 结束" Binding="{Binding LeaseEnd}" Width="145" ElementStyle="{StaticResource CellText}"/>
+              <DataGridTextColumn Header="Status / 状态" Binding="{Binding StatusText}" Width="125" ElementStyle="{StaticResource StatusText}"/>
+              <DataGridTextColumn Header="Ping ms" Binding="{Binding PingLatencyMs}" Width="80" ElementStyle="{StaticResource CellText}"/>
+              <DataGridTextColumn Header="Remark / 备注" Binding="{Binding Remark}" Width="*" ElementStyle="{StaticResource CellText}"/>
+            </DataGrid.Columns>
+          </DataGrid>
+        </Grid>
+      </TabItem>
+      <TabItem x:Name="TabScan">
+        <Grid Margin="8">
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+          </Grid.RowDefinitions>
+          <WrapPanel>
+            <TextBlock x:Name="LblManualIp"/>
+            <TextBox x:Name="ManualIp" Width="120" Margin="6" TextChanged="ManualIp_TextChanged"/>
+            <TextBlock x:Name="LblManualMask"/>
+            <TextBox x:Name="ManualMask" Width="120" Margin="6" TextChanged="ManualInput_TextChanged"/>
+            <TextBlock x:Name="LblManualTargetIp"/>
+            <TextBox x:Name="ManualTargetIp" Width="120" Margin="6" TextChanged="ManualInput_TextChanged"/>
+            <Button x:Name="BtnApplyScan" Click="ApplyScan_Click"/>
+            <Button x:Name="BtnStopScan" Click="StopScan_Click"/>
+            <Button x:Name="BtnRestoreScan" Content="Restore / 恢复网卡" Click="RestoreScan_Click"/>
+            <Button x:Name="BtnAddFavorite" Click="AddFavorite_Click"/>
+            <TextBlock x:Name="TxtManualAdapterIp" Margin="12,0,0,0" Foreground="#57606A" MinWidth="260"/>
+          </WrapPanel>
+          <StackPanel Grid.Row="1" Orientation="Horizontal">
+            <ProgressBar x:Name="ScanProgress" Width="300" Height="18"/>
+            <TextBlock x:Name="ScanStatus" Margin="8,0,0,0"/>
+          </StackPanel>
+          <DataGrid x:Name="ScanGrid" Grid.Row="2" ItemsSource="{Binding ScanResults}" AutoGenerateColumns="False" IsReadOnly="False" CanUserResizeColumns="True" CanUserResizeRows="True" MouseDoubleClick="ScanGrid_MouseDoubleClick">
+            <DataGrid.Columns>
+              <DataGridTemplateColumn Header="IP" Width="120">
+                <DataGridTemplateColumn.CellTemplate>
+                  <DataTemplate><TextBlock Padding="4,2"><Hyperlink Click="OpenHttpLink_Click" CommandParameter="{Binding IpAddress}"><TextBlock Text="{Binding IpAddress}"/></Hyperlink></TextBlock></DataTemplate>
+                </DataGridTemplateColumn.CellTemplate>
+              </DataGridTemplateColumn>
+              <DataGridCheckBoxColumn Header="Ping / 连通" Binding="{Binding PingOk}" Width="85"/>
+              <DataGridTextColumn Header="ms / 延迟" Binding="{Binding LatencyMs}" Width="85" ElementStyle="{StaticResource CellText}"/>
+              <DataGridTextColumn Header="Status / 状态" Binding="{Binding StatusText}" Width="125" ElementStyle="{StaticResource CellText}"/>
+              <DataGridTextColumn Header="Web / 网页" Binding="{Binding WebText}" Width="95" ElementStyle="{StaticResource CellText}"/>
+              <DataGridTextColumn Header="Local IP / 本机IP" Binding="{Binding ConfiguredLocalIp}" Width="130" ElementStyle="{StaticResource CellText}"/>
+              <DataGridTextColumn Header="MAC" Binding="{Binding MacAddress}" Width="145" ElementStyle="{StaticResource CellText}"/>
+              <DataGridTextColumn Header="Hostname / 主机名" Binding="{Binding Hostname}" Width="160" ElementStyle="{StaticResource CellText}"/>
+              <DataGridTextColumn Header="Last Seen / 最后发现" Binding="{Binding LastSeen}" Width="155" ElementStyle="{StaticResource CellText}"/>
+              <DataGridTextColumn Header="Remark / 备注" Binding="{Binding Remark}" Width="*" ElementStyle="{StaticResource CellText}"/>
+            </DataGrid.Columns>
+          </DataGrid>
+        </Grid>
+      </TabItem>
+      <TabItem x:Name="TabFavorites">
+        <Grid Margin="8">
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+          </Grid.RowDefinitions>
+          <StackPanel Orientation="Horizontal">
+            <TextBlock x:Name="LblSearch"/>
+            <TextBox x:Name="FavoriteSearch" Width="240" Margin="6" TextChanged="FavoriteSearch_TextChanged"/>
+            <Button x:Name="BtnNewFavorite" Click="NewFavorite_Click"/>
+            <Button x:Name="BtnTemplateFavorite" Content="Templates / 模板" Click="TemplateFavorite_Click"/>
+            <Button x:Name="BtnImportFavorite" Content="Import / 导入" Click="ImportFavorites_Click"/>
+            <Button x:Name="BtnExportFavorite" Content="Export / 导出" Click="ExportFavorites_Click"/>
+            <Button x:Name="BtnFavoriteColumns" Content="Columns / 列" Click="FavoriteColumns_Click"/>
+            <Button x:Name="BtnLoadFavorite" Click="LoadFavorite_Click"/>
+            <Button x:Name="BtnApplyFavorite" Click="ApplyFavorite_Click"/>
+            <Button x:Name="BtnDeleteFavorite" Click="DeleteFavorite_Click"/>
+          </StackPanel>
+          <DataGrid x:Name="FavoriteGrid" Grid.Row="1" ItemsSource="{Binding Favorites}" AutoGenerateColumns="False" IsReadOnly="True" CanUserResizeColumns="True" CanUserReorderColumns="True" CanUserResizeRows="False" RowHeight="34" SelectionChanged="FavoriteGrid_SelectionChanged" MouseDoubleClick="FavoriteGrid_MouseDoubleClick">
+            <DataGrid.Columns>
+              <DataGridTextColumn Header="Name / 名称" Binding="{Binding Name}" Width="140" ElementStyle="{StaticResource FavoriteCellText}"/>
+              <DataGridTextColumn Header="Device / 设备" Binding="{Binding DeviceNumber}" Width="110" ElementStyle="{StaticResource FavoriteCellText}"/>
+              <DataGridTextColumn Header="SN / 序列号" Binding="{Binding SerialNumber}" Width="110" ElementStyle="{StaticResource FavoriteCellText}"/>
+              <DataGridTextColumn Header="Remark / 备注" Binding="{Binding RemarkName}" Width="130" ElementStyle="{StaticResource FavoriteCellText}"/>
+              <DataGridTextColumn Header="User / 账号" Binding="{Binding Username}" Width="100" ElementStyle="{StaticResource FavoriteCellText}"/>
+              <DataGridTextColumn Header="Password / 密码" Binding="{Binding Password}" Width="105" ElementStyle="{StaticResource FavoriteCellText}"/>
+              <DataGridTextColumn Header="IP" Binding="{Binding LocalIp}" Width="120" ElementStyle="{StaticResource FavoriteCellText}"/>
+              <DataGridTextColumn Header="Mask / 掩码" Binding="{Binding SubnetMask}" Width="120" ElementStyle="{StaticResource FavoriteCellText}"/>
+              <DataGridTemplateColumn Header="Custom / 自定义" Width="220" MinWidth="120">
+                <DataGridTemplateColumn.CellTemplate>
+                  <DataTemplate>
+                    <TextBlock Text="{Binding CustomFieldsSummary}" Style="{StaticResource FavoriteCellText}" Cursor="Hand" MouseLeftButtonUp="FavoriteCustomFields_Click"/>
+                  </DataTemplate>
+                </DataGridTemplateColumn.CellTemplate>
+              </DataGridTemplateColumn>
+              <DataGridTextColumn Header="Updated / 更新" Binding="{Binding UpdatedAt}" Width="145" ElementStyle="{StaticResource FavoriteCellText}"/>
+              <DataGridTextColumn Header="Last Used / 最近使用" Binding="{Binding LastUsedAt}" Width="155" ElementStyle="{StaticResource FavoriteCellText}"/>
+              <DataGridTextColumn Header="Description / 说明" Binding="{Binding Description}" Width="*" MinWidth="180" ElementStyle="{StaticResource FavoriteCellText}"/>
+            </DataGrid.Columns>
+          </DataGrid>
+        </Grid>
+      </TabItem>
+      <TabItem x:Name="TabSettings">
+        <StackPanel Margin="12">
+          <CheckBox x:Name="AllowWifi"/>
+          <CheckBox x:Name="AllowGateway"/>
+          <CheckBox x:Name="DetectExistingDhcp"/>
+          <Button x:Name="BtnSaveSettings" Width="120" HorizontalAlignment="Left" Click="SaveSettings_Click"/>
+        </StackPanel>
+      </TabItem>
+    </TabControl>
+  </DockPanel>
+  <Border x:Name="BusyOverlay" Background="#AAFFFFFF" Visibility="Visible">
+    <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" MinWidth="260">
+      <ProgressBar IsIndeterminate="True" Height="16"/>
+      <TextBlock x:Name="BusyText" Text="Please wait... / 请稍后..." FontSize="16" FontWeight="SemiBold" HorizontalAlignment="Center" Margin="0,12,0,0"/>
+    </StackPanel>
+  </Border>
+  </Grid>
+</Window>
