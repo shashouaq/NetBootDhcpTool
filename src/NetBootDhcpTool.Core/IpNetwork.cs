@@ -4,6 +4,35 @@ namespace NetBootDhcpTool.Core;
 
 public static class IpNetwork
 {
+    public static bool TryParseCidr(string? value, out IPAddress network, out int prefixLength, out string canonical)
+    {
+        network = IPAddress.None;
+        prefixLength = 0;
+        canonical = "";
+        if (string.IsNullOrWhiteSpace(value)) return false;
+
+        var parts = value.Trim().Split('/', 2, StringSplitOptions.TrimEntries);
+        if (parts.Length != 2 || !IPAddress.TryParse(parts[0], out var address) || address.GetAddressBytes().Length != 4)
+        {
+            return false;
+        }
+        if (!int.TryParse(parts[1], out prefixLength) || prefixLength is < 0 or > 32)
+        {
+            return false;
+        }
+
+        var mask = prefixLength == 0 ? 0u : uint.MaxValue << (32 - prefixLength);
+        network = FromUInt32(ToUInt32(address) & mask);
+        canonical = $"{network}/{prefixLength}";
+        return true;
+    }
+
+    public static string ParseCidr(string value)
+    {
+        if (!TryParseCidr(value, out _, out _, out var canonical)) throw new FormatException("Invalid IPv4 CIDR / 无效的 IPv4 网段");
+        return canonical;
+    }
+
     public static uint ToUInt32(IPAddress address)
     {
         var bytes = address.GetAddressBytes();

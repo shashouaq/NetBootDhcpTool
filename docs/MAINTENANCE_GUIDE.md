@@ -75,7 +75,7 @@ Use this workflow when changing the published version.
 2. Search for the old version and update intentional references:
 
 ```powershell
-rg -n "1\.0\.6|v1\.0\.6" .
+rg -n "<old-version>|v<old-version>" .
 ```
 
 3. Add a complete change log entry in `docs/FEATURE_CHANGELOG.md`.

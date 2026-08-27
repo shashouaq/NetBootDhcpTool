@@ -14,6 +14,7 @@ public sealed class AppPaths
         SettingsFile = Path.Combine(ConfigDirectory, "appsettings.json");
         FavoritesFile = Path.Combine(ConfigDirectory, "favorites.json");
         AdapterBackupsFile = Path.Combine(ConfigDirectory, "adapter-backups.json");
+        StaticRouteSessionFile = Path.Combine(ConfigDirectory, "static-route-session.json");
         NetworkHistoryFile = Path.Combine(DataDirectory, "network-history.json");
         OperationHistoryFile = Path.Combine(DataDirectory, "operation-history.json");
         MigrateLegacyData();
@@ -29,6 +30,7 @@ public sealed class AppPaths
     public string SettingsFile { get; }
     public string FavoritesFile { get; }
     public string AdapterBackupsFile { get; }
+    public string StaticRouteSessionFile { get; }
     public string NetworkHistoryFile { get; }
     public string OperationHistoryFile { get; }
 

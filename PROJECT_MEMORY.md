@@ -55,6 +55,9 @@
 - UI language resources and XAML labels must be checked for mojibake before release, especially Chinese strings edited through PowerShell.
 - On exit, persist favorites before cleanup starts, and never delete/overwrite favorites or runtime logs as part of close flow.
 - Favorites and logs must use a durable per-user path (`%LOCALAPPDATA%\NetBootDhcpTool`) with one-time migration from legacy app-folder data.
+- Static routes are session-owned: accept multiple IPv4 destination prefixes, normalize host bits to the network boundary, use a blank gateway for direct routes (`0.0.0.0` at the Windows API boundary), and use a nonblank IPv4 gateway for next-hop routes.
+- Static route application must refuse WLAN, virtual, disconnected, and ambiguous adapter targets; do not overwrite a matching non-system route. Allow `0.0.0.0/0` only with an explicit extra confirmation because it changes the default IPv4 path.
+- Record every route created by this process with adapter identity, interface index, next hop, metric, policy store, and instance ID. On exit remove only those recorded routes; if cleanup fails or adapter identity changes, retain the recovery journal and offer cleanup on next startup.
 
 ## Validation Checklist
 
@@ -64,6 +67,7 @@
 - Publish: `.\build\publish.ps1`
 - Cleanup stuck test processes: `.\build\stop-test-processes.ps1`
 - DHCP packet capture: `.\build\verify-dhcp-pktmon.ps1`
+- Static route service smoke test: run `.\build\route-smoke.ps1` as administrator; it creates two uniquely named Hyper-V internal switches, tests direct and gateway routes, then removes the switches in `finally`.
 
 ## Future Maintenance
 

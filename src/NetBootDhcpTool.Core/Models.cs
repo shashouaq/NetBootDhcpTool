@@ -79,6 +79,33 @@ public sealed class AdapterConfigBackup
     public int InterfaceMetric { get; set; }
 }
 
+public sealed class StaticRouteRule
+{
+    public string Id { get; set; } = Guid.NewGuid().ToString("N");
+    public string DestinationPrefix { get; set; } = "";
+    public string AdapterId { get; set; } = "";
+    public string AdapterName { get; set; } = "";
+    public string AdapterMac { get; set; } = "";
+    public string NextHop { get; set; } = "";
+    public int RouteMetric { get; set; } = 10;
+    [JsonIgnore] public string Status { get; set; } = "Not applied / 未应用";
+    [JsonIgnore] public string NextHopDisplay => string.IsNullOrWhiteSpace(NextHop) ? "Direct / 直连" : NextHop;
+}
+
+public sealed class AppliedStaticRoute
+{
+    public string RuleId { get; set; } = "";
+    public string DestinationPrefix { get; set; } = "";
+    public string AdapterId { get; set; } = "";
+    public string AdapterName { get; set; } = "";
+    public string AdapterMac { get; set; } = "";
+    public int InterfaceIndex { get; set; }
+    public string NextHop { get; set; } = "0.0.0.0";
+    public int RouteMetric { get; set; }
+    public string PolicyStore { get; set; } = "ActiveStore";
+    public string InstanceId { get; set; } = "";
+}
+
 public sealed class OperationHistoryItem
 {
     public DateTime Time { get; set; } = DateTime.Now;
@@ -111,5 +138,6 @@ public sealed class ScanResult
 [JsonSerializable(typeof(AppSettings))]
 [JsonSerializable(typeof(List<FavoriteConfig>))]
 [JsonSerializable(typeof(List<FavoriteField>))]
+[JsonSerializable(typeof(List<AppliedStaticRoute>))]
 [JsonSerializable(typeof(Dictionary<string, string>))]
 public partial class NetBootJsonContext : JsonSerializerContext;

@@ -1,5 +1,13 @@
 # Feature Change Log
 
+## 2026-08-27
+
+- Type: Feature / Release
+- Affected files/modules: `src/NetBootDhcpTool.Core/Models.cs`, `src/NetBootDhcpTool.Core/IpNetwork.cs`, `src/NetBootDhcpTool.Core/StaticRouteValidator.cs`, `src/NetBootDhcpTool.Network/StaticRouteService.cs`, `src/NetBootDhcpTool.App/MainWindow.xaml`, `src/NetBootDhcpTool.App/MainWindow.xaml.cs`, `i18n/`, `build/route-smoke.ps1`, `build/resolve-dotnet.ps1`, `README.md`, `docs/NetBootDhcpTool_OnePageGuide.html`, `PROJECT_MEMORY.md`
+- Concrete change: Added a Static Routes tab for multiple IPv4 CIDR rules. Each rule selects a wired adapter and accepts either a blank gateway for a directly connected route or an IPv4 next hop for a gateway route. Prefixes are canonicalized, metrics are validated, duplicate/conflicting routes are rejected, default routes are allowed with an additional confirmation, and only routes created by the current session are journaled and removed on exit. Cleanup failures or adapter identity changes remain recoverable on the next startup. Added a controlled Hyper-V vNIC smoke-test script and made the build resolver prefer a project-local .NET 8 SDK.
+- Verification: Project-local .NET SDK `8.0.424` restore and Release build passed with 0 warnings and 0 errors; existing test smoke returned `OK`; elevated isolated Hyper-V route smoke returned `ROUTE_SMOKE_OK` and `LEFTOVER_SWITCHES=0`; `git diff --check` and content/encoding review passed; the v1.0.7 self-contained package passed 7-Zip testing, SHA256 sidecar verification, manifest verification, and assembly file-version verification. Remote Release verification is completed below.
+- User impact: Users can explicitly direct selected IPv4 networks through different wired adapters while keeping DHCP/manual adapter safety boundaries. Session-created routes do not persist as permanent application settings and are cleaned automatically on exit.
+
 ## 2026-07-02
 
 - Type: Documentation

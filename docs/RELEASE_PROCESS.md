@@ -8,7 +8,8 @@ For day-to-day maintenance, required change-log practice, GitHub synchronization
 
 - The application version is defined in `src/NetBootDhcpTool.App/NetBootDhcpTool.App.csproj`.
 - `build/publish.ps1` reads that version and must not use a separate hard-coded version.
-- Release tags must use `v<version>`, for example `v1.0.6`.
+- Release tags must use `v<version>`, for example `v1.0.7`.
+- The resolver selects a project-local or system .NET 8 SDK and bootstraps the local SDK when neither is available.
 
 ## Required Checks
 
@@ -43,6 +44,7 @@ Expected outputs:
 - `release\latest.json`
 
 The publish script must test the `.7z` archive before the release is considered valid.
+For static route changes, run `build\route-smoke.ps1` as administrator when Hyper-V is available; the script owns and removes only its uniquely named test switches.
 
 ## GitHub Release Standard
 

@@ -1,10 +1,16 @@
 # NetBoot DHCP Tool
 
-Version: 1.0.6
+Version: 1.0.7
 
 Authors: Joel & Codex
 
-Windows green portable IPv4 DHCP, adapter IP configuration, ping scan, web open, favorites, bilingual UI, and logs.
+Windows green portable IPv4 DHCP, adapter IP configuration, static route rules, ping scan, web open, favorites, bilingual UI, and logs.
+
+## Static Routes
+
+The Static Routes tab accepts multiple IPv4 destination prefixes and assigns each one to a selected wired adapter. Enter a gateway for a next-hop route; leave Gateway blank for a direct route. Prefixes are normalized to the network boundary, route metrics must be between 1 and 65535, and `0.0.0.0/0` is allowed but requires an additional confirmation because it can change all IPv4 traffic.
+
+Only routes created by this session are removed when the application closes. Existing system routes are not overwritten or removed. If the original adapter identity is no longer available, the route is retained in a recovery journal under `%LOCALAPPDATA%\NetBootDhcpTool` and the next startup offers cleanup after the adapter is available again.
 
 ## Notes
 
@@ -74,6 +80,7 @@ DHCP must only be used on isolated test networks. Do not run it on office, produ
 `logs\yyyy-MM-dd.log` stores logs.
 
 From v1.0.6, favorites, network history, and runtime logs are persisted in `%LOCALAPPDATA%\NetBootDhcpTool`.
+Static route recovery state is also stored there temporarily while routes created by the current session exist; it is deleted after successful cleanup.
 On first start after upgrade, legacy data under the app folder is migrated automatically if the new store is empty.
 
 ## Notes
