@@ -71,8 +71,8 @@
 
 ## Future Maintenance
 
-- Keep business logic out of `MainWindow.xaml.cs` when features grow; move lease view updates, favorites, and settings into ViewModels.
-- Consider DPAPI encryption for stored passwords before production use.
-- Consider import/export for favorite memory records.
-- Consider optional HTTPS default behavior per favorite/device.
+- Collection state used by the main window is now held by `MainWindowViewModel`; keep new UI state out of the code-behind where practical.
+- Favorite passwords use current-user Windows DPAPI; keep exports credential-free and ask the user to re-enter a password when a different Windows identity cannot decrypt it.
+- Favorite JSON import/export and per-favorite HTTPS preference are implemented; preserve the credential-free export boundary.
+- The in-app version check only opens the validated direct GitHub download. Do not add automatic installation without a signed-update and rollback design.
 - If Wi-Fi coexistence complaints reappear, inspect `Microsoft-Windows-WLAN-AutoConfig/Operational` before changing adapter code again; this tool should remain read-only toward WLAN state.

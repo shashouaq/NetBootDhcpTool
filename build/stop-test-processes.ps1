@@ -1,6 +1,7 @@
 $ErrorActionPreference = "SilentlyContinue"
-pktmon stop | Out-Null
-pktmon filter remove | Out-Null
+$null = pktmon stop 2>$null
+$null = pktmon filter remove 2>$null
+$global:LASTEXITCODE = 0
 Get-CimInstance Win32_Process |
   Where-Object {
     ($_.Name -like 'NetBootDhcpTool*') -or

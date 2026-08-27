@@ -8,7 +8,7 @@ For day-to-day maintenance, required change-log practice, GitHub synchronization
 
 - The application version is defined in `src/NetBootDhcpTool.App/NetBootDhcpTool.App.csproj`.
 - `build/publish.ps1` reads that version and must not use a separate hard-coded version.
-- Release tags must use `v<version>`, for example `v1.0.7`.
+- Release tags must use `v<version>`, for example `v1.0.8`.
 - The resolver selects a project-local or system .NET 8 SDK and bootstraps the local SDK when neither is available.
 
 ## Required Checks
@@ -69,9 +69,9 @@ $r = Invoke-WebRequest -Uri "https://github.com/shashouaq/NetBootDhcpTool/releas
 [System.Text.Encoding]::UTF8.GetString($r.Content)
 ```
 
-## Future Upgrade Detection
+## Upgrade Detection
 
-The application should later check this URL:
+The application checks this URL in the background after the main window is ready:
 
 ```text
 https://github.com/shashouaq/NetBootDhcpTool/releases/latest/download/latest.json
@@ -86,4 +86,4 @@ The manifest contains:
 - `releasePageUrl`: user-facing GitHub release page.
 - `minimumSupportedVersion`: oldest version allowed to use this update path.
 
-The updater must download the archive from `downloadUrl`, verify `archiveSha256`, and only then replace or extract files.
+When `version` is newer than the running version, the UI shows a clickable `有新版本！` / `New version available!` link beside the current version and opens `downloadUrl` in the system browser. The current release does not install or replace files automatically; a future installer must verify `archiveSha256` and provide rollback before adding that behavior.

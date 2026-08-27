@@ -1,6 +1,6 @@
 # NetBoot DHCP Tool
 
-Version: 1.0.7
+Version: 1.0.8
 
 Authors: Joel & Codex
 
@@ -14,7 +14,11 @@ Only routes created by this session are removed when the application closes. Exi
 
 ## Notes
 
-Favorite records can store device name, device number, serial number, remark, account/password text, and free-form memory text. Passwords are currently stored in local JSON as plain text; keep the portable folder private.
+Favorite records can store device name, device number, serial number, remark, account/password text, and free-form memory text. Passwords are protected with Windows DPAPI for the current user; legacy plaintext favorites are upgraded on load, and JSON exports intentionally omit credentials. A favorite can also mark HTTPS as its preferred web scheme.
+
+## Version Check
+
+The application displays its running version when it starts. It checks the GitHub `latest.json` manifest in the background; when a newer validated release is available, `有新版本！` / `New version available!` appears beside the version and opens the direct `.7z` download in the system browser. The updater never installs files automatically and only accepts HTTPS GitHub release URLs with a valid SHA256 field.
 
 ## Build
 

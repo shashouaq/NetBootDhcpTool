@@ -8,12 +8,12 @@ public static class Defaults
         if (!File.Exists(paths.SettingsFile)) JsonStore.Save(paths.SettingsFile, new AppSettings());
         if (!File.Exists(paths.FavoritesFile))
         {
-            JsonStore.Save(paths.FavoritesFile, DefaultFavorites());
+            FavoriteStore.Save(paths.FavoritesFile, DefaultFavorites());
         }
         else
         {
-            var existing = JsonStore.LoadOrDefault(paths.FavoritesFile, new List<FavoriteConfig>());
-            if (existing.Count == 0) JsonStore.Save(paths.FavoritesFile, DefaultFavorites());
+            var existing = FavoriteStore.Load(paths.FavoritesFile, migrateLegacy: true);
+            if (existing.Count == 0) FavoriteStore.Save(paths.FavoritesFile, DefaultFavorites());
         }
         var zh = Path.Combine(paths.I18nDirectory, "zh-CN.json");
         var en = Path.Combine(paths.I18nDirectory, "en-US.json");
@@ -28,6 +28,11 @@ public static class Defaults
         ["refresh"] = "刷新",
         ["open.logs"] = "打开日志",
         ["about"] = "关于",
+        ["version"] = "版本",
+        ["checking.update"] = "正在检查更新...",
+        ["new.version"] = "有新版本！",
+        ["latest.version"] = "已是最新版本",
+        ["update.failed"] = "检查更新失败",
         ["adapter"] = "网卡",
         ["current.ip"] = "上次/当前 IP",
         ["mac"] = "MAC",
@@ -93,6 +98,11 @@ public static class Defaults
         ["refresh"] = "Refresh",
         ["open.logs"] = "Open Logs",
         ["about"] = "About",
+        ["version"] = "Version",
+        ["checking.update"] = "Checking for updates...",
+        ["new.version"] = "New version available!",
+        ["latest.version"] = "Up to date",
+        ["update.failed"] = "Update check failed",
         ["adapter"] = "Adapter",
         ["current.ip"] = "Last / Current IP",
         ["mac"] = "MAC",
@@ -156,16 +166,16 @@ public static class Defaults
         var now = DateTime.Now;
         return
         [
-            Bmc("Dell iDRAC default", "Dell", "192.168.0.120", "root", "calvin", "Common iDRAC factory default. Verify by model and site policy.", now),
-            Bmc("HPE iLO default", "HPE", "192.168.1.1", "Administrator", "", "iLO password is often on the chassis tag; fixed IP varies by generation.", now),
-            Bmc("Lenovo XCC default", "Lenovo", "192.168.70.125", "USERID", "PASSW0RD", "Common Lenovo XClarity Controller default. Verify before use.", now),
-            Bmc("Supermicro IPMI default", "Supermicro", "192.168.100.100", "ADMIN", "ADMIN", "Newer devices may use a unique password on the label.", now),
-            Bmc("Inspur BMC template", "Inspur", "192.168.1.100", "admin", "admin", "Template entry; verify actual project default.", now),
-            Bmc("Huawei iBMC template", "Huawei", "192.168.2.100", "Administrator", "", "Template entry; verify actual project default.", now)
+            Bmc("Dell iDRAC default", "Dell", "192.168.0.120", "root", "Common iDRAC factory default. Verify by model and site policy.", now),
+            Bmc("HPE iLO default", "HPE", "192.168.1.1", "Administrator", "iLO password is often on the chassis tag; fixed IP varies by generation.", now),
+            Bmc("Lenovo XCC default", "Lenovo", "192.168.70.125", "USERID", "Common Lenovo XClarity Controller default. Verify before use.", now),
+            Bmc("Supermicro IPMI default", "Supermicro", "192.168.100.100", "ADMIN", "Newer devices may use a unique password on the label.", now),
+            Bmc("Inspur BMC template", "Inspur", "192.168.1.100", "admin", "Template entry; verify actual project default.", now),
+            Bmc("Huawei iBMC template", "Huawei", "192.168.2.100", "Administrator", "Template entry; verify actual project default.", now)
         ];
     }
 
-    private static FavoriteConfig Bmc(string name, string vendor, string targetIp, string user, string password, string description, DateTime now) => new()
+    private static FavoriteConfig Bmc(string name, string vendor, string targetIp, string user, string description, DateTime now) => new()
     {
         Name = name,
         DeviceNumber = vendor,
@@ -173,7 +183,6 @@ public static class Defaults
         SubnetMask = "255.255.255.0",
         TargetIp = targetIp,
         Username = user,
-        Password = password,
         Description = description,
         MemoryText = "BMC management port preset. Keep passwords updated according to site policy.",
         CustomFields =

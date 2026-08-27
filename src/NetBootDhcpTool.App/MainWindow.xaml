@@ -53,6 +53,12 @@
       <Button x:Name="BtnTheme" Content="Theme / 主题" Click="Theme_Click"/>
       <Button x:Name="BtnOpenLogs" Click="OpenLogs_Click"/>
       <Button x:Name="BtnAbout" Click="About_Click"/>
+      <Separator/>
+      <TextBlock x:Name="TxtVersion" Margin="8,0,0,0" FontWeight="SemiBold"/>
+      <TextBlock x:Name="TxtUpdateStatus" Margin="6,0,0,0"/>
+      <TextBlock x:Name="TxtUpdateLink" Margin="6,0,0,0" Visibility="Collapsed">
+        <Hyperlink x:Name="UpdateLink" Click="UpdateLink_Click" Foreground="#0969DA"/>
+      </TextBlock>
     </ToolBar>
     <Border DockPanel.Dock="Top" BorderBrush="#C8D1DC" Background="#F8FAFC" BorderThickness="1" Padding="10" Margin="0,8,0,8" CornerRadius="6">
       <Grid>
@@ -236,6 +242,7 @@
             <Button x:Name="BtnImportFavorite" Content="Import / 导入" Click="ImportFavorites_Click"/>
             <Button x:Name="BtnExportFavorite" Content="Export / 导出" Click="ExportFavorites_Click"/>
             <Button x:Name="BtnFavoriteColumns" Content="Columns / 列" Click="FavoriteColumns_Click"/>
+            <Button x:Name="BtnOpenFavorite" Content="Open Web / 打开网页" Click="OpenFavorite_Click"/>
             <Button x:Name="BtnLoadFavorite" Click="LoadFavorite_Click"/>
             <Button x:Name="BtnApplyFavorite" Click="ApplyFavorite_Click"/>
             <Button x:Name="BtnDeleteFavorite" Click="DeleteFavorite_Click"/>
@@ -247,7 +254,7 @@
               <DataGridTextColumn Header="SN / 序列号" Binding="{Binding SerialNumber}" Width="110" ElementStyle="{StaticResource FavoriteCellText}"/>
               <DataGridTextColumn Header="Remark / 备注" Binding="{Binding RemarkName}" Width="130" ElementStyle="{StaticResource FavoriteCellText}"/>
               <DataGridTextColumn Header="User / 账号" Binding="{Binding Username}" Width="100" ElementStyle="{StaticResource FavoriteCellText}"/>
-              <DataGridTextColumn Header="Password / 密码" Binding="{Binding Password}" Width="105" ElementStyle="{StaticResource FavoriteCellText}"/>
+              <DataGridTextColumn Header="Password / 密码" Binding="{Binding PasswordDisplay}" Width="150" ElementStyle="{StaticResource FavoriteCellText}"/>
               <DataGridTextColumn Header="IP" Binding="{Binding LocalIp}" Width="120" ElementStyle="{StaticResource FavoriteCellText}"/>
               <DataGridTextColumn Header="Mask / 掩码" Binding="{Binding SubnetMask}" Width="120" ElementStyle="{StaticResource FavoriteCellText}"/>
               <DataGridTemplateColumn Header="Custom / 自定义" Width="220" MinWidth="120">

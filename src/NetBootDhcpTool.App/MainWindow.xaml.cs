@@ -21,6 +21,7 @@ namespace NetBootDhcpTool.App;
 
 public partial class MainWindow : Window
 {
+    private static readonly Version CurrentVersion = typeof(MainWindow).Assembly.GetName().Version ?? new Version(1, 0, 8);
     private readonly AppPaths _paths;
     private readonly FileLogger _logger;
     private readonly LanguageService _lang;
@@ -30,6 +31,9 @@ public partial class MainWindow : Window
     private readonly PingScanner _scanner;
     private readonly ExistingDhcpDetector _dhcpDetector;
     private readonly DhcpServer _dhcpServer;
+    private readonly MainWindowViewModel _viewModel;
+    private readonly VersionUpdateService _updateService;
+    private readonly CancellationTokenSource _updateCts = new();
     private readonly SemaphoreSlim _leaseUpdateGate = new(1, 1);
     private AppSettings _settings;
     private List<FavoriteConfig> _allFavorites = [];
@@ -53,18 +57,22 @@ public partial class MainWindow : Window
     private bool _adapterStatusRefreshInProgress;
     private bool _darkTheme;
     private string? _businessConfigurationFingerprint;
+    private DhcpFirewallRuleLease? _dhcpFirewallRules;
+    private UpdateCheckResult? _lastUpdateResult;
+    private bool _updateCheckStarted;
 
-    public ObservableCollection<NetworkAdapterInfo> Adapters { get; } = [];
-    public ObservableCollection<ScanResult> ScanResults { get; } = [];
-    public ObservableCollection<FavoriteConfig> Favorites { get; } = [];
-    public ObservableCollection<DhcpLease> Leases { get; } = [];
-    public ObservableCollection<AdapterIpHistoryItem> AdapterIpHistory { get; } = [];
-    public ObservableCollection<StaticRouteRule> StaticRoutes { get; } = [];
+    public ObservableCollection<NetworkAdapterInfo> Adapters => _viewModel.Adapters;
+    public ObservableCollection<ScanResult> ScanResults => _viewModel.ScanResults;
+    public ObservableCollection<FavoriteConfig> Favorites => _viewModel.Favorites;
+    public ObservableCollection<DhcpLease> Leases => _viewModel.Leases;
+    public ObservableCollection<AdapterIpHistoryItem> AdapterIpHistory => _viewModel.AdapterIpHistory;
+    public ObservableCollection<StaticRouteRule> StaticRoutes => _viewModel.StaticRoutes;
 
     public MainWindow()
     {
         InitializeComponent();
-        DataContext = this;
+        _viewModel = new MainWindowViewModel();
+        DataContext = _viewModel;
         _paths = new AppPaths(AppContext.BaseDirectory);
         Defaults.EnsureFiles(_paths);
         _logger = new FileLogger(_paths);
@@ -81,6 +89,7 @@ public partial class MainWindow : Window
         _scanner = new PingScanner(_logger, _probe);
         _dhcpDetector = new ExistingDhcpDetector(_logger);
         _dhcpServer = new DhcpServer(_logger);
+        _updateService = new VersionUpdateService();
         _dhcpServer.LeaseChanged += lease => Dispatcher.Invoke(() => _ = UpdateLeaseAsync(lease));
         _leasePingTimer.Tick += (_, _) => _ = RefreshLeasePingAsync();
         _adapterStatusTimer.Tick += (_, _) => RefreshSelectedAdapterStatus();
@@ -102,6 +111,7 @@ public partial class MainWindow : Window
         {
             SetBusy(false);
             _ = RecoverStaleRoutesAsync();
+            _ = CheckForUpdatesAsync();
         }, DispatcherPriority.ApplicationIdle);
     }
 
@@ -119,9 +129,12 @@ public partial class MainWindow : Window
         NetworkChange.NetworkAddressChanged -= NetworkChanged;
         NetworkChange.NetworkAvailabilityChanged -= NetworkAvailabilityChanged;
         _adapterStatusTimer.Stop();
+        _updateCts.Cancel();
         IsEnabled = false;
         SetBusy(true, "Cleaning up... / 正在清理工作环境...");
         await CleanupWorkEnvironmentAsync();
+        _updateService.Dispose();
+        _updateCts.Dispose();
         _closeAfterCleanup = true;
         await Dispatcher.InvokeAsync(Close, DispatcherPriority.Background);
     }
@@ -130,7 +143,8 @@ public partial class MainWindow : Window
 
     private void ApplyLanguage()
     {
-        Title = "NetBoot DHCP Tool v1.0.7 - Authors: Joel & Codex - 1406829360@qq.com";
+        Title = $"NetBoot DHCP Tool v{CurrentVersionText} - Authors: Joel & Codex - 1406829360@qq.com";
+        TxtVersion.Text = $"{_lang.T("version")}: v{CurrentVersionText}";
         LblLanguage.Text = _lang.T("language");
         BtnRefresh.Content = _lang.T("refresh");
         BtnOpenLogs.Content = _lang.T("open.logs");
@@ -173,6 +187,7 @@ public partial class MainWindow : Window
         BtnImportFavorite.Content = IsChineseUi() ? "导入" : "Import";
         BtnExportFavorite.Content = IsChineseUi() ? "导出" : "Export";
         BtnFavoriteColumns.Content = IsChineseUi() ? "列" : "Columns";
+        BtnOpenFavorite.Content = IsChineseUi() ? "打开网页" : "Open Web";
         LblSearch.Text = _lang.T("search");
         BtnLoadFavorite.Content = _lang.T("load");
         BtnApplyFavorite.Content = _lang.T("apply.and.scan");
@@ -187,6 +202,68 @@ public partial class MainWindow : Window
         ApplyGridHeaders();
         UpdateManualScanButtons();
         UpdateFavoriteButtons();
+        UpdateVersionPresentation();
+    }
+
+    private static string CurrentVersionText => CurrentVersion.ToString(3);
+
+    private async Task CheckForUpdatesAsync()
+    {
+        if (_updateCheckStarted) return;
+        _updateCheckStarted = true;
+        UpdateVersionPresentation();
+        try
+        {
+            _lastUpdateResult = await _updateService.CheckAsync(CurrentVersion, _updateCts.Token);
+            _logger.Info(_lastUpdateResult.Succeeded
+                ? $"Update check completed: current={CurrentVersionText} latest={_lastUpdateResult.LatestVersion} new={_lastUpdateResult.IsNewVersion}"
+                : "Update check failed: " + _lastUpdateResult.Error);
+        }
+        catch (OperationCanceledException) when (_updateCts.IsCancellationRequested)
+        {
+            return;
+        }
+        catch (Exception ex)
+        {
+            _lastUpdateResult = new UpdateCheckResult { CurrentVersion = CurrentVersion, Succeeded = false, Error = ex.Message };
+            _logger.Error("Update check failed", ex);
+        }
+        UpdateVersionPresentation();
+    }
+
+    private void UpdateVersionPresentation()
+    {
+        if (!_updateCheckStarted)
+        {
+            TxtUpdateStatus.Text = "";
+            TxtUpdateLink.Visibility = Visibility.Collapsed;
+            UpdateLink.IsEnabled = false;
+            return;
+        }
+
+        if (_lastUpdateResult == null)
+        {
+            TxtUpdateStatus.Text = _lang.T("checking.update");
+            TxtUpdateLink.Visibility = Visibility.Collapsed;
+            UpdateLink.IsEnabled = false;
+            return;
+        }
+
+        if (_lastUpdateResult.Succeeded && _lastUpdateResult.IsNewVersion)
+        {
+            TxtUpdateStatus.Text = "";
+            UpdateLink.Inlines.Clear();
+            UpdateLink.Inlines.Add(new Run($"{_lang.T("new.version")} v{_lastUpdateResult.LatestVersion}"));
+            UpdateLink.ToolTip = _lastUpdateResult.DownloadUrl;
+            TxtUpdateLink.Visibility = Visibility.Visible;
+            UpdateLink.IsEnabled = true;
+            return;
+        }
+
+        TxtUpdateLink.Visibility = Visibility.Collapsed;
+        UpdateLink.IsEnabled = false;
+        TxtUpdateStatus.Text = _lastUpdateResult.Succeeded ? _lang.T("latest.version") : _lang.T("update.failed");
+        TxtUpdateStatus.ToolTip = _lastUpdateResult.Succeeded ? null : _lastUpdateResult.Error;
     }
 
     private void LoadDefaults()
@@ -247,13 +324,13 @@ public partial class MainWindow : Window
 
     private void LoadFavorites()
     {
-        _allFavorites = JsonStore.LoadOrDefault(_paths.FavoritesFile, new List<FavoriteConfig>(), _logger);
+        _allFavorites = FavoriteStore.Load(_paths.FavoritesFile, _logger, migrateLegacy: true);
         FilterFavorites();
     }
 
     private void SaveFavorites()
     {
-        JsonStore.Save(_paths.FavoritesFile, _allFavorites);
+        FavoriteStore.Save(_paths.FavoritesFile, _allFavorites, _logger);
     }
 
     private void LoadNetworkHistory()
@@ -301,11 +378,15 @@ public partial class MainWindow : Window
             AppDialog.Show(this, _lang.T("start.dhcp"), message);
             return;
         }
+        var serverStarted = false;
+        var adapterConfigured = false;
+        NetworkAdapterInfo? changedAdapter = null;
         try
         {
             SetBusy(true, "Starting DHCP... / 正在启动 DHCP...");
             await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.Render);
             var adapter = SelectedAdapter ?? throw new InvalidOperationException("No adapter selected");
+            changedAdapter = adapter;
             if (adapter.IsWifi && !_settings.AllowDhcpOnWifi) throw new InvalidOperationException(_lang.T("blocked.wifi"));
             if (adapter.HasGateway && !_settings.AllowDhcpOnAdapterWithGateway) throw new InvalidOperationException(_lang.T("blocked.gateway"));
             if (adapter.IsVirtual) throw new InvalidOperationException(_lang.T("blocked.virtual"));
@@ -331,10 +412,11 @@ public partial class MainWindow : Window
             if (!ConfirmConfigurationChange(adapter, DhcpServerIp.Text, DhcpMask.Text, "DHCP")) return;
             await RememberAdapterConfigAsync(adapter);
             await _adapterService.ApplyStaticIPv4Async(adapter, DhcpServerIp.Text, DhcpMask.Text, DhcpGateway.Text, DhcpDns.Text);
+            adapterConfigured = true;
             _activeDhcpAdapterIndex = adapter.InterfaceIndex;
             MarkAdapterIp(adapter, DhcpServerIp.Text);
             await _adapterService.LogReadonlyWlanStateAsync("after DHCP start");
-            await _adapterService.EnsureDhcpFirewallRulesAsync();
+            _dhcpFirewallRules = await _adapterService.EnsureDhcpFirewallRulesAsync();
             var settings = new DhcpServerSettings
             {
                 ServerIp = IPAddress.Parse(DhcpServerIp.Text),
@@ -346,6 +428,7 @@ public partial class MainWindow : Window
                 LeaseSeconds = int.TryParse(DhcpLeaseSeconds.Text, out var lease) ? lease : 3600
             };
             await _dhcpServer.StartAsync(settings);
+            serverStarted = true;
             _dhcpWasStartedInThisSession = true;
             SetDhcpRunningState(true);
             _leasePingTimer.Start();
@@ -356,6 +439,23 @@ public partial class MainWindow : Window
         catch (Exception ex)
         {
             _logger.Error("Start DHCP failed", ex);
+            if (!serverStarted)
+            {
+                await RemoveDhcpFirewallRulesAsync();
+                if (adapterConfigured && changedAdapter != null)
+                {
+                    try
+                    {
+                        await RestoreOriginalAdapterConfigAsync(changedAdapter);
+                        _activeDhcpAdapterIndex = null;
+                        _logger.Info("DHCP startup rollback restored adapter configuration");
+                    }
+                    catch (Exception restoreEx)
+                    {
+                        _logger.Error("DHCP startup rollback failed", restoreEx);
+                    }
+                }
+            }
             AppDialog.Show(this, _lang.T("start.dhcp"), ex.Message, danger: true);
         }
         finally
@@ -371,6 +471,7 @@ public partial class MainWindow : Window
             SetBusy(true, "Stopping DHCP... / 正在停止 DHCP...");
             await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.Render);
             _dhcpServer.Stop();
+            await RemoveDhcpFirewallRulesAsync();
             _leasePingTimer.Stop();
             _leaseHintCts?.Cancel();
             if (RestoreOnStop.IsChecked == true)
@@ -823,7 +924,7 @@ public partial class MainWindow : Window
         if (dialog.ShowDialog(this) != true) return;
         try
         {
-            var imported = JsonStore.LoadOrDefault(dialog.FileName, new List<FavoriteConfig>(), _logger)
+            var imported = FavoriteStore.Load(dialog.FileName, _logger)
                 .Where(IsValidFavorite)
                 .ToList();
             var added = 0;
@@ -867,9 +968,9 @@ public partial class MainWindow : Window
         if (dialog.ShowDialog(this) != true) return;
         try
         {
-            JsonStore.Save(dialog.FileName, _allFavorites);
+            FavoriteStore.SaveCredentialFreeExport(dialog.FileName, _allFavorites);
             _logger.Info("Favorites exported: " + dialog.FileName);
-            AppDialog.Show(this, "Export / 导出", "导出完成。\n" + dialog.FileName);
+            AppDialog.Show(this, "Export / 导出", "导出完成（未包含密码）。\n" + dialog.FileName);
         }
         catch (Exception ex)
         {
@@ -887,6 +988,13 @@ public partial class MainWindow : Window
         SaveFavorites();
         _logger.Info("Favorite loaded: " + fav.Name);
         Tabs.SelectedItem = TabScan;
+    }
+
+    private void OpenFavorite_Click(object sender, RoutedEventArgs e)
+    {
+        if (FavoriteGrid.SelectedItem is not FavoriteConfig fav || !IPAddress.TryParse(fav.TargetIp, out _)) return;
+        OpenUrl($"{(fav.PreferHttps ? "https" : "http")}://{fav.TargetIp}");
+        _logger.Info($"Favorite web opened: {fav.Name} https={fav.PreferHttps}");
     }
 
     private void FavoriteSearch_TextChanged(object sender, TextChangedEventArgs e) => FilterFavorites();
@@ -1029,6 +1137,7 @@ public partial class MainWindow : Window
         BtnLoadFavorite.IsEnabled = selected && !_scanRunning;
         BtnApplyFavorite.IsEnabled = selected && !_scanRunning && SelectedAdapter != null;
         BtnDeleteFavorite.IsEnabled = selected && !_scanRunning;
+        BtnOpenFavorite.IsEnabled = selected && !_scanRunning && FavoriteGrid.SelectedItem is FavoriteConfig openFavorite && IPAddress.TryParse(openFavorite.TargetIp, out _);
         BtnNewFavorite.Background = BtnNewFavorite.IsEnabled ? Brushes.LightBlue : Brushes.LightGray;
         BtnImportFavorite.Background = BtnImportFavorite.IsEnabled ? Brushes.LightBlue : Brushes.LightGray;
         BtnExportFavorite.Background = BtnExportFavorite.IsEnabled ? Brushes.LightBlue : Brushes.LightGray;
@@ -1036,6 +1145,7 @@ public partial class MainWindow : Window
         BtnLoadFavorite.Background = BtnLoadFavorite.IsEnabled ? Brushes.LightBlue : Brushes.LightGray;
         BtnApplyFavorite.Background = BtnApplyFavorite.IsEnabled ? Brushes.LightGreen : Brushes.LightGray;
         BtnDeleteFavorite.Background = BtnDeleteFavorite.IsEnabled ? Brushes.MistyRose : Brushes.LightGray;
+        BtnOpenFavorite.Background = BtnOpenFavorite.IsEnabled ? Brushes.LightBlue : Brushes.LightGray;
     }
 
     private void AdapterBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -1079,6 +1189,8 @@ public partial class MainWindow : Window
             await _adapterService.RestoreIPv4ConfigAsync(adapter, new AdapterIpv4Snapshot
             {
                 DhcpEnabled = backup.DhcpEnabled,
+                Addresses = backup.Addresses,
+                Routes = backup.Routes,
                 IpAddress = backup.IpAddress,
                 PrefixLength = backup.PrefixLength,
                 Gateway = backup.Gateway,
@@ -1150,7 +1262,7 @@ public partial class MainWindow : Window
 
     private void About_Click(object sender, RoutedEventArgs e)
     {
-        AppDialog.Show(this, _lang.T("about"), "NetBoot DHCP Tool v1.0.7\nIPv4 DHCP / Scan / Static Routes / Favorites\nAuthors: Joel & Codex\nEmail: 1406829360@qq.com");
+        AppDialog.Show(this, _lang.T("about"), $"NetBoot DHCP Tool v{CurrentVersionText}\nIPv4 DHCP / Scan / Static Routes / Favorites\nAuthors: Joel & Codex\nEmail: 1406829360@qq.com");
     }
 
     private void LanguageBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -1326,6 +1438,7 @@ public partial class MainWindow : Window
             _leaseHintCts?.Cancel();
             _scanCts?.Cancel();
             _dhcpServer.Stop();
+            await RemoveDhcpFirewallRulesAsync();
             await ClearAppliedRoutesAsync();
             StaticRoutes.Clear();
             if (restoreAdapter)
@@ -1342,6 +1455,21 @@ public partial class MainWindow : Window
         catch (Exception ex)
         {
             _logger.Error("Window closing cleanup failed", ex);
+        }
+    }
+
+    private async Task RemoveDhcpFirewallRulesAsync()
+    {
+        var lease = _dhcpFirewallRules;
+        _dhcpFirewallRules = null;
+        if (lease == null || lease.CreatedRuleNames.Count == 0) return;
+        try
+        {
+            await _adapterService.RemoveDhcpFirewallRulesAsync(lease);
+        }
+        catch (Exception ex)
+        {
+            _logger.Error("Remove DHCP firewall rules failed", ex);
         }
     }
 
@@ -1470,6 +1598,13 @@ public partial class MainWindow : Window
         }
     }
 
+    private void UpdateLink_Click(object sender, RoutedEventArgs e)
+    {
+        if (_lastUpdateResult is not { Succeeded: true, IsNewVersion: true } result || string.IsNullOrWhiteSpace(result.DownloadUrl)) return;
+        OpenUrl(result.DownloadUrl);
+        _logger.Info($"Update download opened: v{result.LatestVersion}");
+    }
+
     private void OpenHttpsLink_Click(object sender, RoutedEventArgs e)
     {
         if (sender is Hyperlink link && link.CommandParameter is string ip) OpenUrl("https://" + ip);
@@ -1530,6 +1665,8 @@ public partial class MainWindow : Window
             PrefixLength = snapshot.PrefixLength,
             Gateway = snapshot.Gateway,
             Dns = snapshot.Dns,
+            Addresses = snapshot.Addresses,
+            Routes = snapshot.Routes,
             AutomaticMetric = snapshot.AutomaticMetric,
             InterfaceMetric = snapshot.InterfaceMetric
         });
@@ -1697,7 +1834,8 @@ public partial class MainWindow : Window
             new() { Name = "SN", Value = fav.SerialNumber },
             new() { Name = IsChineseUi() ? "备注" : "Remark", Value = fav.RemarkName },
             new() { Name = IsChineseUi() ? "账号" : "User", Value = fav.Username },
-            new() { Name = IsChineseUi() ? "密码" : "Password", Value = fav.Password },
+            new() { Name = IsChineseUi() ? "密码" : "Password", Value = fav.PasswordDisplay },
+            new() { Name = IsChineseUi() ? "网页协议" : "Web scheme", Value = fav.PreferHttps ? "HTTPS" : "HTTP" },
             new() { Name = IsChineseUi() ? "本机IP" : "Local IP", Value = fav.LocalIp },
             new() { Name = IsChineseUi() ? "掩码" : "Mask", Value = fav.SubnetMask },
             new() { Name = IsChineseUi() ? "对端IP" : "Target IP", Value = fav.TargetIp },
@@ -1831,6 +1969,9 @@ public partial class MainWindow : Window
         target.Description = source.Description;
         target.Username = source.Username;
         target.Password = source.Password;
+        target.ProtectedPassword = source.ProtectedPassword;
+        target.PasswordUnavailable = source.PasswordUnavailable;
+        target.PreferHttps = source.PreferHttps;
         target.MemoryText = source.MemoryText;
         target.LocalIp = source.LocalIp;
         target.SubnetMask = source.SubnetMask;

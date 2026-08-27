@@ -1,5 +1,22 @@
 # Release Notes
 
+## v1.0.8
+
+NetBoot DHCP Tool v1.0.8 closes the maintenance backlog around local credential safety, network rollback completeness, DHCP lifecycle cleanup, and release update visibility.
+
+### Changes
+
+- Protected favorite passwords with current-user Windows DPAPI; automatically migrated legacy plaintext favorites and made JSON exports credential-free.
+- Added per-favorite HTTPS preference and an explicit Open Web action; password values are masked everywhere in the main UI and details dialog.
+- Captured and restored all non-APIPA IPv4 addresses and all default routes, including route metrics and policy stores, with backward-compatible legacy snapshots.
+- Made DHCP startup transactional and scoped firewall rules to the application; rules created by the current session are removed on stop, failed startup, and window cleanup.
+- Added a background GitHub `latest.json` check. The current version is shown at startup, and a validated newer release appears as a clickable direct download link.
+- Moved main-window binding collections into `MainWindowViewModel` and expanded the smoke suite with DPAPI, updater, DHCP UDP, lease, and snapshot checks.
+
+### Validation
+
+- Release build passed with 0 warnings and 0 errors; the expanded smoke suite passed DPAPI migration/export, updater-manifest validation, DHCP UDP Offer/ACK and bind-failure recovery, lease exhaustion, route normalization, and legacy snapshot checks. The self-contained archive is 63,449,475 bytes, passed 7-Zip testing, has file version 1.0.8.0, and uses SHA256 `adbc955aa2367853321c12f9cbe6c7801879ef3bde9d15df0ec838934b9040a5` in the sidecar and manifest. Remote GitHub release verification is recorded in the feature change log after publication; elevated Hyper-V route smoke was not run because this terminal is not administrator.
+
 ## v1.0.7
 
 NetBoot DHCP Tool v1.0.7 adds session-scoped static route management for isolated Windows network diagnostics.

@@ -21,7 +21,8 @@ public partial class FavoriteWindow : Window
         SnBox.Text = favorite.SerialNumber;
         RemarkBox.Text = favorite.RemarkName;
         UserBox.Text = favorite.Username;
-        PasswordBox.Text = favorite.Password;
+        PasswordBox.Password = favorite.Password;
+        PreferHttpsBox.IsChecked = favorite.PreferHttps;
         IpBox.Text = favorite.LocalIp;
         MaskBox.Text = favorite.SubnetMask;
         TargetIpBox.Text = favorite.TargetIp;
@@ -66,7 +67,8 @@ public partial class FavoriteWindow : Window
         _favorite.SerialNumber = SnBox.Text.Trim();
         _favorite.RemarkName = RemarkBox.Text.Trim();
         _favorite.Username = UserBox.Text.Trim();
-        _favorite.Password = PasswordBox.Text.Trim();
+        _favorite.Password = PasswordBox.Password.Trim();
+        _favorite.PreferHttps = PreferHttpsBox.IsChecked == true;
         _favorite.LocalIp = ip;
         _favorite.SubnetMask = mask;
         _favorite.TargetIp = TargetIpBox.Text.Trim();

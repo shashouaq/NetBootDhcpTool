@@ -113,42 +113,54 @@ $OutputEncoding = [Console]::OutputEncoding
 $PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
 $idx={{adapter.InterfaceIndex}}
 $ipif = Get-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction Stop
-$ips = @(Get-NetIPAddress -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -notlike '169.254.*' } | Select-Object -First 1)
-$routes = @(Get-NetRoute -InterfaceIndex $idx -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Sort-Object RouteMetric | Select-Object -First 1)
+$ips = @(Get-NetIPAddress -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -notlike '169.254.*' } | Sort-Object SkipAsSource,IPAddress | ForEach-Object {
+  [pscustomobject]@{ IpAddress = $_.IPAddress; PrefixLength = [int]$_.PrefixLength }
+})
+$routes = @(Get-NetRoute -InterfaceIndex $idx -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Sort-Object RouteMetric,NextHop | ForEach-Object {
+  [pscustomobject]@{ DestinationPrefix = $_.DestinationPrefix; NextHop = $_.NextHop; RouteMetric = [int]$_.RouteMetric; PolicyStore = [string]$_.PolicyStore }
+})
 $dns = @(Get-DnsClientServerAddress -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses
 [pscustomobject]@{
   DhcpEnabled = ($ipif.Dhcp -eq 'Enabled')
-  IpAddress = if ($ips.Count -gt 0) { $ips[0].IPAddress } else { '' }
+  Addresses = [object[]]$ips
+  Routes = [object[]]$routes
+  IpAddress = if ($ips.Count -gt 0) { $ips[0].IpAddress } else { '' }
   PrefixLength = if ($ips.Count -gt 0) { [int]$ips[0].PrefixLength } else { 24 }
   Gateway = if ($routes.Count -gt 0) { $routes[0].NextHop } else { '' }
   Dns = @($dns)
   AutomaticMetric = [bool]$ipif.AutomaticMetric
   InterfaceMetric = [int]$ipif.InterfaceMetric
-} | ConvertTo-Json -Compress
+} | ConvertTo-Json -Compress -Depth 5
 """;
         var output = await RunPowerShellOutputAsync(script, "PowerShell action capture target adapter IPv4", ct, false);
         var snapshot = JsonSerializer.Deserialize<AdapterIpv4Snapshot>(output) ?? new AdapterIpv4Snapshot();
-        _logger.Info($"Captured adapter IPv4: idx={adapter.InterfaceIndex} dhcp={snapshot.DhcpEnabled} ip={snapshot.IpAddress} gateway={snapshot.Gateway} autoMetric={snapshot.AutomaticMetric} metric={snapshot.InterfaceMetric}");
+        snapshot.NormalizeLegacyFields();
+        _logger.Info($"Captured adapter IPv4: idx={adapter.InterfaceIndex} dhcp={snapshot.DhcpEnabled} addresses={snapshot.Addresses.Count} routes={snapshot.Routes.Count} autoMetric={snapshot.AutomaticMetric} metric={snapshot.InterfaceMetric}");
         return snapshot;
     }
 
     public async Task RestoreIPv4ConfigAsync(NetworkAdapterInfo adapter, AdapterIpv4Snapshot snapshot, CancellationToken ct = default)
     {
         EnsureAllowedTargetAdapter(adapter);
+        snapshot.NormalizeLegacyFields();
         var restoreDnsCommand = snapshot.Dns.Count == 0
-            ? "Set-DnsClientServerAddress -InterfaceIndex $idx -ResetServerAddresses -ErrorAction SilentlyContinue"
-            : "Set-DnsClientServerAddress -InterfaceIndex $idx -ServerAddresses @(" + string.Join(",", snapshot.Dns.Where(x => !string.IsNullOrWhiteSpace(x)).Select(x => "'" + x.Trim().Replace("'", "''") + "'")) + ") -ErrorAction SilentlyContinue";
-        if (snapshot.DhcpEnabled || string.IsNullOrWhiteSpace(snapshot.IpAddress))
+            ? "Set-DnsClientServerAddress -InterfaceIndex $idx -ResetServerAddresses -ErrorAction Stop"
+            : "Set-DnsClientServerAddress -InterfaceIndex $idx -ServerAddresses @("
+              + string.Join(",", snapshot.Dns.Where(x => IPAddress.TryParse(x, out var dns) && dns.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork).Select(PsQuote))
+              + ") -ErrorAction Stop";
+        if (snapshot.DhcpEnabled || snapshot.Addresses.Count == 0)
         {
             var metricScript = snapshot.AutomaticMetric
-                ? "Set-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -AutomaticMetric Enabled -ErrorAction SilentlyContinue"
-                : $"Set-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -AutomaticMetric Disabled -InterfaceMetric {Math.Max(1, snapshot.InterfaceMetric)} -ErrorAction SilentlyContinue";
+                ? "Set-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -AutomaticMetric Enabled -ErrorAction Stop"
+                : $"Set-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -AutomaticMetric Disabled -InterfaceMetric {Math.Max(1, snapshot.InterfaceMetric)} -ErrorAction Stop";
             var dhcpScript = $$"""
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [Console]::OutputEncoding
 $PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
 $idx={{adapter.InterfaceIndex}}
-Set-NetIPInterface -InterfaceIndex $idx -Dhcp Enabled -ErrorAction Stop
+Set-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -Dhcp Disabled -ErrorAction SilentlyContinue
+Get-NetIPAddress -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
+Set-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -Dhcp Enabled -ErrorAction Stop
 {{metricScript}}
 {{restoreDnsCommand}}
 'OK'
@@ -158,11 +170,11 @@ Set-NetIPInterface -InterfaceIndex $idx -Dhcp Enabled -ErrorAction Stop
         }
 
         var metricRestore = snapshot.AutomaticMetric
-            ? "Set-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -AutomaticMetric Enabled -ErrorAction SilentlyContinue"
-            : $"Set-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -AutomaticMetric Disabled -InterfaceMetric {Math.Max(1, snapshot.InterfaceMetric)} -ErrorAction SilentlyContinue";
-        var gatewayPart = string.IsNullOrWhiteSpace(snapshot.Gateway) || snapshot.Gateway.Trim().Equals(snapshot.IpAddress.Trim(), StringComparison.OrdinalIgnoreCase)
-            ? ""
-            : $"-DefaultGateway '{snapshot.Gateway}'";
+            ? "Set-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -AutomaticMetric Enabled -ErrorAction Stop"
+            : $"Set-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -AutomaticMetric Disabled -InterfaceMetric {Math.Max(1, snapshot.InterfaceMetric)} -ErrorAction Stop";
+        var addressCommands = string.Join(Environment.NewLine, snapshot.Addresses.Select(address =>
+            $"New-NetIPAddress -InterfaceIndex $idx -IPAddress {PsQuote(address.IpAddress)} -PrefixLength {ValidatePrefix(address.PrefixLength)} -ErrorAction Stop | Out-Null"));
+        var routeCommands = string.Join(Environment.NewLine, snapshot.Routes.Select(BuildRouteRestoreCommand));
         var script = $$"""
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [Console]::OutputEncoding
@@ -171,7 +183,8 @@ $idx={{adapter.InterfaceIndex}}
 Set-NetIPInterface -InterfaceIndex $idx -Dhcp Disabled -ErrorAction SilentlyContinue
 Get-NetIPAddress -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
 Get-NetRoute -InterfaceIndex $idx -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
-New-NetIPAddress -InterfaceIndex $idx -IPAddress '{{snapshot.IpAddress}}' -PrefixLength {{snapshot.PrefixLength}} {{gatewayPart}} -ErrorAction Stop | Out-Null
+{{addressCommands}}
+{{routeCommands}}
 {{metricRestore}}
 {{restoreDnsCommand}}
 'OK'
@@ -186,23 +199,48 @@ New-NetIPAddress -InterfaceIndex $idx -IPAddress '{{snapshot.IpAddress}}' -Prefi
         return state;
     }
 
-    public Task EnsureDhcpFirewallRulesAsync(CancellationToken ct = default)
+    public async Task<DhcpFirewallRuleLease> EnsureDhcpFirewallRulesAsync(CancellationToken ct = default)
     {
+        var programPath = Environment.ProcessPath ?? Process.GetCurrentProcess().MainModule?.FileName ?? "";
+        var programPart = string.IsNullOrWhiteSpace(programPath) ? "" : $" -Program {PsQuote(programPath)}";
         var script = """
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [Console]::OutputEncoding
 $PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
 $inName='NetBoot DHCP Tool DHCP In'
 $outName='NetBoot DHCP Tool DHCP Out'
+$group='NetBootDhcpTool'
+$created=@()
 if (-not (Get-NetFirewallRule -DisplayName $inName -ErrorAction SilentlyContinue)) {
-  New-NetFirewallRule -DisplayName $inName -Direction Inbound -Action Allow -Protocol UDP -LocalPort 67 -Profile Any | Out-Null
+  New-NetFirewallRule -DisplayName $inName -Group $group -Direction Inbound -Action Allow -Protocol UDP -LocalPort 67 -Profile Any__PROGRAM__ | Out-Null
+  $created += $inName
 }
 if (-not (Get-NetFirewallRule -DisplayName $outName -ErrorAction SilentlyContinue)) {
-  New-NetFirewallRule -DisplayName $outName -Direction Outbound -Action Allow -Protocol UDP -RemotePort 68 -Profile Any | Out-Null
+  New-NetFirewallRule -DisplayName $outName -Group $group -Direction Outbound -Action Allow -Protocol UDP -RemotePort 68 -Profile Any__PROGRAM__ | Out-Null
+  $created += $outName
+}
+[pscustomobject]@{ CreatedRuleNames = @($created) } | ConvertTo-Json -Compress
+""".Replace("__PROGRAM__", programPart, StringComparison.Ordinal);
+        var output = await RunPowerShellOutputAsync(script, "PowerShell action ensure DHCP firewall rules", ct, false);
+        return JsonSerializer.Deserialize<DhcpFirewallRuleLease>(output, JsonStore.Options) ?? new DhcpFirewallRuleLease();
+    }
+
+    public Task RemoveDhcpFirewallRulesAsync(DhcpFirewallRuleLease? lease, CancellationToken ct = default)
+    {
+        if (lease == null || lease.CreatedRuleNames.Count == 0) return Task.CompletedTask;
+        var names = string.Join(",", lease.CreatedRuleNames.Distinct(StringComparer.OrdinalIgnoreCase).Select(PsQuote));
+        var script = $$"""
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [Console]::OutputEncoding
+$PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
+$group='NetBootDhcpTool'
+$names=@({{names}})
+foreach ($name in $names) {
+  Get-NetFirewallRule -DisplayName $name -Group $group -ErrorAction SilentlyContinue | Remove-NetFirewallRule -Confirm:$false -ErrorAction Stop
 }
 'OK'
 """;
-        return RunPowerShellAsync(script, "PowerShell action ensure DHCP firewall rules", ct);
+        return RunPowerShellAsync(script, "PowerShell action remove DHCP firewall rules", ct);
     }
 
     private async Task<WlanReadonlyState> GetReadonlyWlanStateAsync(CancellationToken ct)
@@ -348,17 +386,80 @@ $policyEvent = Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-WLAN-A
         var bytes = mac.GetAddressBytes();
         return bytes.Length == 0 ? "" : string.Join("-", bytes.Select(x => x.ToString("X2")));
     }
+
+    private static string PsQuote(string value) => "'" + (value ?? "").Replace("'", "''") + "'";
+
+    private static string BuildRouteRestoreCommand(AdapterRouteSnapshot route)
+    {
+        var destination = ValidateDestinationPrefix(route.DestinationPrefix);
+        var nextHop = ValidateIpv4(route.NextHop, "route next hop");
+        var metric = ValidateMetric(route.RouteMetric);
+        return $"New-NetRoute -InterfaceIndex $idx -DestinationPrefix {PsQuote(destination)} -NextHop {PsQuote(nextHop)} -RouteMetric {metric} {PolicyStorePart(route.PolicyStore)} -ErrorAction Stop | Out-Null";
+    }
+
+    private static string ValidateIpv4(string value, string field)
+    {
+        if (!IPAddress.TryParse(value, out var ip) || ip.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork)
+            throw new InvalidDataException($"Invalid {field}: {value}");
+        return ip.ToString();
+    }
+
+    private static int ValidatePrefix(int prefix)
+    {
+        if (prefix is < 0 or > 32) throw new InvalidDataException($"Invalid IPv4 prefix length: {prefix}");
+        return prefix;
+    }
+
+    private static int ValidateMetric(int metric)
+    {
+        if (metric is < 0 or > 65535) throw new InvalidDataException($"Invalid route metric: {metric}");
+        return metric;
+    }
+
+    private static string ValidateDestinationPrefix(string value)
+    {
+        if (!value.Equals("0.0.0.0/0", StringComparison.Ordinal)) throw new InvalidDataException($"Unexpected captured default route: {value}");
+        return value;
+    }
+
+    private static string PolicyStorePart(string value)
+    {
+        value ??= "";
+        return value.Equals("ActiveStore", StringComparison.OrdinalIgnoreCase) || value.Equals("PersistentStore", StringComparison.OrdinalIgnoreCase)
+            ? $"-PolicyStore {PsQuote(value)}"
+            : "";
+    }
 }
 
 public sealed class AdapterIpv4Snapshot
 {
     public bool DhcpEnabled { get; set; }
+    public List<AdapterIpv4AddressSnapshot> Addresses { get; set; } = [];
+    public List<AdapterRouteSnapshot> Routes { get; set; } = [];
     public string IpAddress { get; set; } = "";
     public int PrefixLength { get; set; } = 24;
     public string Gateway { get; set; } = "";
     public List<string> Dns { get; set; } = [];
     public bool AutomaticMetric { get; set; } = true;
     public int InterfaceMetric { get; set; } = 0;
+
+    public void NormalizeLegacyFields()
+    {
+        if (Addresses.Count == 0 && !string.IsNullOrWhiteSpace(IpAddress))
+        {
+            Addresses.Add(new AdapterIpv4AddressSnapshot { IpAddress = IpAddress, PrefixLength = PrefixLength });
+        }
+        if (Routes.Count == 0 && !string.IsNullOrWhiteSpace(Gateway))
+        {
+            Routes.Add(new AdapterRouteSnapshot { NextHop = Gateway });
+        }
+        if (string.IsNullOrWhiteSpace(IpAddress) && Addresses.Count > 0)
+        {
+            IpAddress = Addresses[0].IpAddress;
+            PrefixLength = Addresses[0].PrefixLength;
+        }
+        if (string.IsNullOrWhiteSpace(Gateway) && Routes.Count > 0) Gateway = Routes[0].NextHop;
+    }
 
     public string DisplayText
     {
@@ -369,6 +470,11 @@ public sealed class AdapterIpv4Snapshot
             return $"{mode} IP={IpAddress} Prefix={PrefixLength} Gateway={Gateway} AutoMetric={AutomaticMetric} Metric={InterfaceMetric}{dns}";
         }
     }
+}
+
+public sealed class DhcpFirewallRuleLease
+{
+    public List<string> CreatedRuleNames { get; set; } = [];
 }
 
 public sealed class WlanReadonlyState

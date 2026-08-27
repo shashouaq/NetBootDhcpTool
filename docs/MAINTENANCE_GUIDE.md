@@ -7,6 +7,7 @@ This guide is the operating standard for maintaining NetBoot DHCP Tool. Follow i
 - GitHub repository: `https://github.com/shashouaq/NetBootDhcpTool`
 - Default branch: `main`
 - Release tag format: `v<version>`
+- Current application version: `1.0.8`
 - Current release manifest URL:
 
 ```text
@@ -138,15 +139,19 @@ $r = Invoke-WebRequest -Uri "https://github.com/shashouaq/NetBootDhcpTool/releas
 
 ## Local Cleanup Policy
 
-- Keep only the current release in `release/` unless an older version is needed for active troubleshooting.
+- Keep the two newest versioned releases in `release/` for rollback and active troubleshooting; remove older versions.
 - Keep:
   - `release\NetBootDhcpTool`
   - `release\NetBootDhcpTool-tools`
-  - `release\NetBootDhcpTool-v<current-version>`
-  - `release\NetBootDhcpTool-v<current-version>.7z`
-  - `release\NetBootDhcpTool-v<current-version>.7z.sha256`
+  - `release\NetBootDhcpTool-v<newest-version>`
+  - `release\NetBootDhcpTool-v<newest-version>.7z`
+  - `release\NetBootDhcpTool-v<newest-version>.7z.sha256`
+  - `release\NetBootDhcpTool-v<previous-version>`
+  - `release\NetBootDhcpTool-v<previous-version>.7z`
+  - `release\NetBootDhcpTool-v<previous-version>.7z.sha256`
   - `release\latest.json`
   - `release\README_RUN.txt`
+- `build\clean.ps1` removes stale build caches and release assets older than the two newest versions while preserving the canonical current outputs; run `build\publish.ps1` afterward when the current output itself needs rebuilding.
 - Remove stale `src/**/bin` and `src/**/obj` caches when preparing a clean workspace.
 - Do not commit `release/`, `.dotnet/`, `logs/`, `bin/`, or `obj/`.
 
@@ -158,12 +163,15 @@ Future in-app upgrade detection must consume:
 https://github.com/shashouaq/NetBootDhcpTool/releases/latest/download/latest.json
 ```
 
-The app must:
+The app now:
 
 - compare `version` with the running app version
-- open `releasePageUrl` for manual upgrade, or download `downloadUrl`
-- verify the downloaded archive with `archiveSha256`
-- never install a download that fails checksum verification
+- display the running version immediately at startup
+- show a clickable `有新版本！` / `New version available!` link beside the version when a newer validated release exists
+- open the manifest's validated `downloadUrl` in the system browser for direct website download
+- accept only HTTPS GitHub release URLs and a valid SHA256 field; it does not install files automatically
+
+Automatic download, checksum verification of the local file, replacement, and rollback remain out of scope until a signed-update installer is designed.
 
 ## Troubleshooting
 

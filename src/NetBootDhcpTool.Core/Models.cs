@@ -35,7 +35,10 @@ public sealed class FavoriteConfig
     public string RemarkName { get; set; } = "";
     public string Description { get; set; } = "";
     public string Username { get; set; } = "";
+    [JsonIgnore]
     public string Password { get; set; } = "";
+    public string ProtectedPassword { get; set; } = "";
+    public bool PreferHttps { get; set; }
     public string MemoryText { get; set; } = "";
     public string AdapterName { get; set; } = "";
     public string AdapterMac { get; set; } = "";
@@ -45,7 +48,16 @@ public sealed class FavoriteConfig
     public string Dns { get; set; } = "";
     public string TargetIp { get; set; } = "";
     public List<FavoriteField> CustomFields { get; set; } = [];
+    [JsonIgnore]
     public string CustomFieldsSummary => string.Join("; ", CustomFields.Where(x => !string.IsNullOrWhiteSpace(x.Name)).Select(x => string.IsNullOrWhiteSpace(x.Value) ? x.Name : $"{x.Name}={x.Value}"));
+    [JsonIgnore]
+    public bool PasswordUnavailable { get; set; }
+    [JsonIgnore]
+    public bool HasPassword => !string.IsNullOrWhiteSpace(Password) || !string.IsNullOrWhiteSpace(ProtectedPassword);
+    [JsonIgnore]
+    public bool HasUsablePassword => !PasswordUnavailable && !string.IsNullOrWhiteSpace(Password);
+    [JsonIgnore]
+    public string PasswordDisplay => PasswordUnavailable ? "Unavailable / 需重新输入" : HasUsablePassword ? "••••••" : "";
     public DateTime CreatedAt { get; set; } = DateTime.Now;
     public DateTime UpdatedAt { get; set; } = DateTime.Now;
     public DateTime? LastUsedAt { get; set; }
@@ -75,8 +87,24 @@ public sealed class AdapterConfigBackup
     public int PrefixLength { get; set; } = 24;
     public string Gateway { get; set; } = "";
     public List<string> Dns { get; set; } = [];
+    public List<AdapterIpv4AddressSnapshot> Addresses { get; set; } = [];
+    public List<AdapterRouteSnapshot> Routes { get; set; } = [];
     public bool AutomaticMetric { get; set; } = true;
     public int InterfaceMetric { get; set; }
+}
+
+public sealed class AdapterIpv4AddressSnapshot
+{
+    public string IpAddress { get; set; } = "";
+    public int PrefixLength { get; set; } = 24;
+}
+
+public sealed class AdapterRouteSnapshot
+{
+    public string DestinationPrefix { get; set; } = "0.0.0.0/0";
+    public string NextHop { get; set; } = "0.0.0.0";
+    public int RouteMetric { get; set; } = 0;
+    public string PolicyStore { get; set; } = "ActiveStore";
 }
 
 public sealed class StaticRouteRule

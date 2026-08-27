@@ -1,5 +1,7 @@
 ﻿# NetBoot DHCP Tool - Codex 开发指令说明书
 
+> 当前状态说明：本文是历史需求草案，可能包含早期路径和行为描述。当前实现、数据位置、清理策略、版本检查和发布规则以 `README.md`、`PROJECT_MEMORY.md`、`docs/MAINTENANCE_GUIDE.md`、`docs/RELEASE_PROCESS.md` 及源码为准；用户运行数据保存在 `%LOCALAPPDATA%\NetBootDhcpTool`，收藏密码使用 Windows 当前用户 DPAPI 保护。
+
 > 用途：本文件用于直接交给 VS Code / Codex 插件阅读，让 Codex 根据本文档自动创建并开发一个 Windows 绿色免安装网络调试工具。  
 > 项目建议名称：**NetBoot DHCP Tool**  
 > 中文名称：**网口调试 DHCP 绿色工具**  
