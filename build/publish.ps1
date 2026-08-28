@@ -49,6 +49,20 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $hash = (Get-FileHash -Path $archive -Algorithm SHA256).Hash.ToLowerInvariant()
 Set-Content -Path $checksumFile -Value "$hash  $(Split-Path $archive -Leaf)" -Encoding ASCII
+$releaseNotes = ""
+$changeItems = @()
+$changeLogPath = Join-Path $root "docs\FEATURE_CHANGELOG.md"
+if (Test-Path $changeLogPath) {
+    $changeLog = Get-Content -Raw $changeLogPath
+    $section = [regex]::Match($changeLog, "(?ms)^##\s+(?:Unreleased|v$version)\b.*?(?=^##\s+|\z)")
+    if ($section.Success) {
+        $releaseNotes = $section.Value.Trim()
+        $changeItems = @([regex]::Matches($releaseNotes, "(?m)^-\s+(?:Concrete change|User impact|变更内容|用户影响)[：:]?\s*(.+)$") | ForEach-Object { $_.Groups[1].Value.Trim() })
+        if ($changeItems.Count -eq 0) {
+            $changeItems = @([regex]::Matches($releaseNotes, "(?m)^-\s+(.+)$") | ForEach-Object { $_.Groups[1].Value.Trim() })
+        }
+    }
+}
 $downloadUrl = $null
 if (-not [string]::IsNullOrWhiteSpace($GitHubRepository)) {
     $downloadUrl = "https://github.com/$GitHubRepository/releases/download/v$version/$(Split-Path $archive -Leaf)"
@@ -61,6 +75,8 @@ $manifestObject = [ordered]@{
     downloadUrl = $downloadUrl
     releasePageUrl = if ([string]::IsNullOrWhiteSpace($GitHubRepository)) { $null } else { "https://github.com/$GitHubRepository/releases/tag/v$version" }
     minimumSupportedVersion = "1.0.6"
+    releaseNotes = $releaseNotes
+    changes = $changeItems
 }
 $manifestObject | ConvertTo-Json -Depth 3 | Set-Content -Path $manifest -Encoding UTF8
 Write-Host "Published: $release"

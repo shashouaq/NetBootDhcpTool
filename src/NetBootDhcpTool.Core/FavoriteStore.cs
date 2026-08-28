@@ -3,8 +3,9 @@ using System.Text.Json;
 namespace NetBootDhcpTool.Core;
 
 /// <summary>
-/// Loads legacy plaintext favorite files, upgrades them to DPAPI-backed storage,
-/// and produces credential-free exports so a portable file cannot leak passwords.
+/// Loads protected personal favorites and manufacturer-published public presets.
+/// Public factory-default credentials are intentionally kept in plaintext because
+/// they are published preset values; personal favorites retain DPAPI storage.
 /// </summary>
 public static class FavoriteStore
 {
@@ -27,7 +28,13 @@ public static class FavoriteStore
                     legacyFound = true;
                 }
 
-                if (!string.IsNullOrWhiteSpace(favorite.ProtectedPassword))
+                if (!string.IsNullOrWhiteSpace(favorite.PublicPassword))
+                {
+                    favorite.Password = favorite.PublicPassword;
+                    favorite.PasswordUnavailable = false;
+                }
+
+                if (string.IsNullOrWhiteSpace(favorite.Password) && !string.IsNullOrWhiteSpace(favorite.ProtectedPassword))
                 {
                     if (CredentialProtector.TryUnprotect(favorite.ProtectedPassword, out var password))
                     {
@@ -49,7 +56,7 @@ public static class FavoriteStore
                 try
                 {
                     Save(path, favorites, logger);
-                    logger?.Info("Legacy plaintext favorite credentials migrated to Windows DPAPI");
+                    logger?.Info("Legacy personal favorite credentials migrated to Windows DPAPI; public presets remain plaintext");
                 }
                 catch (Exception migrationEx)
                 {
@@ -80,7 +87,7 @@ public static class FavoriteStore
         var persistent = favorites.Select(ToPersistent).ToList();
         JsonStore.Save(path, persistent);
         TryDeleteFavoriteBackup(path, logger);
-        logger?.Info("Favorites saved with protected local credentials");
+        logger?.Info("Favorites saved; public manufacturer presets are plaintext and personal credentials remain protected");
     }
 
     public static void SaveCredentialFreeExport(string path, IEnumerable<FavoriteConfig> favorites)
@@ -100,13 +107,20 @@ public static class FavoriteStore
     private static FavoriteConfig ToPersistent(FavoriteConfig source)
     {
         var clone = Clone(source);
-        if (!string.IsNullOrWhiteSpace(source.Password))
+        if (source.IsPublicDefault)
+        {
+            clone.PublicPassword = source.Password;
+            clone.ProtectedPassword = "";
+        }
+        else if (!string.IsNullOrWhiteSpace(source.Password))
         {
             clone.ProtectedPassword = CredentialProtector.Protect(source.Password);
+            clone.PublicPassword = "";
         }
         else if (!source.PasswordUnavailable)
         {
             clone.ProtectedPassword = "";
+            clone.PublicPassword = "";
         }
         clone.Password = "";
         clone.PasswordUnavailable = false;
@@ -135,7 +149,9 @@ public static class FavoriteStore
         RemarkName = source.RemarkName,
         Description = source.Description,
         Username = source.Username,
+        PublicPassword = source.PublicPassword,
         ProtectedPassword = source.ProtectedPassword,
+        IsPublicDefault = source.IsPublicDefault,
         PreferHttps = source.PreferHttps,
         MemoryText = source.MemoryText,
         AdapterName = source.AdapterName,

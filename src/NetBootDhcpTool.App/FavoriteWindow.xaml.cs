@@ -13,6 +13,7 @@ public partial class FavoriteWindow : Window
     public FavoriteWindow(FavoriteConfig favorite)
     {
         InitializeComponent();
+        Title = "Favorite / 收藏配置";
         _favorite = favorite;
         _customFields = new ObservableCollection<FavoriteField>(favorite.CustomFields.Select(x => new FavoriteField { Name = x.Name, Value = x.Value }));
         CustomFieldGrid.ItemsSource = _customFields;

@@ -13,7 +13,32 @@ public static class Defaults
         else
         {
             var existing = FavoriteStore.Load(paths.FavoritesFile, migrateLegacy: true);
-            if (existing.Count == 0) FavoriteStore.Save(paths.FavoritesFile, DefaultFavorites());
+            var defaults = DefaultFavorites();
+            var changed = false;
+            foreach (var preset in defaults)
+            {
+                var current = existing.FirstOrDefault(x => x.Id.Equals(preset.Id, StringComparison.OrdinalIgnoreCase));
+                if (current == null)
+                {
+                    existing.Add(preset);
+                    changed = true;
+                    continue;
+                }
+
+                // Upgrade the shipped BMC templates once, without overwriting a
+                // user's separately-created favorite with the same display name.
+                if (current.RemarkName.Equals("BMC preset", StringComparison.OrdinalIgnoreCase))
+                {
+                    current.IsPublicDefault = true;
+                    current.Password = preset.Password;
+                    current.PublicPassword = preset.Password;
+                    current.Description = preset.Description;
+                    current.MemoryText = preset.MemoryText;
+                    current.CustomFields = preset.CustomFields;
+                    changed = true;
+                }
+            }
+            if (existing.Count == 0 || changed) FavoriteStore.Save(paths.FavoritesFile, existing);
         }
         var zh = Path.Combine(paths.I18nDirectory, "zh-CN.json");
         var en = Path.Combine(paths.I18nDirectory, "en-US.json");
@@ -26,6 +51,14 @@ public static class Defaults
         ["app.title"] = "NetBoot DHCP Tool",
         ["language"] = "语言",
         ["refresh"] = "刷新",
+        ["rollback"] = "回滚",
+        ["export.results"] = "导出结果",
+        ["diagnostics"] = "网卡诊断",
+        ["package.logs"] = "支持包",
+        ["theme"] = "主题",
+        ["theme.light"] = "浅色主题",
+        ["restart.adapter"] = "重启网卡",
+        ["change.mac"] = "修改 MAC",
         ["open.logs"] = "打开日志",
         ["about"] = "关于",
         ["version"] = "版本",
@@ -52,12 +85,20 @@ public static class Defaults
         ["lease.seconds"] = "租约秒数",
         ["start.dhcp"] = "开始 DHCP",
         ["stop.dhcp"] = "停止 DHCP",
+        ["show.gateway"] = "+ 网关",
+        ["show.dns"] = "+ DNS",
         ["isolated.confirm"] = "我确认当前网络为隔离调试网络",
         ["restore.stop"] = "停止后恢复原始 IP",
         ["apply.scan"] = "应用并扫描",
         ["stop.scan"] = "停止扫描",
+        ["restore.scan"] = "恢复网卡",
         ["add.favorite"] = "加入收藏",
         ["new.favorite"] = "手动新增",
+        ["template.favorite"] = "模板",
+        ["import.favorite"] = "导入",
+        ["export.favorite"] = "导出",
+        ["favorite.columns"] = "列",
+        ["open.favorite"] = "打开网页",
         ["delete"] = "删除",
         ["load"] = "加载",
         ["apply.and.scan"] = "应用并扫描",
@@ -73,6 +114,8 @@ public static class Defaults
         ["blocked.disconnected"] = "当前网卡未连接，不能启动 DHCP。",
         ["allow.wifi"] = "允许在 Wi-Fi 网卡启动 DHCP",
         ["allow.gateway"] = "允许在有默认网关的网卡启动 DHCP",
+        ["allow.restart.any"] = "允许重启无线、虚拟、未连接等所有网卡",
+        ["allow.mac.any"] = "允许修改无线、虚拟、未连接等所有网卡 MAC",
         ["detect.existing.dhcp"] = "启动前检测已有 DHCP 服务",
         ["save"] = "保存",
         ["add.route"] = "新增路由",
@@ -88,7 +131,84 @@ public static class Defaults
         ["dhcp.client.hint"] = "如果客户端 DHCP 超时，请按顺序尝试：重新获取 IP、禁用/启用客户端网卡、拔插对端网线、重启客户端网络服务或设备，并确认网线、交换机、网口指示灯正常。",
         ["dhcp.timeout.hint"] = "45 秒内没有收到客户端 DHCP 请求。请检查网线、交换机、网口指示灯，并在客户端重新获取 IP、禁用/启用网卡、拔插对端网线或重启客户端设备。",
         ["ok"] = "确定",
-        ["cancel"] = "取消"
+        ["cancel"] = "取消",
+        ["about.details"] = "IPv4 DHCP / 扫描 / 静态路由 / 收藏夹\n作者：Joel & Codex\n邮箱：1406829360@qq.com",
+        ["help.language"] = "选择自动、中文或 English 界面语言。",
+        ["help.favorite.search"] = "按名称、设备、序列号、备注或 IP 筛选收藏夹。",
+        ["help.confirm.isolated"] = "确认当前网卡连接的是隔离调试网络；启动 DHCP 前必须勾选。",
+        ["help.restore.stop"] = "停止 DHCP 后恢复启动前保存的网卡 IP 配置。",
+        ["help.lease.grid"] = "显示 DHCP 租约、客户端 MAC/IP、在线状态、Ping 延迟和最后上线时间。",
+        ["help.scan.grid"] = "显示手动扫描发现的 IP、连通性、网页入口、MAC、主机名和最后发现时间。",
+        ["help.route.grid"] = "显示所有本地网卡当前 IPv4 路由；只有新增草稿可被本次运行应用。",
+        ["help.favorite.grid"] = "显示收藏夹的设备、账号、密码、网络参数、备注和自定义字段。",
+        ["help.tab.dhcp"] = "自动 DHCP：在隔离网络中为客户端提供地址租约。",
+        ["help.tab.scan"] = "手动 IP / 扫描：给选中网卡配置临时 IP，并探测目标或网段。",
+        ["help.tab.routes"] = "静态路由：查看所有网卡当前路由，并管理本次运行的新增路由。",
+        ["help.tab.favorites"] = "收藏夹：保存和复用网络扫描参数及服务器带外管理信息。",
+        ["help.tab.settings"] = "设置：调整 DHCP 安全开关、网卡操作范围和退出恢复行为。",
+        ["help.title"] = "帮助",
+        ["help.adapter.selector"] = "当前选择的网卡；顶部选择会影响 DHCP、手动扫描和网卡操作。静态路由页会显示所有网卡的当前路由。",
+        ["help.current.ip"] = "当前网卡的 IPv4 地址；如果本工具修改过地址，同时显示最近一次记录的地址。",
+        ["help.mac.value"] = "当前网卡的 MAC 地址；修改 MAC 后会在这里刷新显示。",
+        ["help.gateway.value"] = "当前网卡检测到的默认网关；有网关的网卡默认禁止启动 DHCP。",
+        ["help.status.value"] = "网卡连接状态，例如 Up 表示已启用，Disconnected/Down 表示未连接或已停用。",
+        ["help.server.ip"] = "DHCP 服务端或手动扫描使用的本机 IPv4 地址。",
+        ["help.subnet.mask"] = "本机 IPv4 子网掩码，用于确定扫描网段。",
+        ["help.pool.start"] = "DHCP 地址池起始地址。",
+        ["help.pool.end"] = "DHCP 地址池结束地址。",
+        ["help.lease.seconds"] = "DHCP 租约有效期，单位为秒。",
+        ["help.manual.ip"] = "手动扫描前要配置到选中网卡的本机 IPv4 地址。",
+        ["help.manual.mask"] = "手动扫描使用的本机 IPv4 子网掩码。",
+        ["help.manual.target.ip"] = "填写后只持续探测这个对端 IP；留空则扫描整个子网。",
+        ["help.refresh"] = "刷新网卡列表，并读取本机所有网卡的当前 IPv4 地址、状态和静态路由；不会主动修改网络配置。",
+        ["help.rollback"] = "回滚选中网卡最近一次保存的网络配置；执行前请确认目标网卡。",
+        ["help.export.results"] = "将当前 DHCP 租约或扫描结果导出为 CSV 文件。",
+        ["help.diagnostics"] = "查看选中网卡的名称、状态、IP、网关、DNS、MAC，以及是否为 Wi-Fi 或虚拟网卡。",
+        ["help.package.logs"] = "将当前运行日志、设置和备份打包为 ZIP，便于问题分析；不会自动发送。",
+        ["help.theme"] = "切换浅色或深色界面主题。",
+        ["help.open.logs"] = "打开本地日志目录。",
+        ["help.about"] = "查看版本、作者和联系方式。",
+        ["help.change.mac"] = "修改选中网卡的 MAC 地址；支持手动输入或随机生成，并可选择正常退出时还原。",
+        ["help.restart.adapter"] = "禁用后重新启用选中网卡；期间该网卡通信会短暂中断。",
+        ["help.clear.log"] = "清空窗口中显示的日志，不会删除磁盘上的日志文件。",
+        ["help.copy.log"] = "复制当前窗口显示的日志文本到剪贴板。",
+        ["help.show.gateway"] = "显示可选的 DHCP 网关输入框；不填写时不会下发网关。",
+        ["help.show.dns"] = "显示可选的 DHCP DNS 输入框；不填写时不会下发 DNS。",
+        ["help.start.dhcp"] = "在确认隔离网络后启动 DHCP 服务；可能影响所选网卡上的客户端。",
+        ["help.stop.dhcp"] = "停止 DHCP 服务，并按设置决定是否恢复原始网卡配置。",
+        ["help.apply.scan"] = "先把手动 IP 和掩码应用到选中网卡，再扫描目标 IP 或整个网段。",
+        ["help.stop.scan"] = "停止当前手动扫描并保留已经得到的结果。",
+        ["help.restore.scan"] = "恢复本次运行中记录的选中网卡原始 IP 配置。",
+        ["help.add.favorite.scan"] = "把当前手动扫描参数加入收藏夹。",
+        ["help.add.route"] = "新增一条静态路由草稿，不会立即写入系统。",
+        ["help.remove.route"] = "删除当前选中的静态路由草稿；已存在系统路由不会被删除。",
+        ["help.apply.routes"] = "应用新增的静态路由；只处理本次会话新增且通过安全检查的路由。",
+        ["help.clear.applied.routes"] = "清除本次运行已应用并记录的静态路由。",
+        ["help.new.favorite"] = "手动创建收藏夹条目。",
+        ["help.template.favorite"] = "从常见服务器厂商模板创建 BMC 收藏夹。",
+        ["help.import.favorite"] = "从 JSON 文件导入收藏夹，并合并到本地收藏夹。",
+        ["help.export.favorite"] = "将收藏夹导出为不含密码的 JSON 文件。",
+        ["help.favorite.columns"] = "选择收藏夹表格显示的列；可拖动表头调整顺序。",
+        ["help.open.favorite"] = "用收藏夹目标 IP 打开 HTTP 或 HTTPS 管理页面。",
+        ["help.load.favorite"] = "把选中收藏夹的本机 IP、掩码和对端 IP 加载到手动扫描页，不执行扫描。",
+        ["help.apply.favorite"] = "加载收藏夹后立即配置网卡并执行一次手动扫描。",
+        ["help.delete.favorite"] = "删除选中的收藏夹；删除前请确认是否还有需要保留的备注。",
+        ["help.save.settings"] = "保存设置中的安全开关和恢复选项。",
+        ["help.favorite.ok"] = "确认并保存收藏夹字段和自定义字段；名称、本机 IP、掩码为必填。",
+        ["help.favorite.cancel"] = "取消编辑并关闭窗口，不保存本次修改。",
+        ["help.favorite.add.field"] = "新增一个自定义字段，并进入编辑状态。",
+        ["help.favorite.delete.field"] = "删除当前选中的自定义字段。",
+        ["help.mac.cancel"] = "取消修改 MAC 并关闭窗口。",
+        ["help.mac.apply"] = "校验并应用输入的 MAC 地址；只有正常退出且勾选还原时才会恢复原 MAC。",
+        ["help.mac.random"] = "生成一个本地管理、单播的随机 MAC 地址。",
+        ["help.dialog.cancel"] = "取消当前确认或操作。",
+        ["help.dialog.ok"] = "确认当前提示并继续操作。",
+        ["help.template.favorite.add"] = "将选中的厂商模板加入收藏夹。",
+        ["help.favorite.columns.close"] = "关闭收藏夹列设置窗口。",
+        ["help.favorite.fields.copy"] = "复制当前收藏夹的自定义字段内容。",
+        ["help.favorite.fields.close"] = "关闭自定义字段查看窗口。",
+        ["help.favorite.details.copy"] = "复制当前收藏夹的详细信息。",
+        ["help.favorite.details.close"] = "关闭收藏夹详情窗口。"
     };
 
     public static Dictionary<string, string> En() => new()
@@ -96,6 +216,14 @@ public static class Defaults
         ["app.title"] = "NetBoot DHCP Tool",
         ["language"] = "Language",
         ["refresh"] = "Refresh",
+        ["rollback"] = "Rollback",
+        ["export.results"] = "Export Results",
+        ["diagnostics"] = "Adapter Diagnostics",
+        ["package.logs"] = "Support Package",
+        ["theme"] = "Theme",
+        ["theme.light"] = "Light Theme",
+        ["restart.adapter"] = "Restart Adapter",
+        ["change.mac"] = "Change MAC",
         ["open.logs"] = "Open Logs",
         ["about"] = "About",
         ["version"] = "Version",
@@ -122,12 +250,20 @@ public static class Defaults
         ["lease.seconds"] = "Lease Seconds",
         ["start.dhcp"] = "Start DHCP",
         ["stop.dhcp"] = "Stop DHCP",
+        ["show.gateway"] = "+ Gateway",
+        ["show.dns"] = "+ DNS",
         ["isolated.confirm"] = "I confirm this is an isolated test network",
         ["restore.stop"] = "Restore original IP after stop",
         ["apply.scan"] = "Apply and Scan",
         ["stop.scan"] = "Stop Scan",
+        ["restore.scan"] = "Restore Adapter",
         ["add.favorite"] = "Add Favorite",
         ["new.favorite"] = "New",
+        ["template.favorite"] = "Templates",
+        ["import.favorite"] = "Import",
+        ["export.favorite"] = "Export",
+        ["favorite.columns"] = "Columns",
+        ["open.favorite"] = "Open Web",
         ["delete"] = "Delete",
         ["load"] = "Load",
         ["apply.and.scan"] = "Apply and Scan",
@@ -143,6 +279,8 @@ public static class Defaults
         ["blocked.disconnected"] = "The selected adapter is disconnected. DHCP cannot start.",
         ["allow.wifi"] = "Allow DHCP on Wi-Fi",
         ["allow.gateway"] = "Allow DHCP on adapter with default gateway",
+        ["allow.restart.any"] = "Allow restarting wireless, virtual, disconnected, and all other adapters",
+        ["allow.mac.any"] = "Allow changing MAC on wireless, virtual, disconnected, and all other adapters",
         ["detect.existing.dhcp"] = "Detect existing DHCP before start",
         ["save"] = "Save",
         ["add.route"] = "Add Route",
@@ -158,7 +296,84 @@ public static class Defaults
         ["dhcp.client.hint"] = "If the client DHCP request times out, try renew IP, disable/enable the client adapter, unplug/replug the client cable, restart the client network service or device, and check cable, switch, and link lights.",
         ["dhcp.timeout.hint"] = "No client DHCP request was received within 45 seconds. Check cable, switch, and link lights, then renew IP, disable/enable the client adapter, unplug/replug the client cable, or restart the client device.",
         ["ok"] = "OK",
-        ["cancel"] = "Cancel"
+        ["cancel"] = "Cancel",
+        ["about.details"] = "IPv4 DHCP / Scan / Static Routes / Favorites\nAuthors: Joel & Codex\nEmail: 1406829360@qq.com",
+        ["help.language"] = "Choose Auto, Chinese, or English for the interface language.",
+        ["help.favorite.search"] = "Filter Favorites by name, device, serial number, remark, or IP.",
+        ["help.confirm.isolated"] = "Confirm that the selected adapter is connected to an isolated test network. This must be checked before DHCP starts.",
+        ["help.restore.stop"] = "Restore the adapter IP configuration saved before DHCP started.",
+        ["help.lease.grid"] = "Shows DHCP leases, client MAC/IP, online state, ping latency, and last-online time.",
+        ["help.scan.grid"] = "Shows discovered IPs, reachability, web links, MAC, hostname, and last-seen time from a manual scan.",
+        ["help.route.grid"] = "Shows current IPv4 routes from all local adapters. Only new drafts can be applied by this run.",
+        ["help.favorite.grid"] = "Shows Favorite device, account, password, network parameters, notes, and custom fields.",
+        ["help.tab.dhcp"] = "Auto DHCP: provide address leases to clients on an isolated network.",
+        ["help.tab.scan"] = "Manual IP / Scan: configure a temporary IP on the selected adapter and probe a target or network.",
+        ["help.tab.routes"] = "Static Routes: view current routes from all adapters and manage routes added by this run.",
+        ["help.tab.favorites"] = "Favorites: save and reuse scan parameters and server out-of-band management details.",
+        ["help.tab.settings"] = "Settings: adjust DHCP safety switches, adapter action scope, and exit restoration behavior.",
+        ["help.title"] = "Help",
+        ["help.adapter.selector"] = "The selected adapter. This selection affects DHCP, manual scanning, and adapter actions. The Static Routes page displays current routes from all adapters.",
+        ["help.current.ip"] = "The selected adapter's IPv4 address. If this tool changed it, the most recently recorded address is also shown.",
+        ["help.mac.value"] = "The selected adapter's current MAC address. It refreshes here after a MAC change.",
+        ["help.gateway.value"] = "The default gateway detected on the selected adapter. DHCP startup is blocked by default when a gateway exists.",
+        ["help.status.value"] = "Adapter connection state. Up means enabled; Disconnected or Down means unavailable or disabled.",
+        ["help.server.ip"] = "The local IPv4 address used by the DHCP server or manual scan.",
+        ["help.subnet.mask"] = "The local IPv4 subnet mask used to determine the scan network.",
+        ["help.pool.start"] = "The first address in the DHCP pool.",
+        ["help.pool.end"] = "The last address in the DHCP pool.",
+        ["help.lease.seconds"] = "The DHCP lease lifetime in seconds.",
+        ["help.manual.ip"] = "The local IPv4 address to apply to the selected adapter before a manual scan.",
+        ["help.manual.mask"] = "The local IPv4 subnet mask used by the manual scan.",
+        ["help.manual.target.ip"] = "When filled, probe only this target IP continuously; when empty, scan the whole subnet.",
+        ["help.refresh"] = "Refresh the adapter list and read current IPv4 addresses, states, and static routes from all local adapters. It does not change network configuration.",
+        ["help.rollback"] = "Restore the most recently saved network configuration for the selected adapter. Confirm the target before continuing.",
+        ["help.export.results"] = "Export the current DHCP leases or scan results to a CSV file.",
+        ["help.diagnostics"] = "View the selected adapter's name, state, IP, gateway, DNS, MAC, and Wi-Fi or virtual status.",
+        ["help.package.logs"] = "Create a ZIP containing runtime logs, settings, and backups for troubleshooting. Nothing is sent automatically.",
+        ["help.theme"] = "Switch between the light and dark interface themes.",
+        ["help.open.logs"] = "Open the local runtime log folder.",
+        ["help.about"] = "View the version, authors, and contact information.",
+        ["help.change.mac"] = "Change the selected adapter's MAC address using manual input or a generated value, with an option to restore it on normal exit.",
+        ["help.restart.adapter"] = "Disable and re-enable the selected adapter. Its traffic will be interrupted briefly.",
+        ["help.clear.log"] = "Clear the log text displayed in this window. Files on disk are not deleted.",
+        ["help.copy.log"] = "Copy the log text currently displayed in this window to the clipboard.",
+        ["help.show.gateway"] = "Show the optional DHCP gateway field. No gateway is sent when it is empty.",
+        ["help.show.dns"] = "Show the optional DHCP DNS field. No DNS value is sent when it is empty.",
+        ["help.start.dhcp"] = "Start the DHCP service after confirming an isolated network. It may affect clients on the selected adapter.",
+        ["help.stop.dhcp"] = "Stop the DHCP service and restore the original adapter configuration according to the setting.",
+        ["help.apply.scan"] = "Apply the manual IP and mask to the selected adapter, then scan the target IP or the whole subnet.",
+        ["help.stop.scan"] = "Stop the current manual scan and keep the results already collected.",
+        ["help.restore.scan"] = "Restore the original IP configuration recorded for the selected adapter during this run.",
+        ["help.add.favorite.scan"] = "Add the current manual-scan parameters to Favorites.",
+        ["help.add.route"] = "Add a static-route draft. It does not write to Windows immediately.",
+        ["help.remove.route"] = "Remove the selected static-route draft. Existing system routes are not removed.",
+        ["help.apply.routes"] = "Apply new static routes that pass safety checks and were created in this session.",
+        ["help.clear.applied.routes"] = "Remove static routes applied and recorded by this run.",
+        ["help.new.favorite"] = "Create a Favorite entry manually.",
+        ["help.template.favorite"] = "Create a BMC Favorite from a common server-vendor template.",
+        ["help.import.favorite"] = "Import Favorites from JSON and merge them into the local collection.",
+        ["help.export.favorite"] = "Export Favorites to a JSON file without passwords.",
+        ["help.favorite.columns"] = "Choose visible Favorite columns and drag headers to reorder them.",
+        ["help.open.favorite"] = "Open the Favorite target IP in an HTTP or HTTPS management page.",
+        ["help.load.favorite"] = "Load the selected Favorite's local IP, mask, and target IP into Manual Scan without scanning.",
+        ["help.apply.favorite"] = "Load the Favorite, configure the adapter, and run one manual scan.",
+        ["help.delete.favorite"] = "Delete the selected Favorite. Confirm that any notes are no longer needed.",
+        ["help.save.settings"] = "Save the safety switches and restoration options in Settings.",
+        ["help.favorite.ok"] = "Validate and save Favorite fields and custom fields. Name, local IP, and mask are required.",
+        ["help.favorite.cancel"] = "Cancel editing and close the window without saving this edit.",
+        ["help.favorite.add.field"] = "Add a custom field and enter edit mode.",
+        ["help.favorite.delete.field"] = "Delete the selected custom field.",
+        ["help.mac.cancel"] = "Cancel the MAC change and close the window.",
+        ["help.mac.apply"] = "Validate and apply the entered MAC address. Restoration occurs only on normal exit when enabled.",
+        ["help.mac.random"] = "Generate a locally administered, unicast random MAC address.",
+        ["help.dialog.cancel"] = "Cancel the current confirmation or operation.",
+        ["help.dialog.ok"] = "Confirm the current message and continue.",
+        ["help.template.favorite.add"] = "Add the selected vendor template to Favorites.",
+        ["help.favorite.columns.close"] = "Close the Favorite column settings window.",
+        ["help.favorite.fields.copy"] = "Copy the current Favorite's custom-field contents.",
+        ["help.favorite.fields.close"] = "Close the custom-fields viewer.",
+        ["help.favorite.details.copy"] = "Copy the current Favorite's detailed information.",
+        ["help.favorite.details.close"] = "Close the Favorite details window."
     };
 
     public static List<FavoriteConfig> DefaultFavorites()
@@ -166,30 +381,40 @@ public static class Defaults
         var now = DateTime.Now;
         return
         [
-            Bmc("Dell iDRAC default", "Dell", "192.168.0.120", "root", "Common iDRAC factory default. Verify by model and site policy.", now),
-            Bmc("HPE iLO default", "HPE", "192.168.1.1", "Administrator", "iLO password is often on the chassis tag; fixed IP varies by generation.", now),
-            Bmc("Lenovo XCC default", "Lenovo", "192.168.70.125", "USERID", "Common Lenovo XClarity Controller default. Verify before use.", now),
-            Bmc("Supermicro IPMI default", "Supermicro", "192.168.100.100", "ADMIN", "Newer devices may use a unique password on the label.", now),
-            Bmc("Inspur BMC template", "Inspur", "192.168.1.100", "admin", "Template entry; verify actual project default.", now),
-            Bmc("Huawei iBMC template", "Huawei", "192.168.2.100", "Administrator", "Template entry; verify actual project default.", now)
+            Bmc("Dell iDRAC legacy default", "Dell", "192.168.0.120", "root", "calvin", "公开旧型号默认值；新型号通常使用机身标签上的唯一密码。", "Public legacy default; newer models commonly use a unique chassis-label password.", "preset-dell-idrac", now),
+            Bmc("HPE iLO default", "HPE", "192.168.0.120", "Administrator", "见机身标签（8位字符）", "默认静态地址和账号公开，但密码按服务器机身标签/型号变化。", "The default address and username are documented; the password varies by model and chassis label.", "preset-hpe-ilo", now),
+            Bmc("Lenovo XCC default", "Lenovo", "192.168.70.125", "USERID", "PASSW0RD", "公开初始账号；首次登录后必须修改。", "Published initial account; change it on first login.", "preset-lenovo-xcc", now),
+            Bmc("Supermicro IPMI legacy default", "Supermicro", "192.168.100.100", "ADMIN", "ADMIN", "旧型号公开默认值；新产品通常使用主板/机箱标签唯一密码。", "Legacy public default; newer products commonly use a unique motherboard/chassis-label password.", "preset-supermicro-ipmi", now),
+            Bmc("Inspur BMC reference", "Inspur", "192.168.1.100", "admin", "以型号手册/标签为准", "不同浪潮型号默认值可能不同，仅作公开资料索引。", "Defaults vary by Inspur model; verify against the model manual or label.", "preset-inspur-bmc", now),
+            Bmc("Huawei iBMC V3", "Huawei", "192.168.2.100", "root", "Huawei12#$", "华为 iBMC V3 公开默认值；首次登录后修改。", "Huawei iBMC V3 published default; change it after first login.", "preset-huawei-ibmc-v3", now),
+            Bmc("Huawei iBMC V5", "Huawei", "192.168.2.100", "Administrator", "Admin@9000", "华为 iBMC V5 公开默认值；首次登录后修改。", "Huawei iBMC V5 published default; change it after first login.", "preset-huawei-ibmc-v5", now),
+            Bmc("H3C HDM default", "H3C", "192.168.1.2", "admin", "Password@_", "H3C HDM 公开默认值；首次登录后修改。", "H3C HDM published default; change it after first login.", "preset-h3c-hdm", now),
+            Bmc("Cisco CIMC legacy default", "Cisco", "10.0.0.1", "admin", "password", "Cisco CIMC 旧版公开默认值；不同平台/版本可能变化。", "Legacy Cisco CIMC public default; verify by platform and firmware.", "preset-cisco-cimc", now),
+            Bmc("Fujitsu iRMC reference", "Fujitsu", "192.168.0.120", "admin", "以机身标签/型号手册为准", "Fujitsu iRMC 默认值随型号变化，仅作公开资料索引。", "Fujitsu iRMC defaults vary by model; verify against the label or manual.", "preset-fujitsu-irmc", now),
+            Bmc("ASRock Rack BMC reference", "ASRock Rack", "192.168.1.100", "admin", "以机身标签/型号手册为准", "ASRock Rack BMC 默认值随型号变化，仅作公开资料索引。", "ASRock Rack BMC defaults vary by model; verify against the label or manual.", "preset-asrockrack-bmc", now),
+            Bmc("Tyan BMC reference", "Tyan", "192.168.1.100", "admin", "以机身标签/型号手册为准", "Tyan BMC 默认值随型号变化，仅作公开资料索引。", "Tyan BMC defaults vary by model; verify against the label or manual.", "preset-tyan-bmc", now)
         ];
     }
 
-    private static FavoriteConfig Bmc(string name, string vendor, string targetIp, string user, string description, DateTime now) => new()
+    private static FavoriteConfig Bmc(string name, string vendor, string targetIp, string user, string password, string description, string descriptionEn, string id, DateTime now) => new()
     {
+        Id = id,
         Name = name,
         DeviceNumber = vendor,
         LocalIp = LocalHostFor(targetIp),
         SubnetMask = "255.255.255.0",
         TargetIp = targetIp,
         Username = user,
-        Description = description,
-        MemoryText = "BMC management port preset. Keep passwords updated according to site policy.",
+        Password = password,
+        IsPublicDefault = true,
+        Description = description + " / " + descriptionEn,
+        MemoryText = "BMC public default preset. Verify model and change credentials after first login. / 带外公开默认模板，请核对型号并在首次登录后修改凭据。",
         CustomFields =
         [
             new FavoriteField { Name = "Type", Value = "BMC" },
             new FavoriteField { Name = "Vendor", Value = vendor },
-            new FavoriteField { Name = "Open", Value = "http://" + targetIp }
+            new FavoriteField { Name = "Open", Value = "http://" + targetIp },
+            new FavoriteField { Name = "Credential source", Value = "Manufacturer public documentation / 厂商公开资料" }
         ],
         CreatedAt = now,
         UpdatedAt = now

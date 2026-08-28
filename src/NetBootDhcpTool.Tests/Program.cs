@@ -41,6 +41,10 @@ Assert(gatewayRoute.NextHop == "10.20.0.1" && gatewayRoute.RouteMetric == 20, "g
 Assert(StaticRouteValidator.Normalize(new StaticRouteRule { DestinationPrefix = "0.0.0.0/0", NextHop = "192.168.100.1", RouteMetric = 5 }).IsDefaultRoute, "default route allowed");
 AssertThrows(() => StaticRouteValidator.Normalize(new StaticRouteRule { DestinationPrefix = "10.0.0.0/8", NextHop = "::1", RouteMetric = 10 }), "ipv6 next hop rejected");
 AssertThrows(() => StaticRouteValidator.Normalize(new StaticRouteRule { DestinationPrefix = "10.0.0.0/8", RouteMetric = 0 }), "invalid metric rejected");
+Assert(NetworkAdapterService.NormalizeMacAddress("02:11:22:33:44:55") == "02-11-22-33-44-55", "MAC normalization");
+var randomMac = NetworkAdapterService.GenerateRandomMacAddress();
+Assert(NetworkAdapterService.NormalizeMacAddress(randomMac) == randomMac, "random MAC format");
+AssertThrows(() => NetworkAdapterService.NormalizeMacAddress("01-11-22-33-44-55"), "multicast MAC rejected");
 var snapshot = new AdapterIpv4Snapshot { IpAddress = "192.168.10.2", PrefixLength = 24, Gateway = "192.168.10.1" };
 snapshot.NormalizeLegacyFields();
 Assert(snapshot.Addresses.Count == 1 && snapshot.Routes.Count == 1, "legacy adapter snapshot normalization");
@@ -62,6 +66,8 @@ smallPool.Allocate("00-00-00-00-00-02", "two");
 AssertThrowsAny(() => smallPool.Allocate("00-00-00-00-00-03", "three"), "lease pool exhaustion");
 TestVersionUpdates();
 TestFavoriteStorage();
+var publicPresets = Defaults.DefaultFavorites();
+Assert(publicPresets.Count >= 10 && publicPresets.All(x => x.IsPublicDefault && !string.IsNullOrWhiteSpace(x.Password)), "public BMC presets");
 await TestDhcpServerAsync();
 TestDhcpServerStartFailureRecovery();
 var tmp = Path.Combine(Path.GetTempPath(), "netboot-test-" + Guid.NewGuid().ToString("N") + ".json");
@@ -110,12 +116,15 @@ static void TestVersionUpdates()
       "archiveName": "NetBootDhcpTool-v1.0.8.7z",
       "archiveSha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
       "downloadUrl": "https://github.com/shashouaq/NetBootDhcpTool/releases/download/v1.0.8/NetBootDhcpTool-v1.0.8.7z",
-      "releasePageUrl": "https://github.com/shashouaq/NetBootDhcpTool/releases/tag/v1.0.8"
+      "releasePageUrl": "https://github.com/shashouaq/NetBootDhcpTool/releases/tag/v1.0.8",
+      "releaseNotes": "## v1.0.8\n- Changes",
+      "changes": ["Changes"]
     }
     """;
     var result = VersionUpdateService.Evaluate(json, new Version(1, 0, 7));
     Assert(result.Succeeded && result.IsNewVersion && result.LatestVersion == new Version(1, 0, 8), "new version manifest");
     Assert(result.DownloadUrl.EndsWith("NetBootDhcpTool-v1.0.8.7z", StringComparison.Ordinal), "direct download URL");
+    Assert(result.Changes.Count == 1 && result.ReleaseNotes.Contains("Changes", StringComparison.Ordinal), "release notes in manifest");
     var current = VersionUpdateService.Evaluate(json, new Version(1, 0, 8));
     Assert(current.Succeeded && !current.IsNewVersion, "current version manifest");
     var unsafeManifest = json.Replace("https://github.com", "http://github.com", StringComparison.Ordinal);
@@ -138,10 +147,18 @@ static void TestFavoriteStorage()
         FavoriteStore.SaveCredentialFreeExport(exportPath, loaded);
         var exported = File.ReadAllText(exportPath);
         Assert(!exported.Contains("dpapi-test-value", StringComparison.Ordinal) && !exported.Contains("\"Password\":", StringComparison.Ordinal), "credential-free favorite export");
+
+        var publicPath = path + ".public.json";
+        var publicFavorite = new FavoriteConfig { Id = "public", Name = "Public preset", IsPublicDefault = true, Password = "PUBLIC_DEFAULT" };
+        FavoriteStore.Save(publicPath, [publicFavorite]);
+        var publicJson = File.ReadAllText(publicPath);
+        Assert(publicJson.Contains("PUBLIC_DEFAULT", StringComparison.Ordinal) && publicJson.Contains("\"PublicPassword\"", StringComparison.Ordinal), "public favorite plaintext credential");
+        var publicLoaded = FavoriteStore.Load(publicPath);
+        Assert(publicLoaded.Count == 1 && publicLoaded[0].Password == "PUBLIC_DEFAULT", "public favorite load");
     }
     finally
     {
-        foreach (var file in new[] { path, path + ".bak", path + ".tmp", exportPath, exportPath + ".bak", exportPath + ".tmp" })
+        foreach (var file in new[] { path, path + ".bak", path + ".tmp", exportPath, exportPath + ".bak", exportPath + ".tmp", path + ".public.json", path + ".public.json.bak", path + ".public.json.tmp" })
         {
             if (File.Exists(file)) File.Delete(file);
         }

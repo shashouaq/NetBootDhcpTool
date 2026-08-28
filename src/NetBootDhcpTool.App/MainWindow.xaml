@@ -9,6 +9,75 @@
       <Setter Property="MinHeight" Value="28"/>
       <Setter Property="Margin" Value="4"/>
       <Setter Property="Padding" Value="10,3"/>
+      <Setter Property="Background" Value="#FFFFFF"/>
+      <Setter Property="BorderBrush" Value="#C8D3E0"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="ButtonBorder" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="8" Padding="{TemplateBinding Padding}">
+              <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}" VerticalAlignment="{TemplateBinding VerticalContentAlignment}" RecognizesAccessKey="True"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="ButtonBorder" Property="Opacity" Value="0.84"/></Trigger>
+              <Trigger Property="IsPressed" Value="True"><Setter TargetName="ButtonBorder" Property="Opacity" Value="0.68"/></Trigger>
+              <Trigger Property="IsEnabled" Value="False"><Setter TargetName="ButtonBorder" Property="Opacity" Value="0.5"/></Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style TargetType="TextBox">
+      <Setter Property="BorderBrush" Value="#C8D3E0"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="Background" Value="#FFFFFF"/>
+      <Setter Property="Padding" Value="6,3"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="TextBox">
+            <Border x:Name="TextBoxBorder" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="7" Padding="{TemplateBinding Padding}">
+              <ScrollViewer x:Name="PART_ContentHost"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsKeyboardFocusWithin" Value="True"><Setter TargetName="TextBoxBorder" Property="BorderBrush" Value="#1769AA"/></Trigger>
+              <Trigger Property="IsEnabled" Value="False"><Setter TargetName="TextBoxBorder" Property="Opacity" Value="0.5"/></Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style TargetType="ComboBox">
+      <Setter Property="Background" Value="#FFFFFF"/>
+      <Setter Property="BorderBrush" Value="#C8D3E0"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="Padding" Value="6,3"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ComboBox">
+            <Grid>
+              <Border x:Name="ComboBorder" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="7" Padding="{TemplateBinding Padding}">
+                <Grid>
+                  <ContentPresenter Margin="0,0,22,0" Content="{TemplateBinding SelectionBoxItem}" ContentTemplate="{TemplateBinding SelectionBoxItemTemplate}" VerticalAlignment="Center" HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"/>
+                  <ToggleButton IsChecked="{Binding IsDropDownOpen, RelativeSource={RelativeSource TemplatedParent}}" ClickMode="Press" Focusable="False" Background="Transparent" BorderThickness="0" HorizontalAlignment="Right" Width="22">
+                    <TextBlock Text="⌄" FontSize="14" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                  </ToggleButton>
+                </Grid>
+              </Border>
+              <Popup x:Name="PART_Popup" AllowsTransparency="True" Placement="Bottom" IsOpen="{TemplateBinding IsDropDownOpen}" Focusable="False" PopupAnimation="Slide">
+                <Border Background="#FFFFFF" BorderBrush="#C8D3E0" BorderThickness="1" CornerRadius="7" Padding="3" MinWidth="{Binding ActualWidth, RelativeSource={RelativeSource TemplatedParent}}">
+                  <ScrollViewer MaxHeight="360" CanContentScroll="True">
+                    <ItemsPresenter KeyboardNavigation.DirectionalNavigation="Contained"/>
+                  </ScrollViewer>
+                </Border>
+              </Popup>
+            </Grid>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsKeyboardFocusWithin" Value="True"><Setter TargetName="ComboBorder" Property="BorderBrush" Value="#1769AA"/></Trigger>
+              <Trigger Property="IsEnabled" Value="False"><Setter TargetName="ComboBorder" Property="Opacity" Value="0.5"/></Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
     </Style>
     <Style x:Key="CellText" TargetType="TextBlock">
       <Setter Property="TextWrapping" Value="Wrap"/>
@@ -36,8 +105,8 @@
       </Style.Triggers>
     </Style>
   </Window.Resources>
-  <Grid x:Name="RootGrid">
-  <DockPanel Margin="10">
+  <Grid x:Name="RootGrid" Background="#F8FAFC">
+  <DockPanel Margin="10" xmlns:help="clr-namespace:NetBootDhcpTool.App">
     <ToolBar DockPanel.Dock="Top">
       <TextBlock x:Name="LblLanguage"/>
       <ComboBox x:Name="LanguageBox" Width="110" SelectionChanged="LanguageBox_SelectionChanged">
@@ -45,14 +114,14 @@
         <ComboBoxItem Content="中文" Tag="zh-CN"/>
         <ComboBoxItem Content="English" Tag="en-US"/>
       </ComboBox>
-      <Button x:Name="BtnRefresh" Click="RefreshAdapters_Click"/>
-      <Button x:Name="BtnRollback" Content="Rollback / 回滚" Click="Rollback_Click"/>
-      <Button x:Name="BtnExport" Content="Export / 导出" Click="ExportResults_Click"/>
-      <Button x:Name="BtnDiagnostics" Content="Diagnostics / 诊断" Click="Diagnostics_Click"/>
-      <Button x:Name="BtnPackageLogs" Content="Support / 支持包" Click="PackageLogs_Click"/>
-      <Button x:Name="BtnTheme" Content="Theme / 主题" Click="Theme_Click"/>
-      <Button x:Name="BtnOpenLogs" Click="OpenLogs_Click"/>
-      <Button x:Name="BtnAbout" Click="About_Click"/>
+      <Button x:Name="BtnRefresh" help:HelpButtonService.HelpKey="help.refresh" Click="RefreshAdapters_Click"/>
+      <Button x:Name="BtnRollback" help:HelpButtonService.HelpKey="help.rollback" Content="Rollback / 回滚" Click="Rollback_Click"/>
+      <Button x:Name="BtnExport" help:HelpButtonService.HelpKey="help.export.results" Content="Export / 导出" Click="ExportResults_Click"/>
+      <Button x:Name="BtnDiagnostics" help:HelpButtonService.HelpKey="help.diagnostics" Content="Diagnostics / 诊断" Click="Diagnostics_Click"/>
+      <Button x:Name="BtnPackageLogs" help:HelpButtonService.HelpKey="help.package.logs" Content="Support / 支持包" Click="PackageLogs_Click"/>
+      <Button x:Name="BtnTheme" help:HelpButtonService.HelpKey="help.theme" Content="Theme / 主题" Click="Theme_Click"/>
+      <Button x:Name="BtnOpenLogs" help:HelpButtonService.HelpKey="help.open.logs" Click="OpenLogs_Click"/>
+      <Button x:Name="BtnAbout" help:HelpButtonService.HelpKey="help.about" Click="About_Click"/>
       <Separator/>
       <TextBlock x:Name="TxtVersion" Margin="8,0,0,0" FontWeight="SemiBold"/>
       <TextBlock x:Name="TxtUpdateStatus" Margin="6,0,0,0"/>
@@ -72,35 +141,43 @@
           <ColumnDefinition Width="Auto"/>
           <ColumnDefinition Width="1.1*"/>
           <ColumnDefinition Width="Auto"/>
-          <ColumnDefinition Width="70"/>
+          <ColumnDefinition Width="145"/>
         </Grid.ColumnDefinitions>
         <TextBlock x:Name="LblAdapter" Grid.Column="0" Margin="0,0,8,0"/>
         <ComboBox x:Name="AdapterBox" Grid.Column="1" Margin="0,0,8,0" DisplayMemberPath="DisplayName" SelectionChanged="AdapterBox_SelectionChanged"/>
         <Border Grid.Column="2" Background="White" BorderBrush="#D8E0EA" BorderThickness="1" CornerRadius="4" Padding="8,3" Margin="0,0,12,0"><TextBlock x:Name="TxtCurrentIp" FontWeight="SemiBold" Foreground="#0B5394"/></Border>
         <TextBlock x:Name="LblMac" Grid.Column="3" Margin="0,0,8,0"/>
-        <TextBlock x:Name="TxtMac" Grid.Column="4" Margin="0,0,16,0"/>
+        <StackPanel Grid.Column="4" Margin="0,0,16,0">
+          <TextBlock x:Name="TxtMac"/>
+          <Button x:Name="BtnChangeMac" help:HelpButtonService.HelpKey="help.change.mac" Click="ChangeMac_Click" HorizontalAlignment="Left" Width="130" Margin="0,4,0,0"/>
+        </StackPanel>
         <TextBlock x:Name="LblGateway" Grid.Column="5" Margin="0,0,8,0"/>
         <TextBlock x:Name="TxtGateway" Grid.Column="6" Margin="0,0,16,0"/>
         <TextBlock x:Name="LblStatus" Grid.Column="7" Margin="0,0,8,0"/>
-        <TextBlock x:Name="TxtStatus" Grid.Column="8" FontWeight="SemiBold"/>
+        <StackPanel Grid.Column="8">
+          <TextBlock x:Name="TxtStatus" FontWeight="SemiBold"/>
+          <Button x:Name="BtnRestartAdapter" help:HelpButtonService.HelpKey="help.restart.adapter" Click="RestartAdapter_Click" HorizontalAlignment="Left" Width="130" Margin="0,4,0,0"/>
+        </StackPanel>
         <ItemsControl x:Name="IpHistoryList" Grid.Row="1" Grid.Column="1" Grid.ColumnSpan="7" Margin="0,8,0,0" ItemsSource="{Binding AdapterIpHistory}">
           <ItemsControl.ItemsPanel><ItemsPanelTemplate><WrapPanel/></ItemsPanelTemplate></ItemsControl.ItemsPanel>
           <ItemsControl.ItemTemplate><DataTemplate><Border Background="White" BorderBrush="#D8E0EA" BorderThickness="1" CornerRadius="10" Padding="8,3" Margin="0,0,6,0"><TextBlock Text="{Binding DisplayText}" Foreground="#57606A"/></Border></DataTemplate></ItemsControl.ItemTemplate>
         </ItemsControl>
       </Grid>
     </Border>
-    <Grid DockPanel.Dock="Bottom" Height="150" Margin="0,8,0,0">
+    <Border DockPanel.Dock="Bottom" Height="150" Margin="0,8,0,0" Background="#FFFFFF" BorderBrush="#D5DEE8" BorderThickness="1" CornerRadius="10" Padding="6">
+    <Grid>
       <Grid.RowDefinitions>
         <RowDefinition Height="Auto"/>
         <RowDefinition Height="*"/>
       </Grid.RowDefinitions>
       <StackPanel Orientation="Horizontal">
-        <Button x:Name="BtnClearLog" Click="ClearLog_Click"/>
-        <Button x:Name="BtnOpenLogs2" Click="OpenLogs_Click"/>
-        <Button x:Name="BtnCopyLog" Click="CopyLog_Click"/>
+        <Button x:Name="BtnClearLog" help:HelpButtonService.HelpKey="help.clear.log" Click="ClearLog_Click"/>
+        <Button x:Name="BtnOpenLogs2" help:HelpButtonService.HelpKey="help.open.logs" Click="OpenLogs_Click"/>
+        <Button x:Name="BtnCopyLog" help:HelpButtonService.HelpKey="help.copy.log" Click="CopyLog_Click"/>
       </StackPanel>
       <RichTextBox x:Name="LogBox" Grid.Row="1" IsReadOnly="True" IsDocumentEnabled="False" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto" FontFamily="Consolas" BorderThickness="1" BorderBrush="#D0D7DE"/>
     </Grid>
+    </Border>
     <TabControl x:Name="Tabs" SelectionChanged="Tabs_SelectionChanged">
       <TabItem x:Name="TabDhcp">
         <Grid Margin="8">
@@ -118,18 +195,18 @@
             <TextBox x:Name="DhcpStart" Width="120" Margin="6" TextChanged="DhcpNetworkInput_TextChanged"/>
             <TextBlock x:Name="LblPoolEnd"/>
             <TextBox x:Name="DhcpEnd" Width="120" Margin="6" TextChanged="DhcpNetworkInput_TextChanged"/>
-            <Button x:Name="BtnShowDhcpGateway" Content="+ Gateway / 网关" Click="ShowDhcpGateway_Click"/>
+            <Button x:Name="BtnShowDhcpGateway" help:HelpButtonService.HelpKey="help.show.gateway" Content="+ Gateway / 网关" Click="ShowDhcpGateway_Click"/>
             <TextBlock x:Name="LblDhcpGateway" Visibility="Collapsed"/>
             <TextBox x:Name="DhcpGateway" Width="120" Margin="6" Visibility="Collapsed"/>
-            <Button x:Name="BtnShowDhcpDns" Content="+ DNS" Click="ShowDhcpDns_Click"/>
+            <Button x:Name="BtnShowDhcpDns" help:HelpButtonService.HelpKey="help.show.dns" Content="+ DNS" Click="ShowDhcpDns_Click"/>
             <TextBlock x:Name="LblDhcpDns" Visibility="Collapsed"/>
             <TextBox x:Name="DhcpDns" Width="120" Margin="6" Visibility="Collapsed"/>
             <TextBlock x:Name="LblLeaseSeconds"/>
             <TextBox x:Name="DhcpLeaseSeconds" Width="80" Margin="6"/>
             <CheckBox x:Name="DhcpConfirm" Margin="6"/>
             <CheckBox x:Name="RestoreOnStop" Margin="6"/>
-            <Button x:Name="BtnStartDhcp" Click="StartDhcp_Click"/>
-            <Button x:Name="BtnStopDhcp" Click="StopDhcp_Click"/>
+            <Button x:Name="BtnStartDhcp" help:HelpButtonService.HelpKey="help.start.dhcp" Click="StartDhcp_Click"/>
+            <Button x:Name="BtnStopDhcp" help:HelpButtonService.HelpKey="help.stop.dhcp" Click="StopDhcp_Click"/>
           </WrapPanel>
           <TextBlock x:Name="DhcpHint" Grid.Row="1" Margin="2,4,2,6" Foreground="#B06000" FontWeight="SemiBold"/>
           <DataGrid x:Name="LeaseGrid" Grid.Row="2" ItemsSource="{Binding Leases}" AutoGenerateColumns="False" IsReadOnly="False" CanUserResizeColumns="True" CanUserResizeRows="True">
@@ -167,10 +244,10 @@
             <TextBox x:Name="ManualMask" Width="120" Margin="6" TextChanged="ManualInput_TextChanged"/>
             <TextBlock x:Name="LblManualTargetIp"/>
             <TextBox x:Name="ManualTargetIp" Width="120" Margin="6" TextChanged="ManualInput_TextChanged"/>
-            <Button x:Name="BtnApplyScan" Click="ApplyScan_Click"/>
-            <Button x:Name="BtnStopScan" Click="StopScan_Click"/>
-            <Button x:Name="BtnRestoreScan" Content="Restore / 恢复网卡" Click="RestoreScan_Click"/>
-            <Button x:Name="BtnAddFavorite" Click="AddFavorite_Click"/>
+            <Button x:Name="BtnApplyScan" help:HelpButtonService.HelpKey="help.apply.scan" Click="ApplyScan_Click"/>
+            <Button x:Name="BtnStopScan" help:HelpButtonService.HelpKey="help.stop.scan" Click="StopScan_Click"/>
+            <Button x:Name="BtnRestoreScan" help:HelpButtonService.HelpKey="help.restore.scan" Content="Restore / 恢复网卡" Click="RestoreScan_Click"/>
+            <Button x:Name="BtnAddFavorite" help:HelpButtonService.HelpKey="help.add.favorite.scan" Click="AddFavorite_Click"/>
             <TextBlock x:Name="TxtManualAdapterIp" Margin="12,0,0,0" Foreground="#57606A" MinWidth="260"/>
           </WrapPanel>
           <StackPanel Grid.Row="1" Orientation="Horizontal">
@@ -205,21 +282,26 @@
             <RowDefinition Height="*"/>
           </Grid.RowDefinitions>
           <WrapPanel>
-            <Button x:Name="BtnAddRoute" Click="AddRoute_Click"/>
-            <Button x:Name="BtnRemoveRoute" Click="RemoveRoute_Click"/>
-            <Button x:Name="BtnApplyRoutes" Click="ApplyRoutes_Click"/>
-            <Button x:Name="BtnClearAppliedRoutes" Click="ClearAppliedRoutes_Click"/>
+            <Button x:Name="BtnAddRoute" help:HelpButtonService.HelpKey="help.add.route" Click="AddRoute_Click"/>
+            <Button x:Name="BtnRemoveRoute" help:HelpButtonService.HelpKey="help.remove.route" Click="RemoveRoute_Click"/>
+            <Button x:Name="BtnApplyRoutes" help:HelpButtonService.HelpKey="help.apply.routes" Click="ApplyRoutes_Click"/>
+            <Button x:Name="BtnClearAppliedRoutes" help:HelpButtonService.HelpKey="help.clear.applied.routes" Click="ClearAppliedRoutes_Click"/>
           </WrapPanel>
           <TextBlock x:Name="RouteHint" Grid.Row="1" Margin="2,4,2,6" Foreground="#B06000" FontWeight="SemiBold"/>
-          <DataGrid x:Name="RouteGrid" Grid.Row="2" ItemsSource="{Binding StaticRoutes}" AutoGenerateColumns="False" CanUserResizeColumns="True" CanUserResizeRows="True" CanUserAddRows="False" SelectionMode="Single">
+          <DataGrid x:Name="RouteGrid" Grid.Row="2" ItemsSource="{Binding StaticRoutes}" AutoGenerateColumns="False" CanUserResizeColumns="True" CanUserResizeRows="True" CanUserAddRows="False" SelectionMode="Single" RowHeight="32" EnableRowVirtualization="True" EnableColumnVirtualization="True" VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling" ScrollViewer.CanContentScroll="True">
             <DataGrid.Columns>
               <DataGridTextColumn Header="Destination / 目标网段" Binding="{Binding DestinationPrefix, UpdateSourceTrigger=PropertyChanged}" Width="190" ElementStyle="{StaticResource CellText}"/>
               <DataGridTemplateColumn Header="Adapter / 网卡" Width="270">
                 <DataGridTemplateColumn.CellTemplate>
                   <DataTemplate>
-                    <ComboBox ItemsSource="{Binding DataContext.Adapters, RelativeSource={RelativeSource AncestorType={x:Type DataGrid}}}" DisplayMemberPath="DisplayName" SelectedValuePath="Id" SelectedValue="{Binding AdapterId, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" SelectionChanged="RouteAdapter_SelectionChanged" MinWidth="240"/>
+                    <TextBlock Text="{Binding AdapterName}" Padding="4,2" TextTrimming="CharacterEllipsis" ToolTip="{Binding AdapterName}"/>
                   </DataTemplate>
                 </DataGridTemplateColumn.CellTemplate>
+                <DataGridTemplateColumn.CellEditingTemplate>
+                  <DataTemplate>
+                    <ComboBox ItemsSource="{Binding DataContext.Adapters, RelativeSource={RelativeSource AncestorType={x:Type DataGrid}}}" DisplayMemberPath="DisplayName" SelectedValuePath="Id" SelectedValue="{Binding AdapterId, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" SelectionChanged="RouteAdapter_SelectionChanged" MinWidth="240"/>
+                  </DataTemplate>
+                </DataGridTemplateColumn.CellEditingTemplate>
               </DataGridTemplateColumn>
               <DataGridTextColumn Header="Gateway / 网关" Binding="{Binding NextHop, UpdateSourceTrigger=PropertyChanged}" Width="165" ElementStyle="{StaticResource CellText}"/>
               <DataGridTextColumn Header="Metric / 跃点" Binding="{Binding RouteMetric, UpdateSourceTrigger=PropertyChanged}" Width="95" ElementStyle="{StaticResource CellText}"/>
@@ -237,15 +319,15 @@
           <StackPanel Orientation="Horizontal">
             <TextBlock x:Name="LblSearch"/>
             <TextBox x:Name="FavoriteSearch" Width="240" Margin="6" TextChanged="FavoriteSearch_TextChanged"/>
-            <Button x:Name="BtnNewFavorite" Click="NewFavorite_Click"/>
-            <Button x:Name="BtnTemplateFavorite" Content="Templates / 模板" Click="TemplateFavorite_Click"/>
-            <Button x:Name="BtnImportFavorite" Content="Import / 导入" Click="ImportFavorites_Click"/>
-            <Button x:Name="BtnExportFavorite" Content="Export / 导出" Click="ExportFavorites_Click"/>
-            <Button x:Name="BtnFavoriteColumns" Content="Columns / 列" Click="FavoriteColumns_Click"/>
-            <Button x:Name="BtnOpenFavorite" Content="Open Web / 打开网页" Click="OpenFavorite_Click"/>
-            <Button x:Name="BtnLoadFavorite" Click="LoadFavorite_Click"/>
-            <Button x:Name="BtnApplyFavorite" Click="ApplyFavorite_Click"/>
-            <Button x:Name="BtnDeleteFavorite" Click="DeleteFavorite_Click"/>
+            <Button x:Name="BtnNewFavorite" help:HelpButtonService.HelpKey="help.new.favorite" Click="NewFavorite_Click"/>
+            <Button x:Name="BtnTemplateFavorite" help:HelpButtonService.HelpKey="help.template.favorite" Content="Templates / 模板" Click="TemplateFavorite_Click"/>
+            <Button x:Name="BtnImportFavorite" help:HelpButtonService.HelpKey="help.import.favorite" Content="Import / 导入" Click="ImportFavorites_Click"/>
+            <Button x:Name="BtnExportFavorite" help:HelpButtonService.HelpKey="help.export.favorite" Content="Export / 导出" Click="ExportFavorites_Click"/>
+            <Button x:Name="BtnFavoriteColumns" help:HelpButtonService.HelpKey="help.favorite.columns" Content="Columns / 列" Click="FavoriteColumns_Click"/>
+            <Button x:Name="BtnOpenFavorite" help:HelpButtonService.HelpKey="help.open.favorite" Content="Open Web / 打开网页" Click="OpenFavorite_Click"/>
+            <Button x:Name="BtnLoadFavorite" help:HelpButtonService.HelpKey="help.load.favorite" Click="LoadFavorite_Click"/>
+            <Button x:Name="BtnApplyFavorite" help:HelpButtonService.HelpKey="help.apply.favorite" Click="ApplyFavorite_Click"/>
+            <Button x:Name="BtnDeleteFavorite" help:HelpButtonService.HelpKey="help.delete.favorite" Click="DeleteFavorite_Click"/>
           </StackPanel>
           <DataGrid x:Name="FavoriteGrid" Grid.Row="1" ItemsSource="{Binding Favorites}" AutoGenerateColumns="False" IsReadOnly="True" CanUserResizeColumns="True" CanUserReorderColumns="True" CanUserResizeRows="False" RowHeight="34" SelectionChanged="FavoriteGrid_SelectionChanged" MouseDoubleClick="FavoriteGrid_MouseDoubleClick">
             <DataGrid.Columns>
@@ -272,12 +354,22 @@
         </Grid>
       </TabItem>
       <TabItem x:Name="TabSettings">
-        <StackPanel Margin="12">
-          <CheckBox x:Name="AllowWifi"/>
-          <CheckBox x:Name="AllowGateway"/>
-          <CheckBox x:Name="DetectExistingDhcp"/>
-          <Button x:Name="BtnSaveSettings" Width="120" HorizontalAlignment="Left" Click="SaveSettings_Click"/>
-        </StackPanel>
+        <ScrollViewer VerticalScrollBarVisibility="Auto">
+          <StackPanel Margin="12">
+            <Border Background="#FFFFFF" BorderBrush="#D5DEE8" BorderThickness="1" CornerRadius="12" Padding="16" Margin="0,0,0,12">
+              <StackPanel>
+                <TextBlock Text="Network safety / 网卡操作安全" FontSize="18" FontWeight="SemiBold" Margin="0,0,0,10"/>
+                <CheckBox x:Name="AllowWifi" Margin="0,4"/>
+                <CheckBox x:Name="AllowGateway" Margin="0,4"/>
+                <CheckBox x:Name="DetectExistingDhcp" Margin="0,4"/>
+                <CheckBox x:Name="AllowRestartAnyAdapter" Margin="0,4"/>
+                <CheckBox x:Name="AllowMacChangeAnyAdapter" Margin="0,4"/>
+                <TextBlock Text="Restart/MAC controls can affect wireless, virtual, disconnected, or production adapters when enabled. Use only when you understand the impact. / 启用后重启/MAC 操作可影响无线、虚拟、未连接或生产网卡，请确认影响范围。" Foreground="#8A4B00" TextWrapping="Wrap" Margin="0,10,0,0"/>
+              </StackPanel>
+            </Border>
+            <Button x:Name="BtnSaveSettings" help:HelpButtonService.HelpKey="help.save.settings" Width="120" HorizontalAlignment="Left" Click="SaveSettings_Click"/>
+          </StackPanel>
+        </ScrollViewer>
       </TabItem>
     </TabControl>
   </DockPanel>

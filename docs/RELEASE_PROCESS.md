@@ -48,7 +48,7 @@ For static route changes, run `build\route-smoke.ps1` as administrator when Hype
 
 ## GitHub Release Standard
 
-Every finished source change must be committed and pushed to `https://github.com/shashouaq/NetBootDhcpTool` before handoff. Every version upgrade must also push its tag and update the GitHub Release assets.
+Local source changes are not committed/pushed or published unless the user explicitly says `发布` or `release`. A normal feature change stops after local validation and source-preview startup. When publication is explicitly authorized, verify the remote commit, tag, release, and assets before claiming GitHub publication.
 
 Create a GitHub Release with:
 
@@ -85,5 +85,7 @@ The manifest contains:
 - `downloadUrl`: direct GitHub asset URL.
 - `releasePageUrl`: user-facing GitHub release page.
 - `minimumSupportedVersion`: oldest version allowed to use this update path.
+- `releaseNotes`: Markdown release-note section extracted from the unreleased/current-version change-log section.
+- `changes`: concise change items extracted from the same change-log section for the in-app update dialog.
 
-When `version` is newer than the running version, the UI shows a clickable `有新版本！` / `New version available!` link beside the current version and opens `downloadUrl` in the system browser. The current release does not install or replace files automatically; a future installer must verify `archiveSha256` and provide rollback before adding that behavior.
+When `version` is newer than the running version, the UI shows a clickable `有新版本！` / `New version available!` link beside the current version. The link shows the release changes and starts a background download to the user's Downloads folder after confirmation. The archive is written to a temporary `.download` file and SHA-256 verified before it is moved into place; it is never installed automatically. Below 3 KB/s for 10 continuous seconds only produces an email contact hint and no automatic email.

@@ -4,6 +4,7 @@ using System.Net.NetworkInformation;
 using System.Security.Principal;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using NetBootDhcpTool.Core;
 
 namespace NetBootDhcpTool.Network;
@@ -23,7 +24,7 @@ public sealed class NetworkAdapterService
         return new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator);
     }
 
-    public IReadOnlyList<NetworkAdapterInfo> GetAdapters()
+    public IReadOnlyList<NetworkAdapterInfo> GetAdapters(bool logAdapters = true)
     {
         var adapters = new List<NetworkAdapterInfo>();
         foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
@@ -31,8 +32,6 @@ public sealed class NetworkAdapterService
             try
             {
                 if (ni.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
-                if (ni.Description.Contains("Bluetooth", StringComparison.OrdinalIgnoreCase)) continue;
-
                 var props = ni.GetIPProperties();
                 var ipv4Props = TryGetIPv4Properties(props, ni.Name);
                 if (ipv4Props == null && TryFindNetAdapterIndex(ni.Name) <= 0) continue;
@@ -58,7 +57,7 @@ public sealed class NetworkAdapterService
                     IsVirtual = IsVirtual(ni.Name, ni.Description)
                 };
                 adapters.Add(info);
-                _logger.Info($"Adapter: {info.Name} {info.Description} IP={info.IPv4Address} MAC={info.MacAddress} Gateway={info.Gateway}");
+                if (logAdapters) _logger.Info($"Adapter: {info.Name} {info.Description} IP={info.IPv4Address} MAC={info.MacAddress} Gateway={info.Gateway}");
             }
             catch (Exception ex)
             {
@@ -66,6 +65,68 @@ public sealed class NetworkAdapterService
             }
         }
         return adapters;
+    }
+
+    public async Task RestartAdapterAsync(NetworkAdapterInfo adapter, bool allowAnyAdapter, CancellationToken ct = default)
+    {
+        EnsureControlTargetAdapter(adapter, allowAnyAdapter);
+        var script = $$"""
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [Console]::OutputEncoding
+$PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
+$idx={{adapter.InterfaceIndex}}
+$netAdapter = Get-NetAdapter -InterfaceIndex $idx -ErrorAction Stop
+$wasDisabled = $netAdapter.Status -eq 'Disabled'
+if ($wasDisabled) {
+  Enable-NetAdapter -InterfaceIndex $idx -Confirm:$false -ErrorAction Stop
+  Start-Sleep -Milliseconds 500
+}
+Disable-NetAdapter -InterfaceIndex $idx -Confirm:$false -ErrorAction Stop
+Start-Sleep -Milliseconds 750
+Enable-NetAdapter -InterfaceIndex $idx -Confirm:$false -ErrorAction Stop
+[pscustomobject]@{ InterfaceIndex = $idx; WasDisabled = [bool]$wasDisabled; Status = (Get-NetAdapter -InterfaceIndex $idx -ErrorAction SilentlyContinue).Status } | ConvertTo-Json -Compress
+""";
+        await RunPowerShellAsync(script, $"PowerShell action restart adapter idx={adapter.InterfaceIndex} name={adapter.Name}", ct);
+    }
+
+    public async Task ChangeMacAddressAsync(NetworkAdapterInfo adapter, string macAddress, bool allowAnyAdapter, CancellationToken ct = default)
+    {
+        EnsureControlTargetAdapter(adapter, allowAnyAdapter);
+        var normalized = NormalizeMacAddress(macAddress);
+        var script = $$"""
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [Console]::OutputEncoding
+$PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
+$idx={{adapter.InterfaceIndex}}
+$mac={{PsQuote(normalized)}}
+$netAdapter = Get-NetAdapter -InterfaceIndex $idx -ErrorAction Stop
+$netAdapter | Set-NetAdapter -MacAddress $mac -Confirm:$false -ErrorAction Stop
+Start-Sleep -Milliseconds 500
+[pscustomobject]@{ InterfaceIndex = $idx; RequestedMac = $mac; CurrentMac = (Get-NetAdapter -InterfaceIndex $idx -ErrorAction Stop).MacAddress } | ConvertTo-Json -Compress
+""";
+        await RunPowerShellAsync(script, $"PowerShell action change adapter MAC idx={adapter.InterfaceIndex} mac={normalized}", ct);
+    }
+
+    public Task RestoreMacAddressAsync(NetworkAdapterInfo adapter, string originalMacAddress, CancellationToken ct = default)
+    {
+        return ChangeMacAddressAsync(adapter, originalMacAddress, allowAnyAdapter: true, ct);
+    }
+
+    public static string NormalizeMacAddress(string value)
+    {
+        var compact = Regex.Replace(value ?? "", "[^0-9A-Fa-f]", "");
+        if (compact.Length != 12 || !compact.All(Uri.IsHexDigit)) throw new FormatException("MAC 地址必须是 12 位十六进制字符");
+        if (!byte.TryParse(compact[..2], System.Globalization.NumberStyles.HexNumber, null, out var first)) throw new FormatException("MAC 地址格式无效");
+        if ((first & 1) != 0) throw new FormatException("MAC 地址不能是组播地址");
+        return string.Join("-", Enumerable.Range(0, 6).Select(i => compact.Substring(i * 2, 2).ToUpperInvariant()));
+    }
+
+    public static string GenerateRandomMacAddress()
+    {
+        var bytes = new byte[6];
+        Random.Shared.NextBytes(bytes);
+        bytes[0] = (byte)((bytes[0] & 0xFC) | 0x02); // locally administered, unicast
+        return string.Join("-", bytes.Select(x => x.ToString("X2")));
     }
 
     public async Task ApplyStaticIPv4Async(NetworkAdapterInfo adapter, string ip, string mask, string gateway, string dns, CancellationToken ct = default)
@@ -333,6 +394,16 @@ $policyEvent = Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-WLAN-A
     {
         if (string.IsNullOrWhiteSpace(adapter.InterfaceIndex)) throw new InvalidOperationException("InterfaceIndex missing");
         if (adapter.IsWifi || IsWifiLike(adapter.Name, adapter.Description, null)) throw new InvalidOperationException("Refusing to modify WLAN adapter");
+    }
+
+    private static void EnsureControlTargetAdapter(NetworkAdapterInfo adapter, bool allowAnyAdapter)
+    {
+        if (string.IsNullOrWhiteSpace(adapter.InterfaceIndex)) throw new InvalidOperationException("InterfaceIndex missing");
+        if (allowAnyAdapter) return;
+        if (adapter.IsWifi || IsWifiLike(adapter.Name, adapter.Description, null) || adapter.IsVirtual)
+            throw new InvalidOperationException("设置当前禁止操作无线或虚拟网卡");
+        if (!adapter.Status.Equals("Up", StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("设置当前禁止操作未启用的网卡");
     }
 
     private IPv4InterfaceProperties? TryGetIPv4Properties(IPInterfaceProperties props, string adapterName)

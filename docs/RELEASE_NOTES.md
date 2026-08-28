@@ -1,5 +1,21 @@
 # Release Notes
 
+## v1.0.9
+
+NetBoot DHCP Tool v1.0.9 adds adapter controls, complete local static-route visibility, responsive route rendering, bilingual contextual help, and safer update/release workflows.
+
+### Changes
+
+- Added selected-adapter restart and MAC address changes with manual or locally administered random values, configurable adapter safety switches, and normal-exit restoration.
+- Added manufacturer-published BMC default presets as explicit public plaintext records while keeping personal favorite credentials protected.
+- Displayed all current IPv4 static routes across local interfaces by default, kept existing routes display-only, and optimized route rendering to avoid UI freezes.
+- Added bilingual labels/help coverage, compact contextual `?` controls, hover explanations, rounded UI surfaces, run-scoped logs, and update manifest/download behavior.
+- Recorded the complete change set in `docs/FEATURE_CHANGELOG.md`; the release archive is not auto-installed by the updater.
+
+### Validation
+
+- Release build and smoke tests passed before packaging; the self-contained archive, SHA256 sidecar, `latest.json`, GitHub tag, release, and assets are verified in the v1.0.9 release verification entry of `docs/FEATURE_CHANGELOG.md`.
+
 ## v1.0.8
 
 NetBoot DHCP Tool v1.0.8 closes the maintenance backlog around local credential safety, network rollback completeness, DHCP lifecycle cleanup, and release update visibility.

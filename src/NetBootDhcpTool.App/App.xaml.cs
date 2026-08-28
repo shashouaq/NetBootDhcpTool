@@ -6,12 +6,15 @@ namespace NetBootDhcpTool.App;
 
 public partial class App : Application
 {
+    public FileLogger? Logger { get; private set; }
+
     protected override void OnStartup(StartupEventArgs e)
     {
         var paths = new AppPaths(AppContext.BaseDirectory);
         paths.Ensure();
         Defaults.EnsureFiles(paths);
         var logger = new FileLogger(paths);
+        Logger = logger;
         DispatcherUnhandledException += (_, args) =>
         {
             logger.Error("Unhandled UI exception", args.Exception);
@@ -19,6 +22,7 @@ public partial class App : Application
             args.Handled = true;
         };
         AppDomain.CurrentDomain.UnhandledException += (_, args2) => logger.Error("Unhandled exception", args2.ExceptionObject as Exception);
+        logger.Info($"Log session started: file={logger.SessionLogPath}");
         logger.Info("Application start");
         var isAdmin = IsAdministrator();
         logger.Info("Administrator=" + isAdmin);
@@ -34,7 +38,7 @@ public partial class App : Application
     {
         try
         {
-            new FileLogger(new AppPaths(AppContext.BaseDirectory)).Info("Application exit");
+            Logger?.Info("Application exit");
         }
         catch { }
         base.OnExit(e);

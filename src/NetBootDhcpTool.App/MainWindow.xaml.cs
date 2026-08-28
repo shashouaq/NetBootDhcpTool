@@ -34,6 +34,7 @@ public partial class MainWindow : Window
     private readonly MainWindowViewModel _viewModel;
     private readonly VersionUpdateService _updateService;
     private readonly CancellationTokenSource _updateCts = new();
+    private readonly CancellationTokenSource _updateDownloadCts = new();
     private readonly SemaphoreSlim _leaseUpdateGate = new(1, 1);
     private AppSettings _settings;
     private List<FavoriteConfig> _allFavorites = [];
@@ -42,7 +43,7 @@ public partial class MainWindow : Window
     private CancellationTokenSource? _scanCts;
     private CancellationTokenSource? _leaseHintCts;
     private readonly DispatcherTimer _leasePingTimer = new() { Interval = TimeSpan.FromSeconds(2) };
-    private readonly DispatcherTimer _adapterStatusTimer = new() { Interval = TimeSpan.FromMilliseconds(750) };
+    private readonly DispatcherTimer _adapterStatusTimer = new() { Interval = TimeSpan.FromSeconds(3) };
     private bool _leaseProbeInProgress;
     private bool _closingCleanupStarted;
     private bool _closeAfterCleanup;
@@ -50,11 +51,16 @@ public partial class MainWindow : Window
     private bool _dhcpWasStartedInThisSession;
     private readonly Dictionary<string, string> _lastAdapterIps = new();
     private readonly Dictionary<string, AdapterIpv4Snapshot> _originalAdapterConfigs = new();
+    private readonly Dictionary<string, AdapterMacBackup> _originalAdapterMacs = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<AppliedStaticRoute> _appliedStaticRoutes = [];
     private TabItem? _lastBusinessTab;
     private string? _activeDhcpAdapterIndex;
     private bool _syncingNetworkInputs;
     private bool _adapterStatusRefreshInProgress;
+    private bool _adapterRefreshInProgress;
+    private bool _adapterActionInProgress;
+    private bool _updateDownloadInProgress;
+    private bool _updateSlowWarningShown;
     private bool _darkTheme;
     private string? _businessConfigurationFingerprint;
     private DhcpFirewallRuleLease? _dhcpFirewallRules;
@@ -71,12 +77,13 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
+        AddHandler(Button.ClickEvent, new RoutedEventHandler(LogButtonClick), true);
         _viewModel = new MainWindowViewModel();
         DataContext = _viewModel;
         _paths = new AppPaths(AppContext.BaseDirectory);
         Defaults.EnsureFiles(_paths);
-        _logger = new FileLogger(_paths);
-        _logger.LineWritten += line => Dispatcher.Invoke(() =>
+        _logger = (Application.Current as App)?.Logger ?? new FileLogger(_paths);
+        _logger.LineWritten += line => Dispatcher.BeginInvoke(() =>
         {
             AppendLogLine(line);
         });
@@ -101,15 +108,15 @@ public partial class MainWindow : Window
         LoadNetworkHistory();
         _adapterBackups = JsonStore.LoadOrDefault(_paths.AdapterBackupsFile, new List<AdapterConfigBackup>(), _logger);
         _operationHistory = JsonStore.LoadOrDefault(_paths.OperationHistoryFile, new List<OperationHistoryItem>(), _logger);
-        RefreshAdapters();
         SetDhcpRunningState(false);
+        UpdateAdapterActionButtons();
         UpdateManualScanButtons();
         UpdateFavoriteButtons();
-        _adapterStatusTimer.Start();
         _logger.Info("MainWindow ready");
         Dispatcher.BeginInvoke(() =>
         {
             SetBusy(false);
+            _ = RefreshAdaptersAsync();
             _ = RecoverStaleRoutesAsync();
             _ = CheckForUpdatesAsync();
         }, DispatcherPriority.ApplicationIdle);
@@ -130,23 +137,36 @@ public partial class MainWindow : Window
         NetworkChange.NetworkAvailabilityChanged -= NetworkAvailabilityChanged;
         _adapterStatusTimer.Stop();
         _updateCts.Cancel();
+        _updateDownloadCts.Cancel();
         IsEnabled = false;
         SetBusy(true, "Cleaning up... / 正在清理工作环境...");
         await CleanupWorkEnvironmentAsync();
         _updateService.Dispose();
         _updateCts.Dispose();
+        _updateDownloadCts.Dispose();
         _closeAfterCleanup = true;
         await Dispatcher.InvokeAsync(Close, DispatcherPriority.Background);
     }
 
     private NetworkAdapterInfo? SelectedAdapter => AdapterBox.SelectedItem as NetworkAdapterInfo;
 
+    private static string AdapterKey(NetworkAdapterInfo adapter) =>
+        !string.IsNullOrWhiteSpace(adapter.Id) ? adapter.Id : adapter.InterfaceIndex;
+
     private void ApplyLanguage()
     {
         Title = $"NetBoot DHCP Tool v{CurrentVersionText} - Authors: Joel & Codex - 1406829360@qq.com";
         TxtVersion.Text = $"{_lang.T("version")}: v{CurrentVersionText}";
         LblLanguage.Text = _lang.T("language");
+        LanguageBox.ToolTip = _lang.T("help.language");
         BtnRefresh.Content = _lang.T("refresh");
+        BtnRollback.Content = _lang.T("rollback");
+        BtnExport.Content = _lang.T("export.results");
+        BtnDiagnostics.Content = _lang.T("diagnostics");
+        BtnPackageLogs.Content = _lang.T("package.logs");
+        BtnTheme.Content = _darkTheme ? _lang.T("theme.light") : _lang.T("theme");
+        BtnRestartAdapter.Content = _lang.T("restart.adapter");
+        BtnChangeMac.Content = _lang.T("change.mac");
         BtnOpenLogs.Content = _lang.T("open.logs");
         BtnOpenLogs2.Content = _lang.T("open.logs");
         BtnAbout.Content = _lang.T("about");
@@ -168,8 +188,8 @@ public partial class MainWindow : Window
         LblLeaseSeconds.Text = _lang.T("lease.seconds");
         BtnStartDhcp.Content = _lang.T("start.dhcp");
         BtnStopDhcp.Content = _lang.T("stop.dhcp");
-        BtnShowDhcpGateway.Content = IsChineseUi() ? "+ 网关" : "+ Gateway";
-        BtnShowDhcpDns.Content = "+ DNS";
+        BtnShowDhcpGateway.Content = _lang.T("show.gateway");
+        BtnShowDhcpDns.Content = _lang.T("show.dns");
         DhcpConfirm.Content = _lang.T("isolated.confirm");
         RestoreOnStop.Content = _lang.T("restore.stop");
         LblManualIp.Text = _lang.T("server.ip");
@@ -177,6 +197,7 @@ public partial class MainWindow : Window
         LblManualTargetIp.Text = _lang.T("target.ip");
         BtnApplyScan.Content = _lang.T("apply.scan");
         BtnStopScan.Content = _lang.T("stop.scan");
+        BtnRestoreScan.Content = _lang.T("restore.scan");
         BtnAddRoute.Content = _lang.T("add.route");
         BtnRemoveRoute.Content = _lang.T("remove.route");
         BtnApplyRoutes.Content = _lang.T("apply.routes");
@@ -184,10 +205,11 @@ public partial class MainWindow : Window
         RouteHint.Text = _lang.T("route.hint");
         BtnAddFavorite.Content = _lang.T("add.favorite");
         BtnNewFavorite.Content = _lang.T("new.favorite");
-        BtnImportFavorite.Content = IsChineseUi() ? "导入" : "Import";
-        BtnExportFavorite.Content = IsChineseUi() ? "导出" : "Export";
-        BtnFavoriteColumns.Content = IsChineseUi() ? "列" : "Columns";
-        BtnOpenFavorite.Content = IsChineseUi() ? "打开网页" : "Open Web";
+        BtnTemplateFavorite.Content = _lang.T("template.favorite");
+        BtnImportFavorite.Content = _lang.T("import.favorite");
+        BtnExportFavorite.Content = _lang.T("export.favorite");
+        BtnFavoriteColumns.Content = _lang.T("favorite.columns");
+        BtnOpenFavorite.Content = _lang.T("open.favorite");
         LblSearch.Text = _lang.T("search");
         BtnLoadFavorite.Content = _lang.T("load");
         BtnApplyFavorite.Content = _lang.T("apply.and.scan");
@@ -197,8 +219,35 @@ public partial class MainWindow : Window
         AllowWifi.Content = _lang.T("allow.wifi");
         AllowGateway.Content = _lang.T("allow.gateway");
         DetectExistingDhcp.Content = _lang.T("detect.existing.dhcp");
+        AllowRestartAnyAdapter.Content = _lang.T("allow.restart.any");
+        AllowMacChangeAnyAdapter.Content = _lang.T("allow.mac.any");
         BtnSaveSettings.Content = _lang.T("save");
         DhcpHint.Text = _lang.T("dhcp.client.hint");
+        AdapterBox.ToolTip = _lang.T("help.adapter.selector");
+        TxtCurrentIp.ToolTip = _lang.T("help.current.ip");
+        TxtMac.ToolTip = _lang.T("help.mac.value");
+        TxtGateway.ToolTip = _lang.T("help.gateway.value");
+        TxtStatus.ToolTip = _lang.T("help.status.value");
+        DhcpServerIp.ToolTip = _lang.T("help.server.ip");
+        DhcpMask.ToolTip = _lang.T("help.subnet.mask");
+        DhcpStart.ToolTip = _lang.T("help.pool.start");
+        DhcpEnd.ToolTip = _lang.T("help.pool.end");
+        DhcpLeaseSeconds.ToolTip = _lang.T("help.lease.seconds");
+        ManualIp.ToolTip = _lang.T("help.manual.ip");
+        ManualMask.ToolTip = _lang.T("help.manual.mask");
+        ManualTargetIp.ToolTip = _lang.T("help.manual.target.ip");
+        FavoriteSearch.ToolTip = _lang.T("help.favorite.search");
+        DhcpConfirm.ToolTip = _lang.T("help.confirm.isolated");
+        RestoreOnStop.ToolTip = _lang.T("help.restore.stop");
+        LeaseGrid.ToolTip = _lang.T("help.lease.grid");
+        ScanGrid.ToolTip = _lang.T("help.scan.grid");
+        RouteGrid.ToolTip = _lang.T("help.route.grid");
+        FavoriteGrid.ToolTip = _lang.T("help.favorite.grid");
+        TabDhcp.ToolTip = _lang.T("help.tab.dhcp");
+        TabScan.ToolTip = _lang.T("help.tab.scan");
+        TabRoutes.ToolTip = _lang.T("help.tab.routes");
+        TabFavorites.ToolTip = _lang.T("help.tab.favorites");
+        TabSettings.ToolTip = _lang.T("help.tab.settings");
         ApplyGridHeaders();
         UpdateManualScanButtons();
         UpdateFavoriteButtons();
@@ -283,20 +332,26 @@ public partial class MainWindow : Window
         AllowWifi.IsChecked = _settings.AllowDhcpOnWifi;
         AllowGateway.IsChecked = _settings.AllowDhcpOnAdapterWithGateway;
         DetectExistingDhcp.IsChecked = _settings.DetectExistingDhcpBeforeStart;
+        AllowRestartAnyAdapter.IsChecked = _settings.AllowRestartOnAnyAdapter;
+        AllowMacChangeAnyAdapter.IsChecked = _settings.AllowMacChangeOnAnyAdapter;
         SelectLanguageBox(_settings.Language);
     }
 
-    private void RefreshAdapters()
+    private async Task RefreshAdaptersAsync()
     {
+        if (_adapterRefreshInProgress) return;
+        _adapterRefreshInProgress = true;
+        var previousIndex = SelectedAdapter?.InterfaceIndex;
         try
         {
-            Adapters.Clear();
-            var adapters = _adapterService.GetAdapters()
+            SetBusy(true, "Loading network adapters... / 正在加载网卡...");
+            var adapters = (await Task.Run(() => _adapterService.GetAdapters()))
                 .OrderBy(x => x.IsVirtual)
                 .ThenBy(x => x.IsWifi)
                 .ThenBy(x => !x.Status.Equals("Up", StringComparison.OrdinalIgnoreCase))
                 .ThenBy(x => x.Name, StringComparer.CurrentCultureIgnoreCase)
                 .ToList();
+            Adapters.Clear();
             foreach (var item in adapters)
             {
                 Adapters.Add(item);
@@ -304,7 +359,8 @@ public partial class MainWindow : Window
             AdapterBox.ItemsSource = Adapters;
             if (Adapters.Count > 0)
             {
-                var preferred = Adapters.FirstOrDefault(x => !x.IsVirtual && !x.IsWifi && x.Status.Equals("Up", StringComparison.OrdinalIgnoreCase))
+                var preferred = Adapters.FirstOrDefault(x => !string.IsNullOrWhiteSpace(previousIndex) && x.InterfaceIndex.Equals(previousIndex, StringComparison.OrdinalIgnoreCase))
+                    ?? Adapters.FirstOrDefault(x => !x.IsVirtual && !x.IsWifi && x.Status.Equals("Up", StringComparison.OrdinalIgnoreCase))
                     ?? Adapters.FirstOrDefault(x => !x.IsVirtual && !x.IsWifi)
                     ?? Adapters.FirstOrDefault(x => !x.IsVirtual)
                     ?? Adapters.FirstOrDefault();
@@ -312,6 +368,7 @@ public partial class MainWindow : Window
             }
             if (Adapters.Count == 0) _logger.Warn("No adapters found for UI");
             RefreshRouteAdapterMetadata();
+            await LoadCurrentStaticRoutesAsync(adapters);
             _businessConfigurationFingerprint = CaptureBusinessConfigurationFingerprint();
             _logger.Info($"UI adapter list loaded: count={Adapters.Count}, selected={SelectedAdapter?.DisplayName ?? ""}");
         }
@@ -319,6 +376,46 @@ public partial class MainWindow : Window
         {
             _logger.Error("Refresh adapters failed", ex);
             AppDialog.Show(this, _lang.T("refresh"), ex.Message, danger: true);
+        }
+        finally
+        {
+            _adapterRefreshInProgress = false;
+            SetBusy(false);
+            UpdateAdapterActionButtons();
+            if (!_closingCleanupStarted) _adapterStatusTimer.Start();
+        }
+    }
+
+    private async Task LoadCurrentStaticRoutesAsync(IReadOnlyList<NetworkAdapterInfo> adapters)
+    {
+        try
+        {
+            var adapterByIndex = adapters
+                .Where(x => !string.IsNullOrWhiteSpace(x.InterfaceIndex))
+                .ToDictionary(x => x.InterfaceIndex, StringComparer.OrdinalIgnoreCase);
+            foreach (var row in StaticRoutes.Where(x => x.IsExistingRoute).ToList()) StaticRoutes.Remove(row);
+            var routes = await _routeService.GetCurrentStaticRoutesAsync();
+            foreach (var route in routes)
+            {
+                adapterByIndex.TryGetValue(route.InterfaceIndex, out var adapter);
+                StaticRoutes.Insert(0, new StaticRouteRule
+                {
+                    DestinationPrefix = route.DestinationPrefix,
+                    AdapterId = adapter?.Id ?? "",
+                    AdapterName = adapter?.Name ?? $"Interface {route.InterfaceIndex} / 未枚举接口",
+                    AdapterMac = adapter?.MacAddress ?? "",
+                    NextHop = route.NextHop == "0.0.0.0" ? "" : route.NextHop,
+                    RouteMetric = route.RouteMetric,
+                    Status = $"Existing route / 已有路由 ({route.Protocol})",
+                    IsExistingRoute = true
+                });
+            }
+            RouteGrid?.Items.Refresh();
+            _logger.Info($"Current static routes loaded: count={routes.Count}");
+        }
+        catch (Exception ex)
+        {
+            _logger.Warn("Read current static routes failed: " + ex.Message);
         }
     }
 
@@ -627,6 +724,107 @@ public partial class MainWindow : Window
         RouteGrid.ScrollIntoView(rule);
     }
 
+    private async void RestartAdapter_Click(object sender, RoutedEventArgs e)
+    {
+        if (_adapterActionInProgress) return;
+        var adapter = SelectedAdapter;
+        if (adapter == null)
+        {
+            AppDialog.Show(this, _lang.T("restart.adapter"), IsChineseUi() ? "请先选择网卡。" : "Select an adapter first.");
+            return;
+        }
+        if (!AppDialog.Show(this,
+            _lang.T("restart.adapter"),
+            IsChineseUi()
+                ? $"{adapter.DisplayName}\n\n将执行禁用 → 启用，可能暂时中断此网卡通信。是否继续？"
+                : $"{adapter.DisplayName}\n\nThe adapter will be disabled and enabled, temporarily interrupting its traffic. Continue?",
+            confirm: true,
+            danger: true)) return;
+
+        _adapterActionInProgress = true;
+        UpdateAdapterActionButtons();
+        try
+        {
+            SetBusy(true, IsChineseUi() ? "正在重启网卡，请稍后..." : "Restarting adapter, please wait...");
+            await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.Render);
+            await _adapterService.RestartAdapterAsync(adapter, _settings.AllowRestartOnAnyAdapter);
+            _logger.Info($"Adapter restart completed: idx={adapter.InterfaceIndex} name={adapter.Name} status={adapter.Status}");
+            await RefreshAdaptersAsync();
+        }
+        catch (Exception ex)
+        {
+            _logger.Error($"Adapter restart failed: idx={adapter.InterfaceIndex} name={adapter.Name}", ex);
+            AppDialog.Show(this, _lang.T("restart.adapter"), ex.Message, danger: true);
+        }
+        finally
+        {
+            _adapterActionInProgress = false;
+            UpdateAdapterActionButtons();
+            SetBusy(false);
+        }
+    }
+
+    private async void ChangeMac_Click(object sender, RoutedEventArgs e)
+    {
+        if (_adapterActionInProgress) return;
+        var adapter = SelectedAdapter;
+        if (adapter == null)
+        {
+            AppDialog.Show(this, _lang.T("change.mac"), IsChineseUi() ? "请先选择网卡。" : "Select an adapter first.");
+            return;
+        }
+
+        var dialog = new MacAddressWindow(adapter) { Owner = this };
+        if (dialog.ShowDialog() != true) return;
+        var requestedMac = dialog.MacAddress;
+        var key = AdapterKey(adapter);
+        var hadBackup = _originalAdapterMacs.TryGetValue(key, out var existingBackup);
+        if (!hadBackup)
+        {
+            if (string.IsNullOrWhiteSpace(adapter.MacAddress))
+            {
+                AppDialog.Show(this, _lang.T("change.mac"), IsChineseUi() ? "无法读取当前 MAC，已取消。" : "The current MAC could not be read; operation canceled.", danger: true);
+                return;
+            }
+            existingBackup = new AdapterMacBackup
+            {
+                InterfaceIndex = adapter.InterfaceIndex,
+                AdapterId = adapter.Id,
+                AdapterName = adapter.Name,
+                OriginalMacAddress = adapter.MacAddress,
+                CapturedAt = DateTime.Now
+            };
+            _originalAdapterMacs[key] = existingBackup;
+        }
+        existingBackup!.RestoreOnExit = dialog.RestoreOnExit;
+
+        _adapterActionInProgress = true;
+        UpdateAdapterActionButtons();
+        try
+        {
+            SetBusy(true, IsChineseUi() ? "正在修改 MAC，请稍后..." : "Changing MAC, please wait...");
+            await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.Render);
+            await _adapterService.ChangeMacAddressAsync(adapter, requestedMac, _settings.AllowMacChangeOnAnyAdapter);
+            adapter.MacAddress = requestedMac;
+            TxtMac.Text = requestedMac;
+            AdapterBox.Items.Refresh();
+            _logger.Info($"Adapter MAC changed: idx={adapter.InterfaceIndex} name={adapter.Name} old={existingBackup.OriginalMacAddress} new={requestedMac} restoreOnExit={existingBackup.RestoreOnExit}");
+            await RefreshAdaptersAsync();
+        }
+        catch (Exception ex)
+        {
+            _logger.Error($"Adapter MAC change failed: idx={adapter.InterfaceIndex} name={adapter.Name} requested={requestedMac}", ex);
+            if (!hadBackup) _originalAdapterMacs.Remove(key);
+            AppDialog.Show(this, _lang.T("change.mac"), ex.Message, danger: true);
+        }
+        finally
+        {
+            _adapterActionInProgress = false;
+            UpdateAdapterActionButtons();
+            SetBusy(false);
+        }
+    }
+
     private void RouteAdapter_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         if (sender is not ComboBox box || box.DataContext is not StaticRouteRule rule || box.SelectedItem is not NetworkAdapterInfo adapter) return;
@@ -707,6 +905,13 @@ public partial class MainWindow : Window
     private async void RemoveRoute_Click(object sender, RoutedEventArgs e)
     {
         if (RouteGrid.SelectedItem is not StaticRouteRule rule) return;
+        if (rule.IsExistingRoute)
+        {
+            AppDialog.Show(this, _lang.T("remove.route"), IsChineseUi()
+                ? "这是本机已有路由，仅用于展示，未执行删除。"
+                : "This route already exists on the computer and is display-only; it was not deleted.");
+            return;
+        }
         try
         {
             var applied = _appliedStaticRoutes.Where(x => x.RuleId.Equals(rule.Id, StringComparison.OrdinalIgnoreCase)).ToList();
@@ -739,10 +944,11 @@ public partial class MainWindow : Window
 
     private List<StaticRouteTarget> BuildStaticRouteTargets()
     {
-        if (StaticRoutes.Count == 0) throw new InvalidOperationException("Add at least one route / 请至少新增一条路由");
+        var editableRoutes = StaticRoutes.Where(x => !x.IsExistingRoute).ToList();
+        if (editableRoutes.Count == 0) throw new InvalidOperationException("Add at least one route / 请至少新增一条路由");
         var targets = new List<StaticRouteTarget>();
         var keys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var rule in StaticRoutes)
+        foreach (var rule in editableRoutes)
         {
             var adapter = ResolveAdapterForRule(rule) ?? throw new InvalidOperationException($"Adapter not found for route {rule.DestinationPrefix} / 路由未找到对应网卡：{rule.DestinationPrefix}");
             var normalized = StaticRouteValidator.Normalize(rule);
@@ -808,7 +1014,7 @@ public partial class MainWindow : Window
             SetBusy(true, "Restoring adapter... / 正在恢复网卡...");
             await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.Render);
             await RestoreOriginalAdapterConfigAsync(SelectedAdapter);
-            RefreshAdapters();
+            await RefreshAdaptersAsync();
         }
         catch (Exception ex)
         {
@@ -875,6 +1081,7 @@ public partial class MainWindow : Window
         var choice = new Window { Owner = this, Title = "Templates / 模板", Width = 360, Height = 260, WindowStartupLocation = WindowStartupLocation.CenterOwner };
         var list = new ListBox { ItemsSource = templates, DisplayMemberPath = "Name", Margin = new Thickness(12) };
         var add = new Button { Content = "Add / 添加", Margin = new Thickness(12), HorizontalAlignment = HorizontalAlignment.Right };
+        HelpButtonService.Attach(add, "help.template.favorite.add");
         add.Click += (_, _) =>
         {
             if (list.SelectedItem is not FavoriteConfig template) return;
@@ -1045,6 +1252,7 @@ public partial class MainWindow : Window
             panel.Children.Add(box);
         }
         var close = new Button { Content = IsChineseUi() ? "关闭" : "Close", MinWidth = 90, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 12, 0, 0) };
+        HelpButtonService.Attach(close, "help.favorite.columns.close");
         close.Click += (_, _) => window.Close();
         panel.Children.Add(close);
         window.Content = new ScrollViewer { Content = panel };
@@ -1126,6 +1334,16 @@ public partial class MainWindow : Window
         BtnAddFavorite.Background = BtnAddFavorite.IsEnabled ? Brushes.LightBlue : Brushes.LightGray;
     }
 
+    private void UpdateAdapterActionButtons()
+    {
+        if (!IsInitialized) return;
+        var enabled = SelectedAdapter != null && !_adapterActionInProgress && !_closingCleanupStarted && !_dhcpServer.IsRunning;
+        BtnRestartAdapter.IsEnabled = enabled;
+        BtnChangeMac.IsEnabled = enabled;
+        BtnRestartAdapter.Background = enabled ? Brushes.LightBlue : Brushes.LightGray;
+        BtnChangeMac.Background = enabled ? Brushes.LightBlue : Brushes.LightGray;
+    }
+
     private void UpdateFavoriteButtons()
     {
         if (!IsInitialized) return;
@@ -1159,9 +1377,10 @@ public partial class MainWindow : Window
         TxtManualAdapterIp.Text = BuildAdapterIpDisplay(SelectedAdapter);
         UpdateManualScanButtons();
         UpdateFavoriteButtons();
+        UpdateAdapterActionButtons();
     }
 
-    private void RefreshAdapters_Click(object sender, RoutedEventArgs e) => RefreshAdapters();
+    private async void RefreshAdapters_Click(object sender, RoutedEventArgs e) => await RefreshAdaptersAsync();
 
     private bool ConfirmConfigurationChange(NetworkAdapterInfo adapter, string targetIp, string targetMask, string operation)
     {
@@ -1198,7 +1417,7 @@ public partial class MainWindow : Window
                 AutomaticMetric = backup.AutomaticMetric,
                 InterfaceMetric = backup.InterfaceMetric
             });
-            RefreshAdapters();
+            await RefreshAdaptersAsync();
         }
         catch (Exception ex)
         {
@@ -1211,16 +1430,31 @@ public partial class MainWindow : Window
         }
     }
 
-    private void ExportResults_Click(object sender, RoutedEventArgs e)
+    private async void ExportResults_Click(object sender, RoutedEventArgs e)
     {
         var rows = Tabs.SelectedItem == TabDhcp
             ? Leases.Select(x => new[] { x.Time.ToString(), x.MacAddress, x.IpAddress, x.Hostname, x.Status, x.PingLatencyMs.ToString(), x.Remark })
             : ScanResults.Select(x => new[] { x.LastSeen.ToString(), x.IpAddress, x.MacAddress, x.Hostname, x.StatusText, x.LatencyMs.ToString(), x.Remark });
         var dialog = new SaveFileDialog { Filter = "CSV (*.csv)|*.csv", FileName = $"NetBoot-{DateTime.Now:yyyyMMdd-HHmmss}.csv" };
         if (dialog.ShowDialog(this) != true) return;
-        var header = Tabs.SelectedItem == TabDhcp ? new[] { "Time", "MAC", "IP", "Hostname", "Status", "PingMs", "Remark" } : new[] { "LastSeen", "IP", "MAC", "Hostname", "Status", "PingMs", "Remark" };
-        File.WriteAllLines(dialog.FileName, new[] { Csv(header) }.Concat(rows.Select(Csv)), new UTF8Encoding(true));
-        _logger.Info("Results exported: " + dialog.FileName);
+        try
+        {
+            SetBusy(true, "Exporting results... / 正在导出结果...");
+            var header = Tabs.SelectedItem == TabDhcp
+                ? (IsChineseUi() ? new[] { "时间", "MAC", "IP", "主机名", "状态", "Ping毫秒", "备注" } : new[] { "Time", "MAC", "IP", "Hostname", "Status", "PingMs", "Remark" })
+                : (IsChineseUi() ? new[] { "最后发现", "IP", "MAC", "主机名", "状态", "Ping毫秒", "备注" } : new[] { "LastSeen", "IP", "MAC", "Hostname", "Status", "PingMs", "Remark" });
+            await Task.Run(() => File.WriteAllLines(dialog.FileName, new[] { Csv(header) }.Concat(rows.Select(Csv)), new UTF8Encoding(true)));
+            _logger.Info("Results exported: " + dialog.FileName);
+        }
+        catch (Exception ex)
+        {
+            _logger.Error("Export results failed", ex);
+            AppDialog.Show(this, "Export / 导出", ex.Message, danger: true);
+        }
+        finally
+        {
+            SetBusy(false);
+        }
     }
 
     private static string Csv(IEnumerable<string> values) => string.Join(",", values.Select(x => "\"" + (x ?? "").Replace("\"", "\"\"") + "\""));
@@ -1232,15 +1466,31 @@ public partial class MainWindow : Window
         AppDialog.Show(this, "Adapter Diagnostics / 网卡诊断", $"Name / 名称: {adapter.Name}\nStatus / 状态: {adapter.Status}\nIP: {adapter.IPv4Address}\nMask / 掩码: {adapter.SubnetMask}\nGateway / 网关: {adapter.Gateway}\nDNS: {adapter.Dns}\nMAC: {adapter.MacAddress}\nWi-Fi: {adapter.IsWifi}\nVirtual / 虚拟: {adapter.IsVirtual}");
     }
 
-    private void PackageLogs_Click(object sender, RoutedEventArgs e)
+    private async void PackageLogs_Click(object sender, RoutedEventArgs e)
     {
         var dialog = new SaveFileDialog { Filter = "ZIP (*.zip)|*.zip", FileName = $"NetBoot-support-{DateTime.Now:yyyyMMdd-HHmmss}.zip" };
         if (dialog.ShowDialog(this) != true) return;
-        using var archive = ZipFile.Open(dialog.FileName, ZipArchiveMode.Create);
-        foreach (var file in Directory.EnumerateFiles(_paths.LogsDirectory, "*.log")) archive.CreateEntryFromFile(file, Path.Combine("logs", Path.GetFileName(file)));
-        if (File.Exists(_paths.SettingsFile)) archive.CreateEntryFromFile(_paths.SettingsFile, "appsettings.json");
-        if (File.Exists(_paths.AdapterBackupsFile)) archive.CreateEntryFromFile(_paths.AdapterBackupsFile, "adapter-backups.json");
-        _logger.Info("Support package created: " + dialog.FileName);
+        try
+        {
+            SetBusy(true, "Creating support package... / 正在生成支持包...");
+            await Task.Run(() =>
+            {
+                using var archive = ZipFile.Open(dialog.FileName, ZipArchiveMode.Create);
+                foreach (var file in Directory.EnumerateFiles(_paths.LogsDirectory, "*.log")) archive.CreateEntryFromFile(file, Path.Combine("logs", Path.GetFileName(file)));
+                if (File.Exists(_paths.SettingsFile)) archive.CreateEntryFromFile(_paths.SettingsFile, "appsettings.json");
+                if (File.Exists(_paths.AdapterBackupsFile)) archive.CreateEntryFromFile(_paths.AdapterBackupsFile, "adapter-backups.json");
+            });
+            _logger.Info("Support package created: " + dialog.FileName);
+        }
+        catch (Exception ex)
+        {
+            _logger.Error("Support package failed", ex);
+            AppDialog.Show(this, "Support / 支持包", ex.Message, danger: true);
+        }
+        finally
+        {
+            SetBusy(false);
+        }
     }
 
     private void Theme_Click(object sender, RoutedEventArgs e)
@@ -1248,7 +1498,7 @@ public partial class MainWindow : Window
         _darkTheme = !_darkTheme;
         RootGrid.Background = _darkTheme ? new SolidColorBrush(Color.FromRgb(31, 35, 40)) : Brushes.White;
         Foreground = _darkTheme ? Brushes.Gainsboro : Brushes.Black;
-        BtnTheme.Content = _darkTheme ? "Light / 浅色" : "Theme / 主题";
+        BtnTheme.Content = _darkTheme ? _lang.T("theme.light") : _lang.T("theme");
     }
 
     private void OpenLogs_Click(object sender, RoutedEventArgs e)
@@ -1262,7 +1512,7 @@ public partial class MainWindow : Window
 
     private void About_Click(object sender, RoutedEventArgs e)
     {
-        AppDialog.Show(this, _lang.T("about"), $"NetBoot DHCP Tool v{CurrentVersionText}\nIPv4 DHCP / Scan / Static Routes / Favorites\nAuthors: Joel & Codex\nEmail: 1406829360@qq.com");
+        AppDialog.Show(this, _lang.T("about"), $"NetBoot DHCP Tool v{CurrentVersionText}\n{_lang.T("about.details")}");
     }
 
     private void LanguageBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -1279,9 +1529,11 @@ public partial class MainWindow : Window
         _settings.AllowDhcpOnWifi = AllowWifi.IsChecked == true;
         _settings.AllowDhcpOnAdapterWithGateway = AllowGateway.IsChecked == true;
         _settings.DetectExistingDhcpBeforeStart = DetectExistingDhcp.IsChecked == true;
+        _settings.AllowRestartOnAnyAdapter = AllowRestartAnyAdapter.IsChecked == true;
+        _settings.AllowMacChangeOnAnyAdapter = AllowMacChangeAnyAdapter.IsChecked == true;
         _settings.RestoreIpOnDhcpStop = RestoreOnStop.IsChecked == true;
         JsonStore.Save(_paths.SettingsFile, _settings);
-        _logger.Info("Settings saved");
+        _logger.Info($"Settings saved: dhcpWifi={_settings.AllowDhcpOnWifi} dhcpGateway={_settings.AllowDhcpOnAdapterWithGateway} detectExistingDhcp={_settings.DetectExistingDhcpBeforeStart} restartAnyAdapter={_settings.AllowRestartOnAnyAdapter} macAnyAdapter={_settings.AllowMacChangeOnAnyAdapter} restoreIp={_settings.RestoreIpOnDhcpStop}");
     }
 
     private void ScanGrid_MouseDoubleClick(object sender, System.Windows.Input.MouseButtonEventArgs e)
@@ -1426,6 +1678,7 @@ public partial class MainWindow : Window
         BtnRemoveRoute.IsEnabled = !running;
         BtnApplyRoutes.IsEnabled = !running;
         BtnClearAppliedRoutes.IsEnabled = !running;
+        UpdateAdapterActionButtons();
     }
 
     private async Task CleanupWorkEnvironmentAsync()
@@ -1449,12 +1702,45 @@ public partial class MainWindow : Window
                     await RestoreOriginalAdapterConfigAsync(adapter);
                 }
             }
+            await RestoreOriginalMacAddressesAsync();
             _activeDhcpAdapterIndex = null;
             _logger.Info("Window closing cleanup completed");
         }
         catch (Exception ex)
         {
             _logger.Error("Window closing cleanup failed", ex);
+        }
+    }
+
+    private async Task RestoreOriginalMacAddressesAsync()
+    {
+        var pending = _originalAdapterMacs.Values.Where(x => x.RestoreOnExit).ToList();
+        if (pending.Count == 0)
+        {
+            _logger.Info("No adapter MAC restoration required on normal exit");
+            return;
+        }
+
+        var available = Adapters.ToList();
+        foreach (var backup in pending)
+        {
+            var adapter = available.FirstOrDefault(x =>
+                (!string.IsNullOrWhiteSpace(backup.AdapterId) && x.Id.Equals(backup.AdapterId, StringComparison.OrdinalIgnoreCase))
+                || (!string.IsNullOrWhiteSpace(backup.InterfaceIndex) && x.InterfaceIndex.Equals(backup.InterfaceIndex, StringComparison.OrdinalIgnoreCase)));
+            if (adapter == null)
+            {
+                _logger.Warn($"MAC restoration skipped: adapter unavailable idx={backup.InterfaceIndex} name={backup.AdapterName}");
+                continue;
+            }
+            try
+            {
+                await _adapterService.RestoreMacAddressAsync(adapter, backup.OriginalMacAddress);
+                _logger.Info($"Adapter MAC restored on normal exit: idx={backup.InterfaceIndex} name={backup.AdapterName} mac={backup.OriginalMacAddress}");
+            }
+            catch (Exception ex)
+            {
+                _logger.Error($"Adapter MAC restoration failed: idx={backup.InterfaceIndex} name={backup.AdapterName}", ex);
+            }
         }
     }
 
@@ -1601,8 +1887,70 @@ public partial class MainWindow : Window
     private void UpdateLink_Click(object sender, RoutedEventArgs e)
     {
         if (_lastUpdateResult is not { Succeeded: true, IsNewVersion: true } result || string.IsNullOrWhiteSpace(result.DownloadUrl)) return;
-        OpenUrl(result.DownloadUrl);
-        _logger.Info($"Update download opened: v{result.LatestVersion}");
+        var changes = result.Changes.Count > 0
+            ? string.Join(Environment.NewLine, result.Changes.Select(x => "• " + x))
+            : result.ReleaseNotes;
+        if (string.IsNullOrWhiteSpace(changes)) changes = IsChineseUi() ? "发布方未提供详细更新内容。" : "The publisher did not provide detailed release notes.";
+        var message = IsChineseUi()
+            ? $"版本 v{result.LatestVersion}\n\n更新内容：\n{changes}\n\n确认后将在后台下载更新包，不会自动安装。下载文件会保存到“下载”文件夹。"
+            : $"Version v{result.LatestVersion}\n\nChanges:\n{changes}\n\nAfter confirmation the package will download in the background and will not be installed automatically. It will be saved to your Downloads folder.";
+        if (!AppDialog.Show(this, IsChineseUi() ? "发现新版本" : "New Version", message, confirm: true)) return;
+        if (_updateDownloadInProgress)
+        {
+            AppDialog.Show(this, IsChineseUi() ? "更新下载" : "Update Download", IsChineseUi() ? "更新已在后台下载中。" : "The update is already downloading.");
+            return;
+        }
+        _ = DownloadUpdateAsync(result);
+    }
+
+    private async Task DownloadUpdateAsync(UpdateCheckResult result)
+    {
+        _updateDownloadInProgress = true;
+        _updateSlowWarningShown = false;
+        var fileName = string.IsNullOrWhiteSpace(result.ArchiveName) ? $"NetBootDhcpTool-v{result.LatestVersion}.7z" : Path.GetFileName(result.ArchiveName);
+        if (string.IsNullOrWhiteSpace(fileName)) fileName = $"NetBootDhcpTool-v{result.LatestVersion}.7z";
+        var downloads = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
+        var destination = Path.Combine(downloads, fileName);
+        if (File.Exists(destination)) destination = Path.Combine(downloads, Path.GetFileNameWithoutExtension(fileName) + $"-{DateTime.Now:yyyyMMdd-HHmmss}" + Path.GetExtension(fileName));
+        _logger.Info($"Update background download started: version={result.LatestVersion} destination={destination}");
+        TxtUpdateStatus.Text = IsChineseUi() ? "正在后台下载更新..." : "Downloading update in background...";
+        var progress = new Progress<UpdateDownloadProgress>(p =>
+        {
+            var speed = p.BytesPerSecond / 1024d;
+            var size = p.TotalBytes.HasValue ? $"{p.BytesReceived / 1024d:0.0}/{p.TotalBytes.Value / 1024d:0.0} KB" : $"{p.BytesReceived / 1024d:0.0} KB";
+            TxtUpdateStatus.Text = IsChineseUi()
+                ? $"后台下载 {size}，速度 {speed:0.0} KB/s"
+                : $"Background download {size}, {speed:0.0} KB/s";
+            if (!_updateSlowWarningShown && p.LowSpeedDuration >= TimeSpan.FromSeconds(10))
+            {
+                _updateSlowWarningShown = true;
+                _logger.Warn($"Update download speed below 3 KB/s for {p.LowSpeedDuration.TotalSeconds:0} seconds");
+                AppDialog.Show(this,
+                    IsChineseUi() ? "下载速度过慢" : "Download Too Slow",
+                    IsChineseUi() ? "下载速度连续 10 秒低于 3 KB/s，可以通过邮件向作者获取更新包：1406829360@qq.com" : "Download speed stayed below 3 KB/s for 10 seconds. You can email the author for the update package: 1406829360@qq.com",
+                    danger: true);
+            }
+        });
+        try
+        {
+            var downloaded = await Task.Run(() => _updateService.DownloadAsync(result, destination, progress, _updateDownloadCts.Token));
+            _logger.Info($"Update background download completed: version={result.LatestVersion} path={downloaded.FilePath} sha256={downloaded.Sha256}");
+            TxtUpdateStatus.Text = IsChineseUi() ? $"更新包已下载（未安装）：{downloaded.FilePath}" : $"Update downloaded (not installed): {downloaded.FilePath}";
+        }
+        catch (OperationCanceledException) when (_updateDownloadCts.IsCancellationRequested)
+        {
+            _logger.Info("Update background download canceled");
+        }
+        catch (Exception ex)
+        {
+            _logger.Error("Update background download failed", ex);
+            TxtUpdateStatus.Text = IsChineseUi() ? "更新下载失败，请查看日志或联系作者" : "Update download failed; see logs or contact the author";
+            AppDialog.Show(this, IsChineseUi() ? "更新下载失败" : "Update Download Failed", ex.Message + "\n\n1406829360@qq.com", danger: true);
+        }
+        finally
+        {
+            _updateDownloadInProgress = false;
+        }
     }
 
     private void OpenHttpsLink_Click(object sender, RoutedEventArgs e)
@@ -1619,6 +1967,28 @@ public partial class MainWindow : Window
     {
         BusyText.Text = text ?? "Please wait... / 请稍后...";
         BusyOverlay.Visibility = busy ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    private void LogButtonClick(object sender, RoutedEventArgs e)
+    {
+        if (e.OriginalSource is Button button)
+        {
+            _logger.Info($"UI button clicked: name={button.Name} content={button.Content}");
+        }
+    }
+
+    internal string GetHelpText(string helpKey)
+    {
+        var message = _lang.T(helpKey);
+        return string.Equals(message, helpKey, StringComparison.Ordinal)
+            ? (IsChineseUi() ? "暂无此功能的帮助说明。" : "No help text is available for this action.")
+            : message;
+    }
+
+    internal void ShowHelp(string helpKey)
+    {
+        _logger.Info($"UI help opened: key={helpKey}");
+        AppDialog.Show(this, _lang.T("help.title"), GetHelpText(helpKey));
     }
 
     private void AppendLogLine(string line)
@@ -1639,6 +2009,7 @@ public partial class MainWindow : Window
             Foreground = Brushes.Black
         });
         LogBox.Document.Blocks.Add(paragraph);
+        while (LogBox.Document.Blocks.Count > 500) LogBox.Document.Blocks.Remove(LogBox.Document.Blocks.FirstBlock);
         LogBox.ScrollToEnd();
     }
 
@@ -1725,7 +2096,7 @@ public partial class MainWindow : Window
         try
         {
             var selectedIndex = SelectedAdapter.InterfaceIndex;
-            var latest = await Task.Run(() => _adapterService.GetAdapters().FirstOrDefault(x => x.InterfaceIndex == selectedIndex));
+            var latest = await Task.Run(() => _adapterService.GetAdapters(logAdapters: false).FirstOrDefault(x => x.InterfaceIndex == selectedIndex));
             if (latest == null) return;
             var adapter = SelectedAdapter;
             if (adapter == null || adapter.InterfaceIndex != selectedIndex) return;
@@ -1798,6 +2169,8 @@ public partial class MainWindow : Window
         var buttons = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right };
         var copyButton = new Button { Content = "Copy / 复制", MinWidth = 90, Margin = new Thickness(4) };
         var closeButton = new Button { Content = "Close / 关闭", MinWidth = 90, Margin = new Thickness(4) };
+        HelpButtonService.Attach(copyButton, "help.favorite.fields.copy");
+        HelpButtonService.Attach(closeButton, "help.favorite.fields.close");
         buttons.Children.Add(copyButton);
         buttons.Children.Add(closeButton);
         DockPanel.SetDock(buttons, Dock.Bottom);
@@ -1859,6 +2232,8 @@ public partial class MainWindow : Window
         var buttons = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right };
         var copyButton = new Button { Content = IsChineseUi() ? "复制" : "Copy", MinWidth = 90, Margin = new Thickness(4) };
         var closeButton = new Button { Content = IsChineseUi() ? "关闭" : "Close", MinWidth = 90, Margin = new Thickness(4) };
+        HelpButtonService.Attach(copyButton, "help.favorite.details.copy");
+        HelpButtonService.Attach(closeButton, "help.favorite.details.close");
         buttons.Children.Add(copyButton);
         buttons.Children.Add(closeButton);
         DockPanel.SetDock(buttons, Dock.Bottom);
@@ -1898,6 +2273,12 @@ public partial class MainWindow : Window
     private void Tabs_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         if (e.Source != Tabs || Tabs.SelectedItem is not TabItem selected) return;
+        var started = Stopwatch.GetTimestamp();
+        _logger.Info($"UI tab selection started: tab={selected.Name} routeRows={StaticRoutes.Count}");
+        if (selected == TabRoutes)
+        {
+            Dispatcher.BeginInvoke(() => _logger.Info($"UI static route tab render completed: routeRows={StaticRoutes.Count} elapsedMs={Stopwatch.GetElapsedTime(started).TotalMilliseconds:0}"), DispatcherPriority.ContextIdle);
+        }
         if (selected != TabDhcp && selected != TabScan && selected != TabRoutes)
         {
             _lastBusinessTab = selected == TabFavorites || selected == TabSettings ? _lastBusinessTab : selected;
@@ -1968,8 +2349,10 @@ public partial class MainWindow : Window
         target.RemarkName = source.RemarkName;
         target.Description = source.Description;
         target.Username = source.Username;
+        target.PublicPassword = source.PublicPassword;
         target.Password = source.Password;
         target.ProtectedPassword = source.ProtectedPassword;
+        target.IsPublicDefault = source.IsPublicDefault;
         target.PasswordUnavailable = source.PasswordUnavailable;
         target.PreferHttps = source.PreferHttps;
         target.MemoryText = source.MemoryText;

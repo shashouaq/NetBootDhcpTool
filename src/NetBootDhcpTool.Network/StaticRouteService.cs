@@ -35,6 +35,17 @@ public sealed class StaticRouteApplyResult
     public AppliedStaticRoute? Applied { get; }
 }
 
+public sealed class CurrentStaticRoute
+{
+    public string InterfaceIndex { get; set; } = "";
+    public string DestinationPrefix { get; set; } = "";
+    public string NextHop { get; set; } = "0.0.0.0";
+    public int RouteMetric { get; set; }
+    public string Protocol { get; set; } = "";
+    public string PolicyStore { get; set; } = "";
+    public string InstanceId { get; set; } = "";
+}
+
 public sealed class StaticRouteService
 {
     private readonly ILogger _logger;
@@ -42,6 +53,46 @@ public sealed class StaticRouteService
     public StaticRouteService(ILogger logger)
     {
         _logger = logger;
+    }
+
+    public async Task<IReadOnlyList<CurrentStaticRoute>> GetCurrentStaticRoutesAsync(CancellationToken ct = default)
+    {
+        _logger.Info("Static route read started: all IPv4 interfaces");
+        var script = """
+$routes = @(Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+  Sort-Object InterfaceIndex,DestinationPrefix,RouteMetric,NextHop |
+  ForEach-Object {
+    [pscustomobject]@{
+      InterfaceIndex = [string]$_.InterfaceIndex
+      DestinationPrefix = [string]$_.DestinationPrefix
+      NextHop = [string]$_.NextHop
+      RouteMetric = [int]$_.RouteMetric
+      Protocol = [string]$_.Protocol
+      PolicyStore = [string]$_.PolicyStore
+      InstanceId = [string]$_.InstanceId
+    }
+  })
+ConvertTo-Json -InputObject $routes -Compress -Depth 4
+""";
+        var output = await RunPowerShellOutputAsync(script, "PowerShell action read current static routes", ct, false);
+        if (string.IsNullOrWhiteSpace(output))
+        {
+            _logger.Info("Static route read completed: count=0");
+            return [];
+        }
+        using var document = JsonDocument.Parse(output);
+        IReadOnlyList<CurrentStaticRoute> routes;
+        if (document.RootElement.ValueKind == JsonValueKind.Array)
+        {
+            routes = JsonSerializer.Deserialize<List<CurrentStaticRoute>>(document.RootElement.GetRawText(), JsonStore.Options) ?? [];
+        }
+        else
+        {
+            var single = JsonSerializer.Deserialize<CurrentStaticRoute>(document.RootElement.GetRawText(), JsonStore.Options);
+            routes = single == null ? [] : [single];
+        }
+        _logger.Info($"Static route read completed: count={routes.Count}");
+        return routes;
     }
 
     public async Task<IReadOnlyList<StaticRouteApplyResult>> ApplyAsync(IReadOnlyList<StaticRouteTarget> targets, CancellationToken ct = default)
@@ -270,6 +321,7 @@ ConvertTo-Json -InputObject $routes -Compress -Depth 4
 
     private async Task<string> RunPowerShellOutputAsync(string script, string summary, CancellationToken ct, bool logOutput)
     {
+        var started = Stopwatch.GetTimestamp();
         _logger.Info(summary);
         using var process = new Process
         {
@@ -297,11 +349,21 @@ ConvertTo-Json -InputObject $routes -Compress -Depth 4
             if (process.ExitCode != 0)
             {
                 var detail = Summarize(error);
-                _logger.Warn($"{summary} failed: exit={process.ExitCode} detail={detail}");
+                _logger.Warn($"{summary} failed: exit={process.ExitCode} elapsedMs={Stopwatch.GetElapsedTime(started).TotalMilliseconds:0} detail={detail}");
                 throw new InvalidOperationException(string.IsNullOrWhiteSpace(error) ? $"PowerShell exit {process.ExitCode}" : error);
             }
-            if (logOutput) _logger.Info($"{summary} result: exit={process.ExitCode} detail={Summarize(output)}");
+            _logger.Info($"{summary} completed: exit={process.ExitCode} elapsedMs={Stopwatch.GetElapsedTime(started).TotalMilliseconds:0} detail={Summarize(output)}");
             return output;
+        }
+        catch (OperationCanceledException)
+        {
+            try
+            {
+                if (!process.HasExited) process.Kill(entireProcessTree: true);
+            }
+            catch { }
+            _logger.Warn($"{summary} aborted: elapsedMs={Stopwatch.GetElapsedTime(started).TotalMilliseconds:0}");
+            throw;
         }
         catch
         {

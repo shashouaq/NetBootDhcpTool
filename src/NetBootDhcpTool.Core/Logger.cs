@@ -12,14 +12,18 @@ public sealed class FileLogger : ILogger
 {
     private readonly AppPaths _paths;
     private readonly object _sync = new();
+    private readonly string _sessionLogPath;
 
     public FileLogger(AppPaths paths)
     {
         _paths = paths;
         _paths.Ensure();
+        _sessionLogPath = Path.Combine(_paths.LogsDirectory, $"run-{DateTime.Now:yyyyMMdd-HHmmss-fff}-{Environment.ProcessId}-{Guid.NewGuid():N}.log");
+        File.WriteAllText(_sessionLogPath, "", new System.Text.UTF8Encoding(true));
     }
 
     public event Action<string>? LineWritten;
+    public string SessionLogPath => _sessionLogPath;
 
     public void Info(string message) => Write("INFO", message, null);
     public void Warn(string message) => Write("WARN", message, null);
@@ -36,19 +40,10 @@ public sealed class FileLogger : ILogger
 
         lock (_sync)
         {
-            var path = Path.Combine(_paths.LogsDirectory, $"{DateTime.Now:yyyy-MM-dd}.log");
-            EnsureUtf8Bom(path);
-            File.AppendAllText(path, line + Environment.NewLine, System.Text.Encoding.UTF8);
+            File.AppendAllText(_sessionLogPath, line + Environment.NewLine, System.Text.Encoding.UTF8);
         }
 
         LineWritten?.Invoke(line);
-    }
-
-    private static void EnsureUtf8Bom(string path)
-    {
-        if (File.Exists(path)) return;
-        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        File.WriteAllText(path, "", new System.Text.UTF8Encoding(true));
     }
 
     private static string Explain(string message)

@@ -1,10 +1,10 @@
 # NetBoot DHCP Tool
 
-Version: 1.0.8
+Version: 1.0.9
 
 Authors: Joel & Codex
 
-Windows green portable IPv4 DHCP, adapter IP configuration, static route rules, ping scan, web open, favorites, bilingual UI, and logs.
+Windows green portable IPv4 DHCP, adapter IP configuration, static route rules, adapter restart/MAC tools, ping scan, web open, favorites, bilingual UI, contextual `?` help buttons, and logs.
 
 ## Static Routes
 
@@ -14,11 +14,13 @@ Only routes created by this session are removed when the application closes. Exi
 
 ## Notes
 
-Favorite records can store device name, device number, serial number, remark, account/password text, and free-form memory text. Passwords are protected with Windows DPAPI for the current user; legacy plaintext favorites are upgraded on load, and JSON exports intentionally omit credentials. A favorite can also mark HTTPS as its preferred web scheme.
+Favorite records can store device name, device number, serial number, remark, account/password text, and free-form memory text. Personal favorite passwords remain protected with Windows DPAPI; manufacturer-published BMC presets are explicitly marked public and show their documented plaintext defaults or model/label guidance. Credential-free JSON export remains available. A favorite can also mark HTTPS as its preferred web scheme.
+
+Every application action button has a small, visible-by-default round `?` help indicator beside it. Hover the action or indicator for a contextual Chinese/English explanation, or click `?` to open the same explanation in a dialog. The help control does not execute the neighboring action. Hovering the main adapter and result fields also explains what their values represent.
 
 ## Version Check
 
-The application displays its running version when it starts. It checks the GitHub `latest.json` manifest in the background; when a newer validated release is available, `有新版本！` / `New version available!` appears beside the version and opens the direct `.7z` download in the system browser. The updater never installs files automatically and only accepts HTTPS GitHub release URLs with a valid SHA256 field.
+The application displays its running version when it starts. It checks the GitHub `latest.json` manifest in the background; when a newer validated release is available, `有新版本！` / `New version available!` appears beside the version. Clicking it shows the release changes and downloads the archive in the background to Downloads, with SHA-256 verification and no automatic installation. If speed remains below 3 KB/s for 10 seconds, the app only displays `1406829360@qq.com`.
 
 ## Build
 

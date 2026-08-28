@@ -1,5 +1,69 @@
 # Feature Change Log
 
+## v1.0.9 / 2026-08-28
+
+- Type: UI / Help UX Refinement
+- Affected files/modules: `src/NetBootDhcpTool.App/HelpButtonService.cs`, `README.md`, `docs/MAINTENANCE_GUIDE.md`, `PROJECT_MEMORY.md`, `docs/FEATURE_CHANGELOG.md`
+- Concrete change: Scaled the help indicator from 18x18 to 9x9 (including its font, margin, and corner radius) and restored it to visible by default. It remains an independent help control; hovering it or the neighboring action shows the contextual bilingual explanation, and clicking it opens the explanation dialog.
+- Verification: Release build passed with 0 warnings and 0 errors; smoke test returned `OK`; `git diff --check` passed; localization audit reported `161` source keys with `zh-CN missing=0 extra=0` and `en-US missing=0 extra=0`; static XAML audit reported `44/44` buttons with help keys and runtime audit reported `6` help attachments. The current source Release preview is responsive and its fresh log shows administrator privilege, 4 adapters, 32 current IPv4 routes loaded, and no errors.
+- User impact: The help indicators remain visible for quick discovery while taking approximately half the previous visual size.
+
+- Type: UI / Help UX Refinement
+- Affected files/modules: `src/NetBootDhcpTool.App/HelpButtonService.cs`, `src/NetBootDhcpTool.App/MainWindow.xaml.cs`, `README.md`, `docs/MAINTENANCE_GUIDE.md`, `PROJECT_MEMORY.md`, `docs/FEATURE_CHANGELOG.md`
+- Concrete change: Reduced the contextual help indicator to a compact 18x18 circular `?`, hid it by default, and revealed it only while the pointer was over its action area. Hovering either the action button or the help indicator showed the current-language contextual explanation; clicking `?` remained available as a dialog fallback. The later 9x9 visible-by-default refinement is recorded above.
+- Verification: Release build passed with 0 warnings and 0 errors; smoke test returned `OK`; `git diff --check` passed; localization audit reported `161` source keys with `zh-CN missing=0 extra=0` and `en-US missing=0 extra=0`; static XAML audit reported `44/44` buttons with help keys and runtime audit reported `6` help attachments. The current source Release preview started with a responsive window and a fresh log showing administrator privilege, 4 adapters, and 32 current IPv4 routes loaded.
+- User impact: Help guidance remains discoverable without filling the interface with large persistent question marks or changing the neighboring action layout.
+
+- Type: Localization / UI Help / Accessibility
+- Affected files/modules: `src/NetBootDhcpTool.App/HelpButtonService.cs`, `src/NetBootDhcpTool.App/MainWindow.xaml`, `src/NetBootDhcpTool.App/MainWindow.xaml.cs`, `src/NetBootDhcpTool.App/FavoriteWindow.xaml`, `src/NetBootDhcpTool.App/MacAddressWindow.xaml`, `src/NetBootDhcpTool.App/AppDialog.xaml`, `src/NetBootDhcpTool.App/FavoriteWindow.xaml.cs`, `i18n/zh-CN.json`, `i18n/en-US.json`, `src/NetBootDhcpTool.Core/Defaults.cs`, `README.md`, `docs/MAINTENANCE_GUIDE.md`, `PROJECT_MEMORY.md`, `docs/FEATURE_CHANGELOG.md`
+- Concrete change: Audited the user-visible language resources and filled the missing command labels and help text so the source defaults and both language JSON files contain the same 161 keys. Localized previously static toolbar, DHCP optional-field, manual-restore, About, CSV, and Favorites action labels through the language service. Added `HelpButtonService`, which wraps every static XAML button and every runtime-created button with an independent round `?` control; clicking it opens contextual bilingual guidance and records a help-opened log entry. Added tooltips to the adapter selector, tabs, result grids, and current IP/MAC/gateway/status plus DHCP/manual input fields.
+- Verification: Static XAML audit found no `<Button>` without `HelpButtonService.HelpKey`; runtime button creation sites all call `HelpButtonService.Attach`; key-set comparison reported `zh-CN missing=0 extra=0` and `en-US missing=0 extra=0`. Release build and smoke tests passed. Windows UI Automation could not inspect the elevated preview from the non-elevated test process because of UIPI, so no UI-tree count is claimed from that probe; the elevated preview itself started normally and wrote a fresh session log.
+- User impact: Buttons now have an explicit contextual help entry, field meanings are available by tooltip, and switching between Chinese and English no longer leaves the newly added command labels untranslated.
+
+- Type: UI / Maintenance Rules / Favorites Review
+- Affected files/modules: `src/NetBootDhcpTool.App/MainWindow.xaml`, `docs/MAINTENANCE_GUIDE.md`, `PROJECT_MEMORY.md`, `docs/FEATURE_CHANGELOG.md`
+- Concrete change: Moved the Restart Adapter action beside the adapter status and the Change MAC action beside the displayed MAC address, keeping both actions tied to the selected adapter. Added a project-wide rule to prioritize Chinese/English bilingual support for future user-visible changes. Audited the Favorites actions: Load configuration only populates fields, records last use, and switches to the scan tab; Apply and scan reuses that step and then runs one adapter configuration and one scan, with no duplicate scan or configuration pass.
+- Verification: Reviewed `LoadFavorite`, `LoadFavorite_Click`, `ApplyFavorite_Click`, and `ApplyAndScanAsync` call paths; the XAML control names and click handlers remain unchanged. Release build completed with 0 warnings and 0 errors, the smoke suite returned `OK`, `git diff --check` passed, and the current source Release preview started successfully with a new session log showing 32 current IPv4 routes loaded.
+- User impact: Adapter-specific controls are located next to the values they change, future UI changes have an explicit bilingual maintenance requirement, and Favorites behavior remains separated without redundant network work.
+
+- Type: Feature / Network Control / Update UX / UI
+- Affected files/modules: `src/NetBootDhcpTool.Network/NetworkAdapterService.cs`, `src/NetBootDhcpTool.Core/Models.cs`, `src/NetBootDhcpTool.Core/FavoriteStore.cs`, `src/NetBootDhcpTool.Core/Defaults.cs`, `src/NetBootDhcpTool.Core/VersionUpdateService.cs`, `src/NetBootDhcpTool.App/MainWindow.xaml`, `src/NetBootDhcpTool.App/MainWindow.xaml.cs`, `src/NetBootDhcpTool.App/MacAddressWindow.xaml`, `src/NetBootDhcpTool.App/MacAddressWindow.xaml.cs`, `src/NetBootDhcpTool.App/FavoriteWindow.xaml`, `src/NetBootDhcpTool.App/AppDialog.xaml`, `src/NetBootDhcpTool.Tests/Program.cs`, `config/appsettings.json`, `build/publish.ps1`, `docs/FEATURE_CHANGELOG.md`, `docs/MAINTENANCE_GUIDE.md`, `docs/RELEASE_PROCESS.md`, `README.md`, `PROJECT_MEMORY.md`
+- Concrete change: Added selected-adapter restart through disable/enable, manual and locally-administered random MAC generation, per-adapter normal-exit MAC restoration enabled by default, and settings switches controlling whether restart and MAC actions may target wireless, virtual, disconnected, or other adapters. Added plaintext public-password fields for manufacturer-published BMC presets while retaining DPAPI protection for personal favorites. Expanded BMC presets and added update-manifest release notes/change items, background download with SHA-256 verification, and the 10-second below-3-KB/s email-only warning. Added rounded styles for buttons, inputs, dialogs, cards, and primary containers while retaining virtualized DataGrid rendering for performance.
+- Verification: Release build and smoke tests passed after implementation; MAC normalization/random-generation tests, public-preset plaintext persistence tests, legacy personal-favorite DPAPI tests, and manifest release-note parsing tests passed. Local preview is required after the final change; no physical adapter was modified and no GitHub publication was performed.
+- User impact: Users can operate a selected network adapter directly with explicit confirmation and visible progress, restore a temporary MAC on normal exit, access common public BMC defaults, review release changes before downloading, and keep the UI responsive during update downloads.
+
+## 2026-08-28
+
+- Type: Frontend verification / Performance / Safety
+- Affected files/modules: `src/NetBootDhcpTool.App/MainWindow.xaml`, `src/NetBootDhcpTool.App/MainWindow.xaml.cs`, `src/NetBootDhcpTool.Network/StaticRouteService.cs`
+- Concrete change: Reproduced the static-route click freeze through the local frontend with 47 current IPv4 route rows and three isolated Hyper-V Internal test adapters. Existing route rows now render the adapter as text and create the adapter ComboBox only during cell editing; route grid row/column virtualization and recycling are enabled.
+- Verification: Frontend smoke created `NetBootUiTest-20260828-0945-A/B/C` with `198.18.250.1/24`, `198.18.251.1/24`, and `198.18.252.1/24`, refreshed the adapter list, displayed all 47 routes, added and removed a pending route, confirmed existing-route delete protection, and confirmed virtual-NIC DHCP refusal. Before the template change the click produced no render-completed checkpoint; after the change the first route render completed in 339 ms and a repeat render in 27 ms. Refresh showed the busy overlay while the complete route read took about 2.1 seconds. The test adapters were removed afterward; no physical adapter or external service was changed.
+- User impact: Static Routes no longer blocks the WPF UI while materializing a ComboBox for every existing route, while slow refresh remains visibly marked as in progress and current routes remain display-only.
+
+## 2026-08-28
+
+- Type: Diagnostics / Performance / UI
+- Affected files/modules: `src/NetBootDhcpTool.Core/Logger.cs`, `src/NetBootDhcpTool.App/MainWindow.xaml.cs`, `src/NetBootDhcpTool.App/MainWindow.xaml`, `src/NetBootDhcpTool.Network/StaticRouteService.cs`, `PROJECT_MEMORY.md`
+- Concrete change: Each application run now creates a unique UTF-8 log file named with its start timestamp, process ID, and unique suffix. Button clicks, tab selections, static-route read steps, PowerShell completion/elapsed time, and static-route-tab render completion are logged. Existing route rows now use a lightweight adapter text display instead of creating an adapter ComboBox for every row.
+- Verification: Local route comparison found 32 IPv4 entries; the new preview log recorded the complete route read, and the static-route render timing checkpoint is instrumented for click reproduction. Release build, smoke suite, and `git diff --check` passed; no external publication was performed.
+- User impact: Every run has an independent traceable log, and the static-route page avoids the bulk ComboBox rendering that caused the observed click-time freeze.
+
+## 2026-08-28
+
+- Type: Maintenance rule / Preview workflow
+- Affected files/modules: `build/run-app-admin.ps1`, `docs/MAINTENANCE_GUIDE.md`, `PROJECT_MEMORY.md`
+- Concrete change: Added the project-wide post-change preview constraint. The standard preview script now detects an existing `NetBootDhcpTool` process, closes and restarts it when present, or starts a new elevated instance when absent; it prefers the current source `Release` output and falls back to the packaged release directory only when the source build is absent. The maintenance guide and project memory now require this check after every completed change.
+- Verification: PowerShell script syntax was inspected, documentation references were checked, and `git diff --check` was run. The local preview entry point was executed after the documentation change.
+- User impact: The preview reflects the current local source build without requiring manual process management and does not silently reuse an older packaged executable.
+
+## 2026-08-28
+
+- Type: Feature / Maintenance rule
+- Affected files/modules: `src/NetBootDhcpTool.App/MainWindow.xaml.cs`, `docs/MAINTENANCE_GUIDE.md`, `PROJECT_MEMORY.md`
+- Concrete change: The Static Routes page now loads all existing IPv4 routes across all local interfaces in one background query, independent of the top adapter selection, including Local, DHCP, and virtual-interface routes with their protocol shown. Existing rows are shown as current state and excluded from a new-route apply batch. Added refresh concurrency protection and ensured slow actions expose the existing busy overlay; adapter enumeration remains off the UI thread, status polling is reduced, log dispatch is asynchronous, and visible log history is capped.
+- Verification: Release build and smoke suite passed; local application preview started after the change; no external publication was requested or performed.
+- User impact: Startup, refresh, and long-running operation remain responsive, and static routes on multiple adapters are visible together without changing the system.
+
 ## 2026-08-27
 
 - Type: Feature / Security / Release

@@ -10,6 +10,8 @@ public sealed class AppSettings
     public int HttpTimeoutMs { get; set; } = 1000;
     public bool AllowDhcpOnWifi { get; set; }
     public bool AllowDhcpOnAdapterWithGateway { get; set; }
+    public bool AllowRestartOnAnyAdapter { get; set; } = true;
+    public bool AllowMacChangeOnAnyAdapter { get; set; } = true;
     public bool RestoreIpOnDhcpStop { get; set; } = true;
     public bool DetectExistingDhcpBeforeStart { get; set; } = true;
     public DefaultDhcpSettings DefaultDhcp { get; set; } = new();
@@ -37,7 +39,13 @@ public sealed class FavoriteConfig
     public string Username { get; set; } = "";
     [JsonIgnore]
     public string Password { get; set; } = "";
+    /// <summary>
+    /// Plaintext password for a manufacturer-published factory-default preset.
+    /// Personal favorites continue to use ProtectedPassword on disk.
+    /// </summary>
+    public string PublicPassword { get; set; } = "";
     public string ProtectedPassword { get; set; } = "";
+    public bool IsPublicDefault { get; set; }
     public bool PreferHttps { get; set; }
     public string MemoryText { get; set; } = "";
     public string AdapterName { get; set; } = "";
@@ -57,7 +65,7 @@ public sealed class FavoriteConfig
     [JsonIgnore]
     public bool HasUsablePassword => !PasswordUnavailable && !string.IsNullOrWhiteSpace(Password);
     [JsonIgnore]
-    public string PasswordDisplay => PasswordUnavailable ? "Unavailable / 需重新输入" : HasUsablePassword ? "••••••" : "";
+    public string PasswordDisplay => PasswordUnavailable ? "Unavailable / 需重新输入" : HasUsablePassword ? Password : "";
     public DateTime CreatedAt { get; set; } = DateTime.Now;
     public DateTime UpdatedAt { get; set; } = DateTime.Now;
     public DateTime? LastUsedAt { get; set; }
@@ -116,6 +124,7 @@ public sealed class StaticRouteRule
     public string AdapterMac { get; set; } = "";
     public string NextHop { get; set; } = "";
     public int RouteMetric { get; set; } = 10;
+    [JsonIgnore] public bool IsExistingRoute { get; set; }
     [JsonIgnore] public string Status { get; set; } = "Not applied / 未应用";
     [JsonIgnore] public string NextHopDisplay => string.IsNullOrWhiteSpace(NextHop) ? "Direct / 直连" : NextHop;
 }
@@ -142,6 +151,16 @@ public sealed class OperationHistoryItem
     public string MacAddress { get; set; } = "";
     public string Status { get; set; } = "";
     public string Detail { get; set; } = "";
+}
+
+public sealed class AdapterMacBackup
+{
+    public string InterfaceIndex { get; set; } = "";
+    public string AdapterId { get; set; } = "";
+    public string AdapterName { get; set; } = "";
+    public string OriginalMacAddress { get; set; } = "";
+    public bool RestoreOnExit { get; set; } = true;
+    public DateTime CapturedAt { get; set; } = DateTime.Now;
 }
 
 public sealed class ScanResult
