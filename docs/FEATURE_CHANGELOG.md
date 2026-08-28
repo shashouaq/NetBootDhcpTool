@@ -34,6 +34,14 @@
 
 ## 2026-08-28
 
+- Type: Release verification
+- Affected files/modules: `src/NetBootDhcpTool.App/NetBootDhcpTool.App.csproj`, `docs/FEATURE_CHANGELOG.md`, `docs/RELEASE_NOTES.md`, `release/NetBootDhcpTool-v1.0.9.7z`, `release/NetBootDhcpTool-v1.0.9.7z.sha256`, `release/latest.json`
+- Concrete change: Published v1.0.9 from commit `9d5fcbc70df9d6c13b9f38332f0aab5aa41fd14c` with the `v1.0.9` tag and GitHub Release assets.
+- Verification: Local self-contained archive size is `63,486,110` bytes and passed 7-Zip testing. File version is `1.0.9.0`. SHA256 `2ad3144c5686042017426800657215b597b723ae897cb88e5d6775e40676b3c9` matches the local archive, sidecar, local manifest, remote `latest.json`, and a freshly downloaded remote archive. `git ls-remote` confirms both `main` and `v1.0.9` resolve to the release commit. GitHub Release verification confirms the archive, checksum, and `latest.json` assets exist.
+- User impact: v1.0.9 is available from [GitHub Release v1.0.9](https://github.com/shashouaq/NetBootDhcpTool/releases/tag/v1.0.9); the updater can consume the verified remote manifest and download the archive without auto-installing it.
+
+## 2026-08-28
+
 - Type: Frontend verification / Performance / Safety
 - Affected files/modules: `src/NetBootDhcpTool.App/MainWindow.xaml`, `src/NetBootDhcpTool.App/MainWindow.xaml.cs`, `src/NetBootDhcpTool.Network/StaticRouteService.cs`
 - Concrete change: Reproduced the static-route click freeze through the local frontend with 47 current IPv4 route rows and three isolated Hyper-V Internal test adapters. Existing route rows now render the adapter as text and create the adapter ComboBox only during cell editing; route grid row/column virtualization and recycling are enabled.

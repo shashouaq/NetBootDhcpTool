@@ -14,7 +14,7 @@ NetBoot DHCP Tool v1.0.9 adds adapter controls, complete local static-route visi
 
 ### Validation
 
-- Release build and smoke tests passed before packaging; the self-contained archive, SHA256 sidecar, `latest.json`, GitHub tag, release, and assets are verified in the v1.0.9 release verification entry of `docs/FEATURE_CHANGELOG.md`.
+- Release build and smoke tests passed before packaging. The self-contained archive is `63,486,110` bytes, passed 7-Zip testing, has file version `1.0.9.0`, and uses SHA256 `2ad3144c5686042017426800657215b597b723ae897cb88e5d6775e40676b3c9`; local and remote archive/manifest verification is recorded in `docs/FEATURE_CHANGELOG.md`.
 
 ## v1.0.8
 
