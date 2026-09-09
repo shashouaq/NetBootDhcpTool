@@ -73,6 +73,7 @@ public partial class MainWindow : Window
     public ObservableCollection<DhcpLease> Leases => _viewModel.Leases;
     public ObservableCollection<AdapterIpHistoryItem> AdapterIpHistory => _viewModel.AdapterIpHistory;
     public ObservableCollection<StaticRouteRule> StaticRoutes => _viewModel.StaticRoutes;
+    public ObservableCollection<StaticRouteRule> CurrentStaticRoutes => _viewModel.CurrentStaticRoutes;
 
     public MainWindow()
     {
@@ -116,10 +117,15 @@ public partial class MainWindow : Window
         Dispatcher.BeginInvoke(() =>
         {
             SetBusy(false);
-            _ = RefreshAdaptersAsync();
-            _ = RecoverStaleRoutesAsync();
+            _ = InitializeNetworkStateAsync();
             _ = CheckForUpdatesAsync();
         }, DispatcherPriority.ApplicationIdle);
+    }
+
+    private async Task InitializeNetworkStateAsync()
+    {
+        await RefreshAdaptersAsync();
+        await RecoverStaleRoutesAsync();
     }
 
     protected override async void OnClosing(System.ComponentModel.CancelEventArgs e)
@@ -129,7 +135,11 @@ public partial class MainWindow : Window
             base.OnClosing(e);
             return;
         }
-        if (_closingCleanupStarted) return;
+        if (_closingCleanupStarted)
+        {
+            e.Cancel = true;
+            return;
+        }
 
         e.Cancel = true;
         _closingCleanupStarted = true;
@@ -203,6 +213,8 @@ public partial class MainWindow : Window
         BtnApplyRoutes.Content = _lang.T("apply.routes");
         BtnClearAppliedRoutes.Content = _lang.T("clear.applied.routes");
         RouteHint.Text = _lang.T("route.hint");
+        RouteRulesTab.Header = _lang.T("route.rules");
+        CurrentRoutesTab.Header = _lang.T("route.current");
         BtnAddFavorite.Content = _lang.T("add.favorite");
         BtnNewFavorite.Content = _lang.T("new.favorite");
         BtnTemplateFavorite.Content = _lang.T("template.favorite");
@@ -242,6 +254,7 @@ public partial class MainWindow : Window
         LeaseGrid.ToolTip = _lang.T("help.lease.grid");
         ScanGrid.ToolTip = _lang.T("help.scan.grid");
         RouteGrid.ToolTip = _lang.T("help.route.grid");
+        CurrentRouteGrid.ToolTip = _lang.T("help.route.current.grid");
         FavoriteGrid.ToolTip = _lang.T("help.favorite.grid");
         TabDhcp.ToolTip = _lang.T("help.tab.dhcp");
         TabScan.ToolTip = _lang.T("help.tab.scan");
@@ -393,30 +406,40 @@ public partial class MainWindow : Window
             var adapterByIndex = adapters
                 .Where(x => !string.IsNullOrWhiteSpace(x.InterfaceIndex))
                 .ToDictionary(x => x.InterfaceIndex, StringComparer.OrdinalIgnoreCase);
-            foreach (var row in StaticRoutes.Where(x => x.IsExistingRoute).ToList()) StaticRoutes.Remove(row);
+            CurrentStaticRoutes.Clear();
             var routes = await _routeService.GetCurrentStaticRoutesAsync();
             foreach (var route in routes)
             {
                 adapterByIndex.TryGetValue(route.InterfaceIndex, out var adapter);
-                StaticRoutes.Insert(0, new StaticRouteRule
+                CurrentStaticRoutes.Add(new StaticRouteRule
                 {
                     DestinationPrefix = route.DestinationPrefix,
+                    AddressFamily = route.AddressFamily,
                     AdapterId = adapter?.Id ?? "",
                     AdapterName = adapter?.Name ?? $"Interface {route.InterfaceIndex} / 未枚举接口",
                     AdapterMac = adapter?.MacAddress ?? "",
-                    NextHop = route.NextHop == "0.0.0.0" ? "" : route.NextHop,
+                    NextHop = IsBlankNextHop(route.NextHop, route.AddressFamily) ? "" : route.NextHop,
                     RouteMetric = route.RouteMetric,
-                    Status = $"Existing route / 已有路由 ({route.Protocol})",
-                    IsExistingRoute = true
+                    InterfaceMetric = route.InterfaceMetric,
+                    Status = BuildCurrentRouteStatus(route)
                 });
             }
-            RouteGrid?.Items.Refresh();
+            CurrentRouteGrid?.Items.Refresh();
             _logger.Info($"Current static routes loaded: count={routes.Count}");
         }
         catch (Exception ex)
         {
             _logger.Warn("Read current static routes failed: " + ex.Message);
         }
+    }
+
+    private string BuildCurrentRouteStatus(CurrentStaticRoute route)
+    {
+        var owned = _appliedStaticRoutes.Any(x =>
+            !string.IsNullOrWhiteSpace(route.InstanceId)
+            && x.InstanceId.Equals(route.InstanceId, StringComparison.OrdinalIgnoreCase));
+        var source = owned ? "Tool-owned / 本工具创建" : "Existing / 系统已有";
+        return $"Protocol={route.Protocol}; Store={route.PolicyStore}; Source={source}";
     }
 
     private void LoadFavorites()
@@ -711,13 +734,18 @@ public partial class MainWindow : Window
 
     private void AddRoute_Click(object sender, RoutedEventArgs e)
     {
-        var adapter = SelectedAdapter ?? Adapters.FirstOrDefault(x => !x.IsWifi && !x.IsVirtual);
+        // Static routes are read-only with respect to adapter configuration, so Wi-Fi
+        // and virtual adapters are valid targets here. Prefer an online adapter when
+        // the route row has not inherited the main adapter selection yet.
+        var adapter = SelectedAdapter
+            ?? Adapters.FirstOrDefault(x => x.Status.Equals("Up", StringComparison.OrdinalIgnoreCase))
+            ?? Adapters.FirstOrDefault();
         var rule = new StaticRouteRule
         {
             AdapterId = adapter?.Id ?? "",
             AdapterName = adapter?.Name ?? "",
             AdapterMac = adapter?.MacAddress ?? "",
-            RouteMetric = 10
+            RouteMetric = 1
         };
         StaticRoutes.Add(rule);
         RouteGrid.SelectedItem = rule;
@@ -832,7 +860,10 @@ public partial class MainWindow : Window
         rule.AdapterName = adapter.Name;
         rule.AdapterMac = adapter.MacAddress;
         rule.Status = "Not applied / 未应用";
-        RouteGrid.Items.Refresh();
+        // SelectionChanged fires while DataGrid is still inside its edit transaction.
+        // Refreshing here throws "Refresh is not allowed during AddNew/EditItem" and
+        // makes the route row appear unusable, especially when choosing a virtual NIC.
+        _ = Dispatcher.BeginInvoke(DispatcherPriority.ContextIdle, new Action(() => RouteGrid.Items.Refresh()));
     }
 
     private async void ApplyRoutes_Click(object sender, RoutedEventArgs e)
@@ -840,34 +871,52 @@ public partial class MainWindow : Window
         try
         {
             var targets = BuildStaticRouteTargets();
-            var summary = string.Join(Environment.NewLine, targets.Select(x =>
-                $"{x.Route.DestinationPrefix}  ->  {x.Adapter.Name}  {x.Route.NextHop switch { "0.0.0.0" => "Direct / 直连", _ => "Gateway / 网关 " + x.Route.NextHop }}  metric={x.Route.RouteMetric}"));
-            if (!AppDialog.Show(this, IsChineseUi() ? "确认应用静态路由" : "Confirm Static Routes", summary + Environment.NewLine + Environment.NewLine + (IsChineseUi() ? "这些路由将影响本机流量。是否继续？" : "These routes will affect traffic from this computer. Continue?"), confirm: true, danger: true)) return;
-            if (targets.Any(x => x.Route.IsDefaultRoute)
-                && !AppDialog.Show(this,
-                    IsChineseUi() ? "确认默认路由" : "Confirm Default Route",
-                    IsChineseUi()
-                        ? "检测到 0.0.0.0/0，可能改变整机所有 IPv4 流量的出口。仍要应用吗？"
-                        : "0.0.0.0/0 may change the default path for all IPv4 traffic. Apply it anyway?",
-                    confirm: true,
-                    danger: true)) return;
-
             SetBusy(true, "Applying routes... / 正在应用路由...");
             await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.Render);
+            var plan = await _routeService.PreviewAsync(targets, _appliedStaticRoutes.ToList());
+            var summary = string.Join(Environment.NewLine, plan.Select(x =>
+            {
+                var gateway = x.Target.Route.NextHop switch { "0.0.0.0" or "::" => "Direct / 直连", _ => "Gateway / 网关 " + x.Target.Route.NextHop };
+                var warning = string.IsNullOrWhiteSpace(x.OverlapWarning) ? "" : $"  [{x.OverlapWarning}]";
+                return $"{x.Target.Route.AddressFamily} {x.Target.Route.DestinationPrefix}  ->  {x.Target.Adapter.Name}  {gateway}  route={x.Target.Route.RouteMetric} + interface={x.InterfaceMetric} = effective {x.EffectiveMetric}{warning}";
+            }));
+            if (!AppDialog.Show(this,
+                IsChineseUi() ? "确认应用静态路由" : "Confirm Static Routes",
+                summary + Environment.NewLine + Environment.NewLine
+                + (IsChineseUi()
+                    ? "跃点已按当前网卡接口跃点自动计算。相同前缀会按综合跃点选择实际出口，不同前缀按最长前缀优先。这些路由将影响本机流量，是否继续？"
+                    : "Route metrics were calculated from the current interface metrics. Same-prefix routes use the lowest effective metric; overlapping prefixes use longest-prefix match. These routes affect local traffic. Continue?"),
+                confirm: true,
+                danger: true))
+            {
+                return;
+            }
+
             if (_appliedStaticRoutes.Count > 0 && !await ClearAppliedRoutesAsync()) return;
 
-            var results = await _routeService.ApplyAsync(targets);
+            var results = await _routeService.ApplyAsync(
+                targets,
+                onCreated: applied =>
+                {
+                    _appliedStaticRoutes.Add(applied);
+                    SaveStaticRouteSession();
+                });
             foreach (var result in results)
             {
                 result.Rule.Status = result.StatusText;
-                if (result.Created && result.Applied != null) _appliedStaticRoutes.Add(result.Applied);
             }
             SaveStaticRouteSession();
             RouteGrid.Items.Refresh();
+            await LoadCurrentStaticRoutesAsync(Adapters.ToList());
             _logger.Info($"Static route batch applied: rules={results.Count} created={results.Count(x => x.Created)}");
         }
         catch (Exception ex)
         {
+            if (_appliedStaticRoutes.Count > 0)
+            {
+                try { await ClearAppliedRoutesAsync(); }
+                catch (Exception cleanupEx) { _logger.Error("Route failure cleanup failed", cleanupEx); }
+            }
             _logger.Error("Apply static routes failed", ex);
             AppDialog.Show(this, _lang.T("apply.routes"), ex.Message, danger: true);
         }
@@ -905,13 +954,6 @@ public partial class MainWindow : Window
     private async void RemoveRoute_Click(object sender, RoutedEventArgs e)
     {
         if (RouteGrid.SelectedItem is not StaticRouteRule rule) return;
-        if (rule.IsExistingRoute)
-        {
-            AppDialog.Show(this, _lang.T("remove.route"), IsChineseUi()
-                ? "这是本机已有路由，仅用于展示，未执行删除。"
-                : "This route already exists on the computer and is display-only; it was not deleted.");
-            return;
-        }
         try
         {
             var applied = _appliedStaticRoutes.Where(x => x.RuleId.Equals(rule.Id, StringComparison.OrdinalIgnoreCase)).ToList();
@@ -944,18 +986,20 @@ public partial class MainWindow : Window
 
     private List<StaticRouteTarget> BuildStaticRouteTargets()
     {
-        var editableRoutes = StaticRoutes.Where(x => !x.IsExistingRoute).ToList();
-        if (editableRoutes.Count == 0) throw new InvalidOperationException("Add at least one route / 请至少新增一条路由");
+        if (StaticRoutes.Count == 0) throw new InvalidOperationException("Add at least one route / 请至少新增一条路由");
         var targets = new List<StaticRouteTarget>();
         var keys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var rule in editableRoutes)
+        foreach (var rule in StaticRoutes)
         {
             var adapter = ResolveAdapterForRule(rule) ?? throw new InvalidOperationException($"Adapter not found for route {rule.DestinationPrefix} / 路由未找到对应网卡：{rule.DestinationPrefix}");
             var normalized = StaticRouteValidator.Normalize(rule);
-            var key = $"{normalized.DestinationPrefix}|{adapter.InterfaceIndex}|{normalized.NextHop}";
+            var key = $"{normalized.AddressFamily}|{normalized.DestinationPrefix}|{adapter.InterfaceIndex}|{normalized.NextHop}";
             if (!keys.Add(key)) throw new InvalidOperationException($"Duplicate route target: {normalized.DestinationPrefix} on {adapter.Name} / 重复路由目标：{normalized.DestinationPrefix} 指向 {adapter.Name}");
             rule.DestinationPrefix = normalized.DestinationPrefix;
+            rule.AddressFamily = normalized.AddressFamily.ToString();
             rule.NextHop = normalized.NextHop == "0.0.0.0" ? "" : normalized.NextHop;
+            if (normalized.NextHop == "::") rule.NextHop = "";
+            rule.RouteMetric = 1;
             rule.AdapterId = adapter.Id;
             rule.AdapterName = adapter.Name;
             rule.AdapterMac = adapter.MacAddress;
@@ -1004,6 +1048,15 @@ public partial class MainWindow : Window
             rule.AdapterMac = adapter.MacAddress;
         }
         RouteGrid?.Items.Refresh();
+    }
+
+    private static bool IsBlankNextHop(string nextHop, string addressFamily)
+    {
+        if (string.IsNullOrWhiteSpace(nextHop)) return true;
+        if (!IPAddress.TryParse(nextHop, out var parsed)) return false;
+        return addressFamily.Equals("IPv6", StringComparison.OrdinalIgnoreCase)
+            ? parsed.Equals(IPAddress.IPv6Any)
+            : parsed.Equals(IPAddress.Any);
     }
 
     private async void RestoreScan_Click(object sender, RoutedEventArgs e)
@@ -1674,6 +1727,7 @@ public partial class MainWindow : Window
         BtnStopDhcp.Background = running ? Brushes.OrangeRed : Brushes.LightGray;
         BtnStopDhcp.Foreground = running ? Brushes.White : Brushes.Black;
         RouteGrid.IsEnabled = !running;
+        CurrentRouteGrid.IsEnabled = !running;
         BtnAddRoute.IsEnabled = !running;
         BtnRemoveRoute.IsEnabled = !running;
         BtnApplyRoutes.IsEnabled = !running;
@@ -1683,33 +1737,58 @@ public partial class MainWindow : Window
 
     private async Task CleanupWorkEnvironmentAsync()
     {
+        PersistStateBeforeExit();
+        var restoreAdapter = _dhcpWasStartedInThisSession;
+        _leasePingTimer.Stop();
+        _leaseHintCts?.Cancel();
+        _scanCts?.Cancel();
+        _dhcpServer.Stop();
+
         try
         {
-            PersistStateBeforeExit();
-            var restoreAdapter = _dhcpWasStartedInThisSession;
-            _leasePingTimer.Stop();
-            _leaseHintCts?.Cancel();
-            _scanCts?.Cancel();
-            _dhcpServer.Stop();
             await RemoveDhcpFirewallRulesAsync();
-            await ClearAppliedRoutesAsync();
-            StaticRoutes.Clear();
-            if (restoreAdapter)
-            {
-                var adapter = GetDhcpRestoreAdapter();
-                if (adapter != null)
-                {
-                    await RestoreOriginalAdapterConfigAsync(adapter);
-                }
-            }
-            await RestoreOriginalMacAddressesAsync();
-            _activeDhcpAdapterIndex = null;
-            _logger.Info("Window closing cleanup completed");
         }
         catch (Exception ex)
         {
-            _logger.Error("Window closing cleanup failed", ex);
+            _logger.Error("Window closing firewall cleanup failed", ex);
         }
+
+        try
+        {
+            await ClearAppliedRoutesAsync();
+        }
+        catch (Exception ex)
+        {
+            _logger.Error("Window closing route cleanup failed", ex);
+        }
+
+        StaticRoutes.Clear();
+        CurrentStaticRoutes.Clear();
+
+        if (restoreAdapter)
+        {
+            try
+            {
+                var adapter = GetDhcpRestoreAdapter();
+                if (adapter != null) await RestoreOriginalAdapterConfigAsync(adapter);
+            }
+            catch (Exception ex)
+            {
+                _logger.Error("Window closing adapter restore failed", ex);
+            }
+        }
+
+        try
+        {
+            await RestoreOriginalMacAddressesAsync();
+        }
+        catch (Exception ex)
+        {
+            _logger.Error("Window closing MAC restore failed", ex);
+        }
+
+        _activeDhcpAdapterIndex = null;
+        _logger.Info("Window closing cleanup completed");
     }
 
     private async Task RestoreOriginalMacAddressesAsync()
@@ -1960,7 +2039,14 @@ public partial class MainWindow : Window
 
     private static void OpenUrl(string url)
     {
-        Process.Start(new ProcessStartInfo { FileName = url, UseShellExecute = true });
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri)
+            || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps)
+            || !IPAddress.TryParse(uri.Host, out _))
+        {
+            return;
+        }
+
+        Process.Start(new ProcessStartInfo { FileName = uri.AbsoluteUri, UseShellExecute = true });
     }
 
     private void SetBusy(bool busy, string? text = null)
@@ -2308,8 +2394,11 @@ public partial class MainWindow : Window
             ["IP", "连通", "延迟(ms)", "状态", "网页", "本机IP", "MAC", "主机名", "最后发现", "备注"],
             ["IP", "Ping", "ms", "Status", "Web", "Local IP", "MAC", "Hostname", "Last Seen", "Remark"]);
         SetHeaders(RouteGrid.Columns, zh,
-            ["目标网段", "使用网卡", "网关", "跃点", "状态"],
-            ["Destination", "Adapter", "Gateway", "Metric", "Status"]);
+            ["目标地址", "地址族", "使用网卡", "网关", "优先级", "状态"],
+            ["Destination", "Family", "Adapter", "Gateway", "Priority", "Status"]);
+        SetHeaders(CurrentRouteGrid.Columns, zh,
+            ["目标地址", "地址族", "使用网卡", "网关", "跃点", "协议"],
+            ["Destination", "Family", "Adapter", "Gateway", "Metric", "Protocol"]);
         SetHeaders(FavoriteGrid.Columns, zh,
             ["名称", "设备", "序列号", "备注", "账号", "密码", "IP", "掩码", "自定义", "更新", "最近使用", "说明"],
             ["Name", "Device", "SN", "Remark", "User", "Password", "IP", "Mask", "Custom", "Updated", "Last Used", "Description"]);

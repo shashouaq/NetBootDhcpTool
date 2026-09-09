@@ -17,4 +17,5 @@ public sealed class MainWindowViewModel
     public ObservableCollection<DhcpLease> Leases { get; } = [];
     public ObservableCollection<AdapterIpHistoryItem> AdapterIpHistory { get; } = [];
     public ObservableCollection<StaticRouteRule> StaticRoutes { get; } = [];
+    public ObservableCollection<StaticRouteRule> CurrentStaticRoutes { get; } = [];
 }

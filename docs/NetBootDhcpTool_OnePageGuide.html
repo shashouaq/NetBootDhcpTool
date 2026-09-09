@@ -29,7 +29,7 @@
       <div class="brand">
         <img class="logo" src="../assets/logo.png" alt="NetBoot DHCP Tool">
         <div>
-          <h1>NetBoot DHCP Tool v1.0.9</h1>
+          <h1>NetBoot DHCP Tool v1.0.10</h1>
           <div>IPv4 DHCP、手动 IP、静态路由、连通性探测和设备收藏工具</div>
         </div>
       </div>
@@ -72,11 +72,11 @@
       <div class="card">
         <h2>静态路由</h2>
         <ul>
-          <li>可添加多条 IPv4 目标网段，并分别选择流量出口网卡。</li>
-          <li>网关留空表示直连；填写 IPv4 网关表示经该网关转发。</li>
-          <li>目标会自动规范到网段边界，跃点范围为 1 到 65535。</li>
-          <li>允许输入 0.0.0.0/0，但会额外确认，因为它可能改变全部 IPv4 流量出口。</li>
-          <li>只清理本次运行创建的路由；已有系统路由不覆盖、不删除。</li>
+          <li>可添加多条 IPv4/IPv6 目标网段，并分别选择流量出口网卡。</li>
+          <li>网关留空表示直连；填写同地址族且处于网卡直连网段内的网关表示经该网关转发。</li>
+          <li>目标会自动规范到网段边界，跃点按当前接口跃点自动计算并在预览中显示。</li>
+          <li>不同前缀按最长前缀优先；不允许新增 IPv4/IPv6 默认路由，也不覆盖已有系统路由。</li>
+          <li>只清理本次运行创建且身份完全匹配的路由；已有系统路由不覆盖、不删除。</li>
         </ul>
       </div>
       <div class="card">
@@ -108,7 +108,7 @@
     </section>
 
     <footer>
-      <span>发布包：release\NetBootDhcpTool-v1.0.9</span>
+      <span>发布包：release\NetBootDhcpTool-v1.0.10</span>
       <span>配置：%LOCALAPPDATA%\NetBootDhcpTool / 说明：docs</span>
     </footer>
   </main>

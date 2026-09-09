@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.IO;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Security.Principal;
@@ -132,7 +133,14 @@ Start-Sleep -Milliseconds 500
     public async Task ApplyStaticIPv4Async(NetworkAdapterInfo adapter, string ip, string mask, string gateway, string dns, CancellationToken ct = default)
     {
         EnsureAllowedTargetAdapter(adapter);
-        var prefix = IpNetwork.PrefixLength(IPAddress.Parse(mask));
+        var parsedIp = ValidateIpv4(ip, "adapter IP");
+        var parsedMask = ValidateIpv4(mask, "subnet mask");
+        var prefix = IpNetwork.PrefixLength(IPAddress.Parse(parsedMask));
+        var expectedMask = prefix == 0 ? 0u : uint.MaxValue << (32 - prefix);
+        if (IpNetwork.ToUInt32(IPAddress.Parse(parsedMask)) != expectedMask)
+            throw new InvalidDataException($"Invalid subnet mask: {mask}");
+        ValidateOptionalIpv4(gateway, "gateway");
+        ValidateOptionalIpv4(dns, "DNS");
         var script = $$"""
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [Console]::OutputEncoding
@@ -141,7 +149,7 @@ $idx={{adapter.InterfaceIndex}}
 Set-NetIPInterface -InterfaceIndex $idx -Dhcp Disabled -ErrorAction SilentlyContinue
 Get-NetIPAddress -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
 Get-NetRoute -InterfaceIndex $idx -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
-New-NetIPAddress -InterfaceIndex $idx -IPAddress '{{ip}}' -PrefixLength {{prefix}} -ErrorAction Stop | Out-Null
+New-NetIPAddress -InterfaceIndex $idx -IPAddress {{PsQuote(parsedIp)}} -PrefixLength {{prefix}} -ErrorAction Stop | Out-Null
 Set-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -AutomaticMetric Disabled -InterfaceMetric 9000 -ErrorAction Stop
 Set-DnsClientServerAddress -InterfaceIndex $idx -ResetServerAddresses -ErrorAction SilentlyContinue
 'OK'
@@ -348,10 +356,13 @@ $policyEvent = Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-WLAN-A
     private async Task<string> RunPowerShellOutputAsync(string script, string summary, CancellationToken ct, bool logOutput)
     {
         _logger.Info(summary);
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeoutCts.CancelAfter(TimeSpan.FromSeconds(30));
+        var operationToken = timeoutCts.Token;
         using var process = new Process();
         process.StartInfo = new ProcessStartInfo
         {
-            FileName = "powershell.exe",
+            FileName = ResolvePowerShellPath(),
             Arguments = "-NoProfile -ExecutionPolicy Bypass -EncodedCommand " + Convert.ToBase64String(Encoding.Unicode.GetBytes(script)),
             UseShellExecute = false,
             RedirectStandardOutput = true,
@@ -361,25 +372,47 @@ $policyEvent = Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-WLAN-A
             CreateNoWindow = true
         };
         process.Start();
-        var output = await process.StandardOutput.ReadToEndAsync(ct);
-        var error = await process.StandardError.ReadToEndAsync(ct);
-        await process.WaitForExitAsync(ct);
-
-        var trimmedOutput = output.Trim();
-        var trimmedError = error.Trim();
-        if (process.ExitCode != 0)
+        try
         {
-            var detail = SummarizePowerShellMessage(trimmedError);
-            _logger.Warn($"{summary} failed: exit={process.ExitCode} detail={detail}");
-            throw new InvalidOperationException(string.IsNullOrWhiteSpace(trimmedError) ? $"PowerShell exit {process.ExitCode}" : trimmedError);
-        }
+            var output = await process.StandardOutput.ReadToEndAsync(operationToken);
+            var error = await process.StandardError.ReadToEndAsync(operationToken);
+            await process.WaitForExitAsync(operationToken);
 
-        if (logOutput)
-        {
-            var detail = SummarizePowerShellMessage(trimmedOutput);
-            _logger.Info($"{summary} result: exit={process.ExitCode} detail={detail}");
+            var trimmedOutput = output.Trim();
+            var trimmedError = error.Trim();
+            if (process.ExitCode != 0)
+            {
+                var detail = SummarizePowerShellMessage(trimmedError);
+                _logger.Warn($"{summary} failed: exit={process.ExitCode} detail={detail}");
+                throw new InvalidOperationException(string.IsNullOrWhiteSpace(trimmedError) ? $"PowerShell exit {process.ExitCode}" : trimmedError);
+            }
+
+            if (logOutput)
+            {
+                var detail = SummarizePowerShellMessage(trimmedOutput);
+                _logger.Info($"{summary} result: exit={process.ExitCode} detail={detail}");
+            }
+            return trimmedOutput;
         }
-        return trimmedOutput;
+        catch (OperationCanceledException)
+        {
+            try
+            {
+                if (!process.HasExited) process.Kill(entireProcessTree: true);
+            }
+            catch { }
+            _logger.Warn($"{summary} aborted or timed out");
+            throw;
+        }
+        catch
+        {
+            try
+            {
+                if (!process.HasExited) process.Kill(entireProcessTree: true);
+            }
+            catch { }
+            throw;
+        }
     }
 
     private static string SummarizePowerShellMessage(string text)
@@ -390,20 +423,33 @@ $policyEvent = Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-WLAN-A
         return normalized;
     }
 
+    private static string ResolvePowerShellPath()
+    {
+        var systemPowerShell = Path.Combine(Environment.SystemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe");
+        if (!File.Exists(systemPowerShell)) throw new InvalidOperationException("Windows PowerShell was not found / 未找到 Windows PowerShell");
+        return systemPowerShell;
+    }
+
     private static void EnsureAllowedTargetAdapter(NetworkAdapterInfo adapter)
     {
-        if (string.IsNullOrWhiteSpace(adapter.InterfaceIndex)) throw new InvalidOperationException("InterfaceIndex missing");
+        EnsureInterfaceIndex(adapter);
         if (adapter.IsWifi || IsWifiLike(adapter.Name, adapter.Description, null)) throw new InvalidOperationException("Refusing to modify WLAN adapter");
     }
 
     private static void EnsureControlTargetAdapter(NetworkAdapterInfo adapter, bool allowAnyAdapter)
     {
-        if (string.IsNullOrWhiteSpace(adapter.InterfaceIndex)) throw new InvalidOperationException("InterfaceIndex missing");
+        EnsureInterfaceIndex(adapter);
         if (allowAnyAdapter) return;
         if (adapter.IsWifi || IsWifiLike(adapter.Name, adapter.Description, null) || adapter.IsVirtual)
             throw new InvalidOperationException("设置当前禁止操作无线或虚拟网卡");
         if (!adapter.Status.Equals("Up", StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException("设置当前禁止操作未启用的网卡");
+    }
+
+    private static void EnsureInterfaceIndex(NetworkAdapterInfo adapter)
+    {
+        if (!int.TryParse(adapter.InterfaceIndex, out var index) || index <= 0)
+            throw new InvalidOperationException("InterfaceIndex is invalid");
     }
 
     private IPv4InterfaceProperties? TryGetIPv4Properties(IPInterfaceProperties props, string adapterName)
@@ -473,6 +519,12 @@ $policyEvent = Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-WLAN-A
         if (!IPAddress.TryParse(value, out var ip) || ip.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork)
             throw new InvalidDataException($"Invalid {field}: {value}");
         return ip.ToString();
+    }
+
+    private static void ValidateOptionalIpv4(string? value, string field)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return;
+        _ = ValidateIpv4(value, field);
     }
 
     private static int ValidatePrefix(int prefix)

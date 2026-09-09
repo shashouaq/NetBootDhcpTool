@@ -288,26 +288,43 @@
             <Button x:Name="BtnClearAppliedRoutes" help:HelpButtonService.HelpKey="help.clear.applied.routes" Click="ClearAppliedRoutes_Click"/>
           </WrapPanel>
           <TextBlock x:Name="RouteHint" Grid.Row="1" Margin="2,4,2,6" Foreground="#B06000" FontWeight="SemiBold"/>
-          <DataGrid x:Name="RouteGrid" Grid.Row="2" ItemsSource="{Binding StaticRoutes}" AutoGenerateColumns="False" CanUserResizeColumns="True" CanUserResizeRows="True" CanUserAddRows="False" SelectionMode="Single" RowHeight="32" EnableRowVirtualization="True" EnableColumnVirtualization="True" VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling" ScrollViewer.CanContentScroll="True">
-            <DataGrid.Columns>
-              <DataGridTextColumn Header="Destination / 目标网段" Binding="{Binding DestinationPrefix, UpdateSourceTrigger=PropertyChanged}" Width="190" ElementStyle="{StaticResource CellText}"/>
-              <DataGridTemplateColumn Header="Adapter / 网卡" Width="270">
-                <DataGridTemplateColumn.CellTemplate>
-                  <DataTemplate>
-                    <TextBlock Text="{Binding AdapterName}" Padding="4,2" TextTrimming="CharacterEllipsis" ToolTip="{Binding AdapterName}"/>
-                  </DataTemplate>
-                </DataGridTemplateColumn.CellTemplate>
-                <DataGridTemplateColumn.CellEditingTemplate>
-                  <DataTemplate>
-                    <ComboBox ItemsSource="{Binding DataContext.Adapters, RelativeSource={RelativeSource AncestorType={x:Type DataGrid}}}" DisplayMemberPath="DisplayName" SelectedValuePath="Id" SelectedValue="{Binding AdapterId, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" SelectionChanged="RouteAdapter_SelectionChanged" MinWidth="240"/>
-                  </DataTemplate>
-                </DataGridTemplateColumn.CellEditingTemplate>
-              </DataGridTemplateColumn>
-              <DataGridTextColumn Header="Gateway / 网关" Binding="{Binding NextHop, UpdateSourceTrigger=PropertyChanged}" Width="165" ElementStyle="{StaticResource CellText}"/>
-              <DataGridTextColumn Header="Metric / 跃点" Binding="{Binding RouteMetric, UpdateSourceTrigger=PropertyChanged}" Width="95" ElementStyle="{StaticResource CellText}"/>
-              <DataGridTextColumn Header="Status / 状态" Binding="{Binding Status}" Width="220" ElementStyle="{StaticResource CellText}"/>
-            </DataGrid.Columns>
-          </DataGrid>
+          <TabControl x:Name="RouteViews" Grid.Row="2">
+            <TabItem x:Name="RouteRulesTab">
+              <DataGrid x:Name="RouteGrid" ItemsSource="{Binding StaticRoutes}" AutoGenerateColumns="False" CanUserResizeColumns="True" CanUserResizeRows="True" CanUserAddRows="False" SelectionMode="Single" RowHeight="32" EnableRowVirtualization="True" EnableColumnVirtualization="True" VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling" ScrollViewer.CanContentScroll="True">
+                <DataGrid.Columns>
+                  <DataGridTextColumn Header="Address / 目标地址" Binding="{Binding DestinationPrefix, UpdateSourceTrigger=PropertyChanged}" Width="220" ElementStyle="{StaticResource CellText}"/>
+                  <DataGridTextColumn Header="Family / 地址族" Binding="{Binding AddressFamilyDisplay}" Width="95" IsReadOnly="True" ElementStyle="{StaticResource CellText}"/>
+                  <DataGridTemplateColumn Header="Adapter / 网卡" Width="270">
+                    <DataGridTemplateColumn.CellTemplate>
+                      <DataTemplate>
+                        <TextBlock Text="{Binding AdapterName}" Padding="4,2" TextTrimming="CharacterEllipsis" ToolTip="{Binding AdapterName}"/>
+                      </DataTemplate>
+                    </DataGridTemplateColumn.CellTemplate>
+                    <DataGridTemplateColumn.CellEditingTemplate>
+                      <DataTemplate>
+                        <ComboBox ItemsSource="{Binding DataContext.Adapters, RelativeSource={RelativeSource AncestorType={x:Type DataGrid}}}" DisplayMemberPath="DisplayName" SelectedValuePath="Id" SelectedValue="{Binding AdapterId, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" SelectionChanged="RouteAdapter_SelectionChanged" MinWidth="240"/>
+                      </DataTemplate>
+                    </DataGridTemplateColumn.CellEditingTemplate>
+                  </DataGridTemplateColumn>
+                  <DataGridTextColumn Header="Gateway / 网关" Binding="{Binding NextHop, UpdateSourceTrigger=PropertyChanged}" Width="180" ElementStyle="{StaticResource CellText}"/>
+                  <DataGridTextColumn Header="Priority / 优先级" Binding="{Binding PriorityDisplay}" Width="110" IsReadOnly="True" ElementStyle="{StaticResource CellText}"/>
+                  <DataGridTextColumn Header="Status / 状态" Binding="{Binding Status}" Width="260" ElementStyle="{StaticResource CellText}"/>
+                </DataGrid.Columns>
+              </DataGrid>
+            </TabItem>
+            <TabItem x:Name="CurrentRoutesTab">
+              <DataGrid x:Name="CurrentRouteGrid" ItemsSource="{Binding CurrentStaticRoutes}" AutoGenerateColumns="False" IsReadOnly="True" CanUserResizeColumns="True" CanUserResizeRows="True" CanUserAddRows="False" SelectionMode="Single" RowHeight="32" EnableRowVirtualization="True" EnableColumnVirtualization="True" VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling" ScrollViewer.CanContentScroll="True">
+                <DataGrid.Columns>
+                  <DataGridTextColumn Header="Address / 目标地址" Binding="{Binding DestinationPrefix}" Width="220" ElementStyle="{StaticResource CellText}"/>
+                  <DataGridTextColumn Header="Family / 地址族" Binding="{Binding AddressFamilyDisplay}" Width="95" ElementStyle="{StaticResource CellText}"/>
+                  <DataGridTextColumn Header="Adapter / 网卡" Binding="{Binding AdapterName}" Width="270" ElementStyle="{StaticResource CellText}"/>
+                  <DataGridTextColumn Header="Gateway / 网关" Binding="{Binding NextHopDisplay}" Width="180" ElementStyle="{StaticResource CellText}"/>
+                  <DataGridTextColumn Header="Route + Interface / 跃点" Binding="{Binding EffectiveMetricDisplay}" Width="150" ElementStyle="{StaticResource CellText}"/>
+                  <DataGridTextColumn Header="Protocol / Store / Source" Binding="{Binding Status}" Width="360" ElementStyle="{StaticResource CellText}"/>
+                </DataGrid.Columns>
+              </DataGrid>
+            </TabItem>
+          </TabControl>
         </Grid>
       </TabItem>
       <TabItem x:Name="TabFavorites">

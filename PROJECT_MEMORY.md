@@ -64,10 +64,10 @@
 - UI language resources and XAML labels must be checked for mojibake before release, especially Chinese strings edited through PowerShell.
 - On exit, persist favorites before cleanup starts, and never delete/overwrite favorites or runtime logs as part of close flow.
 - Favorites and logs must use a durable per-user path (`%LOCALAPPDATA%\NetBootDhcpTool`) with one-time migration from legacy app-folder data.
-- Static routes are session-owned: accept multiple IPv4 destination prefixes, normalize host bits to the network boundary, use a blank gateway for direct routes (`0.0.0.0` at the Windows API boundary), and use a nonblank IPv4 gateway for next-hop routes.
-- The static-route page initially displays all existing IPv4 routes across local interfaces as current-state indications, including Local/DHCP/virtual-interface routes with protocol labels; it does not require the top adapter selection and does not automatically apply anything.
+- Static routes are session-owned: accept multiple IPv4/IPv6 destination addresses or prefixes, normalize host bits to the network boundary, treat a bare IPv4/IPv6 address as `/32` or `/128`, use a blank gateway for direct routes (`0.0.0.0` or `::` at the Windows API boundary), and require a gateway to match the destination address family for next-hop routes.
+- The static-route page separates new editable rules from the current read-only route table, which displays all existing IPv4/IPv6 routes across local interfaces including Local/DHCP/virtual-interface routes with protocol labels; it does not require the top adapter selection and does not automatically apply anything.
 - For a large existing-route set, keep the route grid display template lightweight: show the adapter name as text and create the adapter ComboBox only in `CellEditingTemplate`; retain row/column virtualization and recycling. A local frontend run with 47 routes measured 339 ms for the first route-tab render and 27 ms on repeat after this change.
-- Static route application must refuse WLAN, virtual, disconnected, and ambiguous adapter targets; do not overwrite a matching non-system route. Allow `0.0.0.0/0` only with an explicit extra confirmation because it changes the default IPv4 path.
+- Static route application may target any identified local adapter for this feature, without changing the DHCP, scan, restart, or MAC-operation safety boundaries. Do not overwrite a matching route; the same normalized prefix may be added on different adapters but is rejected twice on one adapter, with route metrics automatically calculated from interface metrics and a deterministic effective winner. Gateways must be on-link for the selected address family/interface, more-specific existing or planned conflicts block broader rules, overlapping prefixes are previewed by longest-prefix behavior, and IPv4/IPv6 default routes are rejected.
 - Record every route created by this process with adapter identity, interface index, next hop, metric, policy store, and instance ID. On exit remove only those recorded routes; if cleanup fails or adapter identity changes, retain the recovery journal and offer cleanup on next startup.
 
 ## Validation Checklist
@@ -78,7 +78,7 @@
 - Publish: `.\build\publish.ps1`
 - Cleanup stuck test processes: `.\build\stop-test-processes.ps1`
 - DHCP packet capture: `.\build\verify-dhcp-pktmon.ps1`
-- Static route service smoke test: run `.\build\route-smoke.ps1` as administrator; it creates two uniquely named Hyper-V internal switches, tests direct and gateway routes, then removes the switches in `finally`.
+- Static route service smoke test: run `.\build\route-smoke.ps1` as administrator; it creates two uniquely named Hyper-V internal switches, tests IPv4 direct/gateway routes, IPv6 routes, same-prefix priority, cleanup, then removes the switches in `finally`.
 
 ## Change and publication boundary
 

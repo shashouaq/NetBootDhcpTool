@@ -1,14 +1,14 @@
 # NetBoot DHCP Tool
 
-Version: 1.0.9
+Version: 1.0.10
 
 Authors: Joel & Codex
 
-Windows green portable IPv4 DHCP, adapter IP configuration, static route rules, adapter restart/MAC tools, ping scan, web open, favorites, bilingual UI, contextual `?` help buttons, and logs.
+Windows green portable IPv4 DHCP, adapter IP configuration, IPv4/IPv6 static route rules, adapter restart/MAC tools, ping scan, web open, favorites, bilingual UI, contextual `?` help buttons, and logs.
 
 ## Static Routes
 
-The Static Routes tab accepts multiple IPv4 destination prefixes and assigns each one to a selected wired adapter. Enter a gateway for a next-hop route; leave Gateway blank for a direct route. Prefixes are normalized to the network boundary, route metrics must be between 1 and 65535, and `0.0.0.0/0` is allowed but requires an additional confirmation because it can change all IPv4 traffic.
+The Static Routes tab accepts multiple temporary IPv4/IPv6 rules. Enter a single address or CIDR network; a single address is normalized to `/32` or `/128`. Select any local adapter, enter an on-link gateway for a next-hop route, or leave Gateway blank for a direct route. The same normalized prefix may be assigned to different adapters, while duplicate use of one prefix on one adapter is blocked. Route metrics are calculated from the current interface metrics and the preview shows the effective same-prefix winner. Different prefixes may overlap; Windows longest-prefix matching is shown in the preview. More-specific existing or planned routes block a broader rule when they use a different path, while existing routes are never overwritten or removed. IPv4 and IPv6 default routes (`0.0.0.0/0` and `::/0`) are not allowed.
 
 Only routes created by this session are removed when the application closes. Existing system routes are not overwritten or removed. If the original adapter identity is no longer available, the route is retained in a recovery journal under `%LOCALAPPDATA%\NetBootDhcpTool` and the next startup offers cleanup after the adapter is available again.
 

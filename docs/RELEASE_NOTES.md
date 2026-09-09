@@ -1,5 +1,19 @@
 # Release Notes
 
+## v1.0.10
+
+NetBoot DHCP Tool v1.0.10 adds temporary multi-adapter IPv4/IPv6 static routes with automatic route metrics and safer route cleanup, while hardening HTTPS reachability probes to use normal certificate validation.
+
+### Changes
+
+- Added multiple temporary IPv4/IPv6 route rules, including single-address normalization, per-rule adapter selection, on-link gateway validation, overlap preview, automatic effective metrics, and exact session-owned cleanup.
+- Kept existing system routes read-only and protected the local default route from being overwritten or removed by the static-route feature.
+- Changed HTTPS reachability probes to use the Windows/.NET certificate trust policy; untrusted self-signed certificates no longer count as successful HTTPS without explicit system trust.
+
+### Validation
+
+- Release build, unit smoke, dependency vulnerability audit, secret-pattern audit, route safety audit, and packaged archive verification are recorded in `docs/FEATURE_CHANGELOG.md`.
+
 ## v1.0.9
 
 NetBoot DHCP Tool v1.0.9 adds adapter controls, complete local static-route visibility, responsive route rendering, bilingual contextual help, and safer update/release workflows.

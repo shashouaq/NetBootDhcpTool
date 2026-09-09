@@ -1,5 +1,13 @@
 # Feature Change Log
 
+## v1.0.10 / 2026-09-09
+
+- Type: Feature / Static Routes / IPv4 and IPv6
+- Affected files/modules: `src/NetBootDhcpTool.Core/IpNetwork.cs`, `src/NetBootDhcpTool.Core/StaticRouteValidator.cs`, `src/NetBootDhcpTool.Network/StaticRouteService.cs`, `src/NetBootDhcpTool.Network/HttpProbeService.cs`, `src/NetBootDhcpTool.App/MainWindow.xaml`, `src/NetBootDhcpTool.App/MainWindow.xaml.cs`, `src/NetBootDhcpTool.App/MainWindowViewModel.cs`, `src/NetBootDhcpTool.App/NetBootDhcpTool.App.csproj`, `src/NetBootDhcpTool.Tests/Program.cs`, `build/route-smoke.ps1`, `i18n/`, `README.md`, `PROJECT_MEMORY.md`, `docs/FEATURE_CHANGELOG.md`
+- Concrete change: Reworked Static Routes into separate editable new-rule and read-only current-route views. New rules accept IPv4/IPv6 single addresses or CIDR ranges, allow any identified local adapter, allow the same normalized prefix on different adapters with deterministic automatic route metrics, require gateway on-link validation, preview effective same-prefix winners and longest-prefix overlap behavior, block broader rules that cannot cover existing or planned more-specific paths, reject IPv4/IPv6 default routes, and remain session-owned with exact instance-identity cleanup. Each successful route is journaled immediately, stale-route recovery waits for adapter enumeration, and PowerShell operations use the absolute system path with a timeout. HTTPS reachability probes now use the platform certificate validation policy instead of accepting arbitrary certificates.
+- Verification: Release build passed with 0 warnings and 0 errors; unit smoke returned `OK`, including the non-IP HTTP probe input-boundary check; `dotnet list package --vulnerable --include-transitive` returned no vulnerable package entries; targeted secret and arbitrary HTTPS-certificate-acceptance scans were clean; bilingual resource keys are synchronized at 164 source keys with zero missing/extra keys in either language; static XAML audit found `44/44` buttons with help keys and 6 runtime help attachments; the elevated local source preview is responsive and its fresh log read 38 IPv4/IPv6 routes with no startup errors. The administrator Hyper-V route smoke was invoked but could not be completed from the current non-elevated automation terminal; no physical adapter, test switch, route, or external network was left modified.
+- User impact: A Wi-Fi default route can remain unchanged while a more-specific internal IPv4/IPv6 range is temporarily directed through the selected wired or other adapter; existing routes remain untouched.
+
 ## v1.0.9 / 2026-08-28
 
 - Type: UI / Help UX Refinement

@@ -119,20 +119,27 @@ public sealed class StaticRouteRule
 {
     public string Id { get; set; } = Guid.NewGuid().ToString("N");
     public string DestinationPrefix { get; set; } = "";
+    public string AddressFamily { get; set; } = "";
     public string AdapterId { get; set; } = "";
     public string AdapterName { get; set; } = "";
     public string AdapterMac { get; set; } = "";
     public string NextHop { get; set; } = "";
-    public int RouteMetric { get; set; } = 10;
-    [JsonIgnore] public bool IsExistingRoute { get; set; }
+    public int RouteMetric { get; set; } = 1;
+    public int InterfaceMetric { get; set; }
     [JsonIgnore] public string Status { get; set; } = "Not applied / 未应用";
     [JsonIgnore] public string NextHopDisplay => string.IsNullOrWhiteSpace(NextHop) ? "Direct / 直连" : NextHop;
+    [JsonIgnore] public string AddressFamilyDisplay => string.IsNullOrWhiteSpace(AddressFamily)
+        ? (DestinationPrefix.Contains(':') ? "IPv6" : "IPv4")
+        : AddressFamily;
+    [JsonIgnore] public string PriorityDisplay => RouteMetric <= 1 ? "Auto / 自动" : RouteMetric.ToString();
+    [JsonIgnore] public string EffectiveMetricDisplay => InterfaceMetric > 0 ? $"{RouteMetric} + {InterfaceMetric} = {RouteMetric + InterfaceMetric}" : RouteMetric.ToString();
 }
 
 public sealed class AppliedStaticRoute
 {
     public string RuleId { get; set; } = "";
     public string DestinationPrefix { get; set; } = "";
+    public string AddressFamily { get; set; } = "IPv4";
     public string AdapterId { get; set; } = "";
     public string AdapterName { get; set; } = "";
     public string AdapterMac { get; set; } = "";

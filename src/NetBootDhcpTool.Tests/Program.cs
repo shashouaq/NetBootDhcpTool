@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -27,19 +28,34 @@ if (routeSmokeIndex >= 0)
     return;
 }
 
+var virtualRouteSmokeIndex = Array.IndexOf(args, "--route-virtual-smoke");
+if (virtualRouteSmokeIndex >= 0)
+{
+    if (args.Length < virtualRouteSmokeIndex + 2) throw new ArgumentException("--route-virtual-smoke requires an interface index");
+    var resultPath = args.Length > virtualRouteSmokeIndex + 2 ? args[virtualRouteSmokeIndex + 2] : Path.Combine(Path.GetTempPath(), "netboot-virtual-route-smoke.result");
+    await RunVirtualRouteSmokeAsync(args[virtualRouteSmokeIndex + 1], resultPath);
+    return;
+}
+
 var mask = IPAddress.Parse("255.255.255.0");
 var hosts = IpNetwork.Hosts(IPAddress.Parse("192.168.1.10"), mask);
 Assert(hosts.Count == 254, "host count");
 Assert(IpNetwork.SameSubnet(IPAddress.Parse("192.168.1.1"), IPAddress.Parse("192.168.1.200"), mask), "same subnet");
 Assert(IpNetwork.BroadcastAddress(IPAddress.Parse("192.168.100.1"), mask).ToString() == "192.168.100.255", "broadcast address");
 Assert(IpNetwork.ParseCidr("192.168.10.42/24") == "192.168.10.0/24", "cidr canonicalization");
+Assert(IpNetwork.ParseCidr("192.168.10.42") == "192.168.10.42/32", "single IPv4 host canonicalization");
+Assert(IpNetwork.ParseCidr("2001:db8:10::42/64") == "2001:db8:10::/64", "IPv6 cidr canonicalization");
 Assert(IpNetwork.ParseCidr("0.0.0.0/0") == "0.0.0.0/0", "default route cidr");
 var directRoute = StaticRouteValidator.Normalize(new StaticRouteRule { DestinationPrefix = "192.168.10.42/24", RouteMetric = 10 });
-Assert(directRoute.DestinationPrefix == "192.168.10.0/24" && directRoute.NextHop == "0.0.0.0" && !directRoute.IsDefaultRoute, "direct route normalization");
+Assert(directRoute.DestinationPrefix == "192.168.10.0/24" && directRoute.NextHop == "0.0.0.0" && directRoute.AddressFamily == AddressFamily.InterNetwork && !directRoute.IsDefaultRoute, "direct route normalization");
 var gatewayRoute = StaticRouteValidator.Normalize(new StaticRouteRule { DestinationPrefix = "10.20.0.0/16", NextHop = "10.20.0.1", RouteMetric = 20 });
 Assert(gatewayRoute.NextHop == "10.20.0.1" && gatewayRoute.RouteMetric == 20, "gateway route normalization");
-Assert(StaticRouteValidator.Normalize(new StaticRouteRule { DestinationPrefix = "0.0.0.0/0", NextHop = "192.168.100.1", RouteMetric = 5 }).IsDefaultRoute, "default route allowed");
-AssertThrows(() => StaticRouteValidator.Normalize(new StaticRouteRule { DestinationPrefix = "10.0.0.0/8", NextHop = "::1", RouteMetric = 10 }), "ipv6 next hop rejected");
+var ipv6Route = StaticRouteValidator.Normalize(new StaticRouteRule { DestinationPrefix = "2001:db8:10::42/64", NextHop = "2001:db8:10::1", RouteMetric = 10 });
+Assert(ipv6Route.DestinationPrefix == "2001:db8:10::/64" && ipv6Route.NextHop == "2001:db8:10::1" && ipv6Route.AddressFamily == AddressFamily.InterNetworkV6, "IPv6 route normalization");
+AssertThrows(() => StaticRouteValidator.Normalize(new StaticRouteRule { DestinationPrefix = "0.0.0.0/0", NextHop = "192.168.100.1", RouteMetric = 5 }), "IPv4 default route rejected");
+AssertThrows(() => StaticRouteValidator.Normalize(new StaticRouteRule { DestinationPrefix = "::/0", NextHop = "2001:db8::1", RouteMetric = 5 }), "IPv6 default route rejected");
+AssertThrows(() => StaticRouteValidator.Normalize(new StaticRouteRule { DestinationPrefix = "10.0.0.0/8", NextHop = "::1", RouteMetric = 10 }), "IPv6 next hop rejected for IPv4 route");
+AssertThrows(() => StaticRouteValidator.Normalize(new StaticRouteRule { DestinationPrefix = "2001:db8::/32", NextHop = "10.0.0.1", RouteMetric = 10 }), "IPv4 next hop rejected for IPv6 route");
 AssertThrows(() => StaticRouteValidator.Normalize(new StaticRouteRule { DestinationPrefix = "10.0.0.0/8", RouteMetric = 0 }), "invalid metric rejected");
 Assert(NetworkAdapterService.NormalizeMacAddress("02:11:22:33:44:55") == "02-11-22-33-44-55", "MAC normalization");
 var randomMac = NetworkAdapterService.GenerateRandomMacAddress();
@@ -66,6 +82,7 @@ smallPool.Allocate("00-00-00-00-00-02", "two");
 AssertThrowsAny(() => smallPool.Allocate("00-00-00-00-00-03", "three"), "lease pool exhaustion");
 TestVersionUpdates();
 TestFavoriteStorage();
+await TestHttpProbeInputBoundaryAsync();
 var publicPresets = Defaults.DefaultFavorites();
 Assert(publicPresets.Count >= 10 && publicPresets.All(x => x.IsPublicDefault && !string.IsNullOrWhiteSpace(x.Password)), "public BMC presets");
 await TestDhcpServerAsync();
@@ -165,6 +182,12 @@ static void TestFavoriteStorage()
     }
 }
 
+static async Task TestHttpProbeInputBoundaryAsync()
+{
+    var result = await new HttpProbeService().ProbeAsync("127.0.0.1;Get-Process", 50);
+    Assert(!result.http && !result.https, "HTTP probe rejects non-IP input");
+}
+
 static async Task TestDhcpServerAsync()
 {
     var logger = new TestLogger();
@@ -252,22 +275,136 @@ static async Task RunRouteSmokeAsync(string firstIndex, string secondIndex)
     var paths = new AppPaths(AppContext.BaseDirectory);
     var logger = new FileLogger(paths);
     var service = new StaticRouteService(logger);
-    var adapterA = new NetworkAdapterInfo { Id = "route-smoke-a", Name = "Route Smoke A", Description = "Test Ethernet", InterfaceIndex = first.ToString(), Status = "Up", MacAddress = "00-00-00-00-00-A1" };
-    var adapterB = new NetworkAdapterInfo { Id = "route-smoke-b", Name = "Route Smoke B", Description = "Test Ethernet", InterfaceIndex = second.ToString(), Status = "Up", MacAddress = "00-00-00-00-00-B1" };
+    var adapterA = new NetworkAdapterInfo { Id = "route-smoke-a", Name = "Route Smoke A", Description = "Test Ethernet", InterfaceIndex = first.ToString(), Status = "Up" };
+    var adapterB = new NetworkAdapterInfo { Id = "route-smoke-b", Name = "Route Smoke B", Description = "Test Ethernet", InterfaceIndex = second.ToString(), Status = "Up" };
     var ruleA = new StaticRouteRule { Id = "route-smoke-rule-a", DestinationPrefix = "10.250.10.0/24", AdapterId = adapterA.Id, RouteMetric = 10 };
-    var ruleB = new StaticRouteRule { Id = "route-smoke-rule-b", DestinationPrefix = "10.250.20.0/24", AdapterId = adapterB.Id, NextHop = "10.250.2.1", RouteMetric = 20 };
+    var ruleB = new StaticRouteRule { Id = "route-smoke-rule-b", DestinationPrefix = "10.250.20.0/24", AdapterId = adapterB.Id, NextHop = "198.18.251.254", RouteMetric = 20 };
+    var conflictRule = new StaticRouteRule { Id = "route-smoke-rule-conflict", DestinationPrefix = "10.250.30.0/24", AdapterId = adapterA.Id, RouteMetric = 10 };
+    var samePrefixRuleA = new StaticRouteRule { Id = "route-smoke-rule-same-a", DestinationPrefix = "10.250.40.0/24", AdapterId = adapterA.Id };
+    var samePrefixRuleB = new StaticRouteRule { Id = "route-smoke-rule-same-b", DestinationPrefix = "10.250.40.0/24", AdapterId = adapterB.Id };
+    var ipv6Rule = new StaticRouteRule { Id = "route-smoke-rule-ipv6", DestinationPrefix = "fd12:250:252::/64", AdapterId = adapterA.Id, RouteMetric = 10 };
+    const string conflictDestination = "10.250.30.0/24";
+    await RunPowerShellCommandAsync($"New-NetRoute -DestinationPrefix '{conflictDestination}' -InterfaceIndex {second} -AddressFamily IPv4 -NextHop '0.0.0.0' -RouteMetric 200 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null");
     var targets = new List<StaticRouteTarget>
     {
         new(ruleA, adapterA, StaticRouteValidator.Normalize(ruleA)),
-        new(ruleB, adapterB, StaticRouteValidator.Normalize(ruleB))
+        new(ruleB, adapterB, StaticRouteValidator.Normalize(ruleB)),
+        new(conflictRule, adapterA, StaticRouteValidator.Normalize(conflictRule)),
+        new(samePrefixRuleA, adapterA, StaticRouteValidator.Normalize(samePrefixRuleA)),
+        new(samePrefixRuleB, adapterB, StaticRouteValidator.Normalize(samePrefixRuleB)),
+        new(ipv6Rule, adapterA, StaticRouteValidator.Normalize(ipv6Rule))
     };
-    var results = await service.ApplyAsync(targets);
-    var applied = results.Where(x => x.Created && x.Applied != null).Select(x => (x.Applied!, x.Rule.AdapterId == adapterA.Id ? adapterA : adapterB)).ToList();
-    Assert(applied.Count == 2, "route smoke created two routes");
-    foreach (var item in applied) Assert(await service.ExistsAsync(item.Item1, item.Item2), "route smoke route exists");
-    foreach (var item in applied) await service.RemoveAsync(item.Item1, item.Item2);
-    foreach (var item in applied) Assert(!await service.ExistsAsync(item.Item1, item.Item2), "route smoke route removed");
-    Console.WriteLine($"ROUTE_SMOKE_OK interfaces={first},{second}");
+    try
+    {
+        var results = await service.ApplyAsync(targets);
+        var applied = results.Where(x => x.Created && x.Applied != null).Select(x => (x.Applied!, x.Rule.AdapterId == adapterA.Id ? adapterA : adapterB)).ToList();
+        Assert(applied.Count == 6, "route smoke created IPv4, IPv6, and multi-adapter priority routes");
+        var conflictApplied = applied.Single(x => x.Item1.DestinationPrefix == conflictDestination);
+        Assert(conflictApplied.Item1.RouteMetric < 200, "same-prefix route received higher priority");
+        var samePrefixApplied = applied.Where(x => x.Item1.DestinationPrefix == "10.250.40.0/24").ToList();
+        Assert(samePrefixApplied.Count == 2 && samePrefixApplied.Select(x => x.Item1.RouteMetric).Distinct().Count() == 2, "same-prefix routes on different adapters received distinct automatic metrics");
+        Assert(applied.Any(x => x.Item1.AddressFamily == "IPv6"), "IPv6 route created");
+        foreach (var item in applied) Assert(await service.ExistsAsync(item.Item1, item.Item2), "route smoke route exists");
+        foreach (var item in applied) await service.RemoveAsync(item.Item1, item.Item2);
+        foreach (var item in applied) Assert(!await service.ExistsAsync(item.Item1, item.Item2), "route smoke route removed");
+        Console.WriteLine($"ROUTE_SMOKE_OK interfaces={first},{second}");
+    }
+    finally
+    {
+        await RunPowerShellCommandAsync($"Get-NetRoute -InterfaceIndex {second} -AddressFamily IPv4 -DestinationPrefix '{conflictDestination}' -NextHop '0.0.0.0' -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue");
+    }
+}
+
+static async Task RunVirtualRouteSmokeAsync(string interfaceIndexText, string resultPath)
+{
+    const string ipv4Destination = "198.18.240.0/24";
+    const string ipv6Destination = "fd12:250:25::/64";
+    try
+    {
+        if (!int.TryParse(interfaceIndexText, out var interfaceIndex) || interfaceIndex <= 0)
+            throw new ArgumentException("A positive virtual adapter interface index is required");
+
+        var paths = new AppPaths(AppContext.BaseDirectory);
+        var logger = new FileLogger(paths);
+        var service = new StaticRouteService(logger);
+        var adapter = new NetworkAdapterInfo
+        {
+            Id = "route-virtual-smoke",
+            Name = "Route Virtual Smoke",
+            Description = "Virtual adapter route test",
+            InterfaceIndex = interfaceIndex.ToString(),
+            Status = "Up",
+            IsVirtual = true,
+        };
+        var ipv4Rule = new StaticRouteRule { Id = "route-virtual-smoke-v4", DestinationPrefix = ipv4Destination, AdapterId = adapter.Id };
+        var ipv6Rule = new StaticRouteRule { Id = "route-virtual-smoke-v6", DestinationPrefix = ipv6Destination, AdapterId = adapter.Id };
+        var targets = new List<StaticRouteTarget>
+        {
+            new(ipv4Rule, adapter, StaticRouteValidator.Normalize(ipv4Rule)),
+            new(ipv6Rule, adapter, StaticRouteValidator.Normalize(ipv6Rule))
+        };
+
+        var results = await service.ApplyAsync(targets);
+        var applied = results.Where(x => x.Created && x.Applied != null).Select(x => x.Applied!).ToList();
+        Assert(applied.Count == 2, "virtual adapter created IPv4 and IPv6 routes");
+        foreach (var route in applied)
+        {
+            Assert(await service.ExistsAsync(route, adapter), "virtual adapter route exists");
+            await service.RemoveAsync(route, adapter);
+            Assert(!await service.ExistsAsync(route, adapter), "virtual adapter route removed");
+        }
+
+        WriteRouteSmokeResult(resultPath, $"PASS interface={interfaceIndex} routes=IPv4,IPv6");
+        Console.WriteLine($"ROUTE_VIRTUAL_SMOKE_OK interface={interfaceIndex}");
+    }
+    catch (Exception ex)
+    {
+        WriteRouteSmokeResult(resultPath, $"FAIL type={ex.GetType().Name} message={ex.Message} inner={ex.InnerException?.Message}");
+        throw;
+    }
+    finally
+    {
+        try
+        {
+            await RunPowerShellCommandAsync($"Get-NetRoute -InterfaceIndex {interfaceIndexText} -AddressFamily IPv4 -DestinationPrefix '{ipv4Destination}' -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue");
+            await RunPowerShellCommandAsync($"Get-NetRoute -InterfaceIndex {interfaceIndexText} -AddressFamily IPv6 -DestinationPrefix '{ipv6Destination}' -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue");
+        }
+        catch
+        {
+            // The primary failure (for example, a non-elevated test) is already recorded above.
+        }
+    }
+}
+
+static void WriteRouteSmokeResult(string resultPath, string result)
+{
+    Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(resultPath))!);
+    File.WriteAllText(resultPath, result, Encoding.UTF8);
+}
+
+static async Task<string> RunPowerShellCommandAsync(string script)
+{
+    using var process = new Process
+    {
+        StartInfo = new ProcessStartInfo
+        {
+            FileName = Path.Combine(Environment.SystemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe"),
+            Arguments = "-NoProfile -ExecutionPolicy Bypass -EncodedCommand " + Convert.ToBase64String(Encoding.Unicode.GetBytes(script)),
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            StandardOutputEncoding = Encoding.UTF8,
+            StandardErrorEncoding = Encoding.UTF8,
+            CreateNoWindow = true
+        }
+    };
+    process.Start();
+    var outputTask = process.StandardOutput.ReadToEndAsync();
+    var errorTask = process.StandardError.ReadToEndAsync();
+    await Task.WhenAll(outputTask, errorTask);
+    await process.WaitForExitAsync();
+    if (process.ExitCode != 0) throw new InvalidOperationException(errorTask.Result.Trim());
+    return outputTask.Result.Trim();
 }
 
 sealed class TestLogger : ILogger

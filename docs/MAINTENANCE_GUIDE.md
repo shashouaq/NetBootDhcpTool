@@ -7,7 +7,7 @@ This guide is the operating standard for maintaining NetBoot DHCP Tool. Follow i
 - GitHub repository: `https://github.com/shashouaq/NetBootDhcpTool`
 - Default branch: `main`
 - Release tag format: `v<version>`
-- Current application version: `1.0.9`
+- Current application version: `1.0.10`
 - Current release manifest URL:
 
 ```text

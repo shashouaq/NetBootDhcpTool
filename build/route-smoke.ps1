@@ -30,6 +30,8 @@ try {
 
     New-NetIPAddress -InterfaceIndex $nicA.ifIndex -IPAddress "198.18.250.1" -PrefixLength 24 -ErrorAction Stop | Out-Null
     New-NetIPAddress -InterfaceIndex $nicB.ifIndex -IPAddress "198.18.251.1" -PrefixLength 24 -ErrorAction Stop | Out-Null
+    New-NetIPAddress -InterfaceIndex $nicA.ifIndex -IPAddress "fd12:250:250::1" -PrefixLength 64 -AddressFamily IPv6 -ErrorAction Stop | Out-Null
+    New-NetIPAddress -InterfaceIndex $nicB.ifIndex -IPAddress "fd12:250:251::1" -PrefixLength 64 -AddressFamily IPv6 -ErrorAction Stop | Out-Null
 
     Push-Location $root
     try {

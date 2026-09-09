@@ -7,9 +7,9 @@
     <Nullable>enable</Nullable>
     <AssemblyName>NetBootDhcpTool</AssemblyName>
     <RootNamespace>NetBootDhcpTool.App</RootNamespace>
-    <Version>1.0.9</Version>
-    <AssemblyVersion>1.0.9.0</AssemblyVersion>
-    <FileVersion>1.0.9.0</FileVersion>
+    <Version>1.0.10</Version>
+    <AssemblyVersion>1.0.10.0</AssemblyVersion>
+    <FileVersion>1.0.10.0</FileVersion>
     <ApplicationIcon>..\..\assets\app.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>
   </PropertyGroup>

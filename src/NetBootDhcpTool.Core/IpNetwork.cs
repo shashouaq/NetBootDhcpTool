@@ -1,4 +1,5 @@
 using System.Net;
+using System.Net.Sockets;
 
 namespace NetBootDhcpTool.Core;
 
@@ -12,25 +13,74 @@ public static class IpNetwork
         if (string.IsNullOrWhiteSpace(value)) return false;
 
         var parts = value.Trim().Split('/', 2, StringSplitOptions.TrimEntries);
-        if (parts.Length != 2 || !IPAddress.TryParse(parts[0], out var address) || address.GetAddressBytes().Length != 4)
-        {
-            return false;
-        }
-        if (!int.TryParse(parts[1], out prefixLength) || prefixLength is < 0 or > 32)
+        if ((parts.Length != 1 && parts.Length != 2) || !IPAddress.TryParse(parts[0], out var address))
         {
             return false;
         }
 
-        var mask = prefixLength == 0 ? 0u : uint.MaxValue << (32 - prefixLength);
-        network = FromUInt32(ToUInt32(address) & mask);
+        var maxPrefixLength = address.AddressFamily == AddressFamily.InterNetwork ? 32
+            : address.AddressFamily == AddressFamily.InterNetworkV6 ? 128
+            : 0;
+        if (maxPrefixLength == 0) return false;
+        if (parts.Length == 1)
+        {
+            prefixLength = maxPrefixLength;
+        }
+        else if (!int.TryParse(parts[1], out prefixLength) || prefixLength is < 0 || prefixLength > maxPrefixLength)
+        {
+            return false;
+        }
+
+        var bytes = address.GetAddressBytes();
+        var remainingBits = prefixLength;
+        for (var i = 0; i < bytes.Length; i++)
+        {
+            if (remainingBits >= 8)
+            {
+                remainingBits -= 8;
+                continue;
+            }
+
+            if (remainingBits == 0)
+            {
+                bytes[i] = 0;
+            }
+            else
+            {
+                bytes[i] = (byte)(bytes[i] & (byte)(0xFF << (8 - remainingBits)));
+                remainingBits = 0;
+            }
+
+            for (var j = i + 1; j < bytes.Length; j++) bytes[j] = 0;
+            break;
+        }
+
+        network = new IPAddress(bytes);
         canonical = $"{network}/{prefixLength}";
         return true;
     }
 
     public static string ParseCidr(string value)
     {
-        if (!TryParseCidr(value, out _, out _, out var canonical)) throw new FormatException("Invalid IPv4 CIDR / 无效的 IPv4 网段");
+        if (!TryParseCidr(value, out _, out _, out var canonical)) throw new FormatException("Invalid IP network / 无效的 IP 网段");
         return canonical;
+    }
+
+    public static bool Contains(IPAddress network, int prefixLength, IPAddress address)
+    {
+        if (network.AddressFamily != address.AddressFamily) return false;
+        var networkBytes = network.GetAddressBytes();
+        var addressBytes = address.GetAddressBytes();
+        var fullBytes = prefixLength / 8;
+        var remainingBits = prefixLength % 8;
+        for (var i = 0; i < fullBytes; i++)
+        {
+            if (networkBytes[i] != addressBytes[i]) return false;
+        }
+
+        return remainingBits == 0
+            || (networkBytes[fullBytes] & (byte)(0xFF << (8 - remainingBits)))
+                == (addressBytes[fullBytes] & (byte)(0xFF << (8 - remainingBits)));
     }
 
     public static uint ToUInt32(IPAddress address)
