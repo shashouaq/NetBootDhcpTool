@@ -8,6 +8,14 @@
 - Verification: Release build passed with 0 warnings and 0 errors; unit smoke returned `OK`, including the non-IP HTTP probe input-boundary check; `dotnet list package --vulnerable --include-transitive` returned no vulnerable package entries; targeted secret and arbitrary HTTPS-certificate-acceptance scans were clean; bilingual resource keys are synchronized at 164 source keys with zero missing/extra keys in either language; static XAML audit found `44/44` buttons with help keys and 6 runtime help attachments; the elevated local source preview is responsive and its fresh log read 38 IPv4/IPv6 routes with no startup errors. The administrator Hyper-V route smoke was invoked but could not be completed from the current non-elevated automation terminal; no physical adapter, test switch, route, or external network was left modified.
 - User impact: A Wi-Fi default route can remain unchanged while a more-specific internal IPv4/IPv6 range is temporarily directed through the selected wired or other adapter; existing routes remain untouched.
 
+## 2026-09-09
+
+- Type: Release verification
+- Affected files/modules: `src/NetBootDhcpTool.App/NetBootDhcpTool.App.csproj`, `docs/FEATURE_CHANGELOG.md`, `docs/RELEASE_NOTES.md`, `release/NetBootDhcpTool-v1.0.10.7z`, `release/NetBootDhcpTool-v1.0.10.7z.sha256`, `release/latest.json`
+- Concrete change: Published v1.0.10 from commit `98002ac1e93ef03be2aec541efc1deddc299d7db` with the `v1.0.10` tag and GitHub Release assets.
+- Verification: The self-contained archive is `63,497,821` bytes and passed 7-Zip testing. File version is `1.0.10.0`. SHA256 `d84b55b9f3cc44f9f4b55c2644514a89bc93fdfa13d44fc26f4b60378e4a1798` matches the local archive, sidecar, local manifest, remote `latest.json`, and a freshly downloaded remote archive. `git ls-remote` confirms `main` and `v1.0.10` are published; GitHub Release verification confirms the archive, checksum, and `latest.json` assets exist.
+- User impact: v1.0.10 is available from [GitHub Release v1.0.10](https://github.com/shashouaq/NetBootDhcpTool/releases/tag/v1.0.10); the updater can consume the verified remote manifest and download the archive without auto-installing it.
+
 ## v1.0.9 / 2026-08-28
 
 - Type: UI / Help UX Refinement

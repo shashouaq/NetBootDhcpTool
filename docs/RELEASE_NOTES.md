@@ -12,7 +12,7 @@ NetBoot DHCP Tool v1.0.10 adds temporary multi-adapter IPv4/IPv6 static routes w
 
 ### Validation
 
-- Release build, unit smoke, dependency vulnerability audit, secret-pattern audit, route safety audit, and packaged archive verification are recorded in `docs/FEATURE_CHANGELOG.md`.
+- Release build, unit smoke, dependency vulnerability audit, secret-pattern audit, route safety audit, and packaged archive verification are recorded in `docs/FEATURE_CHANGELOG.md`. The self-contained archive is `63,497,821` bytes, passed 7-Zip testing, has file version `1.0.10.0`, and uses SHA256 `d84b55b9f3cc44f9f4b55c2644514a89bc93fdfa13d44fc26f4b60378e4a1798`; the local package matches the remote manifest and a freshly downloaded remote archive.
 
 ## v1.0.9
 
