@@ -12,6 +12,7 @@ public sealed class NetworkAdapterInfo
     public string Gateway { get; set; } = "";
     public string Dns { get; set; } = "";
     public string Status { get; set; } = "";
+    public long LinkSpeedMbps { get; set; }
     public bool IsWifi { get; set; }
     public bool IsVirtual { get; set; }
     public bool HasGateway => !string.IsNullOrWhiteSpace(Gateway) && !Gateway.Equals("0.0.0.0", StringComparison.OrdinalIgnoreCase);
@@ -28,5 +29,8 @@ public sealed class NetworkAdapterInfo
             return $"{Name} - {Description} - {ip}{suffix}";
         }
     }
+    public string LinkSpeedDisplay => LinkSpeedMbps > 0 ? $"{LinkSpeedMbps} Mbps" : "Unknown / 未知速率";
+    public string KindDisplay => IsWifi ? "Wi-Fi / 无线" : IsVirtual ? "Virtual / 虚拟" : "Wired / 有线";
+    public string ConnectionDisplay => Status.Equals("Up", StringComparison.OrdinalIgnoreCase) ? "Connected / 已连接" : $"{Status} / 未连接";
     public override string ToString() => DisplayName;
 }

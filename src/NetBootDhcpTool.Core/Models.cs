@@ -14,6 +14,17 @@ public sealed class AppSettings
     public bool AllowMacChangeOnAnyAdapter { get; set; } = true;
     public bool RestoreIpOnDhcpStop { get; set; } = true;
     public bool DetectExistingDhcpBeforeStart { get; set; } = true;
+    public bool DarkTheme { get; set; }
+    public bool SafetyOnboardingCompleted { get; set; }
+    public bool RedactSupportPackage { get; set; } = true;
+    public double WindowWidth { get; set; } = 1240;
+    public double WindowHeight { get; set; } = 800;
+    public double? WindowLeft { get; set; }
+    public double? WindowTop { get; set; }
+    public string WindowState { get; set; } = "Normal";
+    public string LastTab { get; set; } = "TabDhcp";
+    public bool LogPanelExpanded { get; set; }
+    public bool LogAutoScroll { get; set; } = true;
     public DefaultDhcpSettings DefaultDhcp { get; set; } = new();
 }
 
@@ -65,7 +76,7 @@ public sealed class FavoriteConfig
     [JsonIgnore]
     public bool HasUsablePassword => !PasswordUnavailable && !string.IsNullOrWhiteSpace(Password);
     [JsonIgnore]
-    public string PasswordDisplay => PasswordUnavailable ? "Unavailable / 需重新输入" : HasUsablePassword ? Password : "";
+    public string PasswordDisplay => PasswordUnavailable ? "Unavailable / 需重新输入" : HasUsablePassword ? "••••••" : "";
     public DateTime CreatedAt { get; set; } = DateTime.Now;
     public DateTime UpdatedAt { get; set; } = DateTime.Now;
     public DateTime? LastUsedAt { get; set; }
@@ -152,12 +163,42 @@ public sealed class AppliedStaticRoute
 
 public sealed class OperationHistoryItem
 {
+    public string Id { get; set; } = Guid.NewGuid().ToString("N");
     public DateTime Time { get; set; } = DateTime.Now;
     public string Type { get; set; } = "";
+    public string Scope { get; set; } = "";
     public string IpAddress { get; set; } = "";
     public string MacAddress { get; set; } = "";
     public string Status { get; set; } = "";
     public string Detail { get; set; } = "";
+    public long DurationMs { get; set; }
+    public bool RollbackAvailable { get; set; }
+
+    [JsonIgnore]
+    public string DurationDisplay => DurationMs <= 0 ? "-" : $"{DurationMs} ms";
+
+    [JsonIgnore]
+    public string RollbackDisplay => RollbackAvailable ? "Available / 可回滚" : "-";
+}
+
+public sealed class NetworkProfile
+{
+    public string Id { get; set; } = Guid.NewGuid().ToString("N");
+    public string Name { get; set; } = "";
+    public string Description { get; set; } = "";
+    public DefaultDhcpSettings Dhcp { get; set; } = new();
+    public string ManualIp { get; set; } = "";
+    public string ManualMask { get; set; } = "";
+    public string ManualTargetIp { get; set; } = "";
+    public List<StaticRouteRule> Routes { get; set; } = [];
+    public DateTime CreatedAt { get; set; } = DateTime.Now;
+    public DateTime UpdatedAt { get; set; } = DateTime.Now;
+
+    [JsonIgnore]
+    public string RouteSummary => Routes.Count == 0 ? "No routes / 无路由" : $"{Routes.Count} route(s) / {Routes.Count} 条路由";
+
+    [JsonIgnore]
+    public string UpdatedDisplay => UpdatedAt.ToString("yyyy-MM-dd HH:mm");
 }
 
 public sealed class AdapterMacBackup
@@ -193,5 +234,8 @@ public sealed class ScanResult
 [JsonSerializable(typeof(List<FavoriteConfig>))]
 [JsonSerializable(typeof(List<FavoriteField>))]
 [JsonSerializable(typeof(List<AppliedStaticRoute>))]
+[JsonSerializable(typeof(List<OperationHistoryItem>))]
+[JsonSerializable(typeof(List<NetworkProfile>))]
+[JsonSerializable(typeof(List<AdapterMacBackup>))]
 [JsonSerializable(typeof(Dictionary<string, string>))]
 public partial class NetBootJsonContext : JsonSerializerContext;

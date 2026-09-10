@@ -54,6 +54,7 @@ public sealed class NetworkAdapterService
                     Gateway = gateway,
                     Dns = dns,
                     Status = ni.OperationalStatus.ToString(),
+                    LinkSpeedMbps = ni.Speed > 0 ? (long)Math.Round(ni.Speed / 1_000_000d) : 0,
                     IsWifi = IsWifiLike(ni.Name, ni.Description, ni.NetworkInterfaceType),
                     IsVirtual = IsVirtual(ni.Name, ni.Description)
                 };

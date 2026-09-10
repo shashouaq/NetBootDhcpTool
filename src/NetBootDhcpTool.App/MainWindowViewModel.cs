@@ -18,4 +18,6 @@ public sealed class MainWindowViewModel
     public ObservableCollection<AdapterIpHistoryItem> AdapterIpHistory { get; } = [];
     public ObservableCollection<StaticRouteRule> StaticRoutes { get; } = [];
     public ObservableCollection<StaticRouteRule> CurrentStaticRoutes { get; } = [];
+    public ObservableCollection<OperationHistoryItem> OperationHistory { get; } = [];
+    public ObservableCollection<NetworkProfile> Profiles { get; } = [];
 }

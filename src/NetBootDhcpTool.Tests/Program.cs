@@ -81,16 +81,39 @@ smallPool.Allocate("00-00-00-00-00-01", "one");
 smallPool.Allocate("00-00-00-00-00-02", "two");
 AssertThrowsAny(() => smallPool.Allocate("00-00-00-00-00-03", "three"), "lease pool exhaustion");
 TestVersionUpdates();
+TestSupportDataRedaction();
 TestFavoriteStorage();
+TestProfileStorage();
 await TestHttpProbeInputBoundaryAsync();
 var publicPresets = Defaults.DefaultFavorites();
 Assert(publicPresets.Count >= 10 && publicPresets.All(x => x.IsPublicDefault && !string.IsNullOrWhiteSpace(x.Password)), "public BMC presets");
 await TestDhcpServerAsync();
 TestDhcpServerStartFailureRecovery();
 var tmp = Path.Combine(Path.GetTempPath(), "netboot-test-" + Guid.NewGuid().ToString("N") + ".json");
+var settingsPath = tmp + ".settings";
 JsonStore.Save(tmp, new AppSettings());
 Assert(File.Exists(tmp), "json save");
-File.Delete(tmp);
+var expectedSettings = new AppSettings
+{
+    WindowWidth = 1400,
+    WindowHeight = 900,
+    WindowLeft = 12,
+    WindowTop = 34,
+    WindowState = "Maximized",
+    LastTab = "TabHistory",
+    LogPanelExpanded = true,
+    LogAutoScroll = false
+};
+JsonStore.Save(settingsPath, expectedSettings);
+var loadedSettings = JsonStore.LoadOrDefault(settingsPath, new AppSettings());
+Assert(loadedSettings.WindowWidth == 1400 && loadedSettings.WindowHeight == 900
+    && loadedSettings.WindowLeft == 12 && loadedSettings.WindowTop == 34
+    && loadedSettings.WindowState == "Maximized" && loadedSettings.LastTab == "TabHistory"
+    && loadedSettings.LogPanelExpanded && !loadedSettings.LogAutoScroll, "app settings layout roundtrip");
+foreach (var file in new[] { tmp, settingsPath })
+{
+    if (File.Exists(file)) File.Delete(file);
+}
 Console.WriteLine("OK");
 
 static void Assert(bool value, string name)
@@ -122,6 +145,18 @@ static void AssertThrowsAny(Action action, string name)
         return;
     }
     throw new Exception("Failed: " + name);
+}
+
+static void TestSupportDataRedaction()
+{
+    var source = "IP=192.168.10.25 MAC=02-11-22-33-44-55 IPv6=2001:db8:10::42";
+    var redacted = SupportDataRedactor.RedactNetworkValues(source);
+    Assert(!redacted.Contains("192.168.10.25", StringComparison.Ordinal)
+        && !redacted.Contains("02-11-22-33-44-55", StringComparison.Ordinal)
+        && !redacted.Contains("2001:db8:10::42", StringComparison.Ordinal), "support network redaction");
+    Assert(redacted.Contains("x.x.x.x", StringComparison.Ordinal)
+        && redacted.Contains("XX-XX-XX-XX-XX-XX", StringComparison.Ordinal)
+        && redacted.Contains("xxxx:xxxx::xxxx", StringComparison.Ordinal), "support redaction placeholders");
 }
 
 static void TestVersionUpdates()
@@ -158,6 +193,7 @@ static void TestFavoriteStorage()
         File.WriteAllText(path, "[{\"Name\":\"Legacy\",\"LocalIp\":\"192.168.10.2\",\"SubnetMask\":\"255.255.255.0\",\"Password\":\"dpapi-test-value\"}]");
         var loaded = FavoriteStore.Load(path, migrateLegacy: true);
         Assert(loaded.Count == 1 && loaded[0].Password == "dpapi-test-value", "legacy favorite load");
+        Assert(loaded[0].PasswordDisplay == "••••••", "favorite password masked by default");
         var persisted = File.ReadAllText(path);
         Assert(!persisted.Contains("\"Password\":", StringComparison.Ordinal) && persisted.Contains("\"ProtectedPassword\":", StringComparison.Ordinal), "favorite password migration");
         Assert(!File.Exists(path + ".bak"), "legacy favorite backup removed");
@@ -171,11 +207,40 @@ static void TestFavoriteStorage()
         var publicJson = File.ReadAllText(publicPath);
         Assert(publicJson.Contains("PUBLIC_DEFAULT", StringComparison.Ordinal) && publicJson.Contains("\"PublicPassword\"", StringComparison.Ordinal), "public favorite plaintext credential");
         var publicLoaded = FavoriteStore.Load(publicPath);
-        Assert(publicLoaded.Count == 1 && publicLoaded[0].Password == "PUBLIC_DEFAULT", "public favorite load");
+        Assert(publicLoaded.Count == 1 && publicLoaded[0].Password == "PUBLIC_DEFAULT" && publicLoaded[0].PasswordDisplay == "••••••", "public favorite load and mask");
     }
     finally
     {
         foreach (var file in new[] { path, path + ".bak", path + ".tmp", exportPath, exportPath + ".bak", exportPath + ".tmp", path + ".public.json", path + ".public.json.bak", path + ".public.json.tmp" })
+        {
+            if (File.Exists(file)) File.Delete(file);
+        }
+    }
+}
+
+static void TestProfileStorage()
+{
+    var path = Path.Combine(Path.GetTempPath(), "netboot-profile-" + Guid.NewGuid().ToString("N") + ".json");
+    try
+    {
+        var profile = new NetworkProfile
+        {
+            Name = "isolated-lab",
+            Description = "credential-free test profile",
+            ManualIp = "192.168.77.2",
+            ManualMask = "255.255.255.0",
+            ManualTargetIp = "192.168.77.3",
+            Routes = [new StaticRouteRule { DestinationPrefix = "192.168.88.0/24", AdapterId = "adapter-a", NextHop = "0.0.0.0" }]
+        };
+        ProfileStore.Save(path, [profile]);
+        var loaded = ProfileStore.Load(path);
+        Assert(loaded.Count == 1 && loaded[0].Name == profile.Name && loaded[0].Routes.Count == 1, "network profile storage");
+        var json = File.ReadAllText(path);
+        Assert(!json.Contains("Password", StringComparison.OrdinalIgnoreCase), "network profile has no credentials");
+    }
+    finally
+    {
+        foreach (var file in new[] { path, path + ".bak", path + ".tmp" })
         {
             if (File.Exists(file)) File.Delete(file);
         }

@@ -5,7 +5,10 @@ public sealed class AppPaths
     public AppPaths(string baseDirectory)
     {
         BaseDirectory = baseDirectory;
-        DataDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "NetBootDhcpTool");
+        var testDataDirectory = Environment.GetEnvironmentVariable("NETBOOT_DATA_DIRECTORY");
+        DataDirectory = string.IsNullOrWhiteSpace(testDataDirectory)
+            ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "NetBootDhcpTool")
+            : Path.GetFullPath(testDataDirectory);
         ConfigDirectory = Path.Combine(DataDirectory, "config");
         I18nDirectory = Path.Combine(baseDirectory, "i18n");
         LogsDirectory = Path.Combine(DataDirectory, "logs");
@@ -14,9 +17,11 @@ public sealed class AppPaths
         SettingsFile = Path.Combine(ConfigDirectory, "appsettings.json");
         FavoritesFile = Path.Combine(ConfigDirectory, "favorites.json");
         AdapterBackupsFile = Path.Combine(ConfigDirectory, "adapter-backups.json");
+        MacBackupsFile = Path.Combine(ConfigDirectory, "mac-backups.json");
         StaticRouteSessionFile = Path.Combine(ConfigDirectory, "static-route-session.json");
         NetworkHistoryFile = Path.Combine(DataDirectory, "network-history.json");
         OperationHistoryFile = Path.Combine(DataDirectory, "operation-history.json");
+        ProfilesFile = Path.Combine(ConfigDirectory, "network-profiles.json");
         MigrateLegacyData();
     }
 
@@ -30,9 +35,11 @@ public sealed class AppPaths
     public string SettingsFile { get; }
     public string FavoritesFile { get; }
     public string AdapterBackupsFile { get; }
+    public string MacBackupsFile { get; }
     public string StaticRouteSessionFile { get; }
     public string NetworkHistoryFile { get; }
     public string OperationHistoryFile { get; }
+    public string ProfilesFile { get; }
 
     public void Ensure()
     {

@@ -1,6 +1,7 @@
 using System.Collections.ObjectModel;
 using System.Net;
 using System.Windows;
+using System.Windows.Media;
 using NetBootDhcpTool.Core;
 
 namespace NetBootDhcpTool.App;
@@ -28,6 +29,19 @@ public partial class FavoriteWindow : Window
         MaskBox.Text = favorite.SubnetMask;
         TargetIpBox.Text = favorite.TargetIp;
         MemoryBox.Text = string.IsNullOrWhiteSpace(favorite.MemoryText) ? favorite.Description : favorite.MemoryText;
+    }
+
+    public void ApplyOwnerTheme(Window owner)
+    {
+        foreach (var key in new[]
+        {
+            "WindowBackgroundBrush", "PanelBackgroundBrush", "InputBackgroundBrush", "TextBrush",
+            "MutedTextBrush", "BorderBrush", "AccentBrush", "DangerBrush", "WarningBrush",
+            "PositiveActionBrush"
+        })
+        {
+            if (owner.Resources[key] is Brush brush) Resources[key] = brush;
+        }
     }
 
     private void AddField_Click(object sender, RoutedEventArgs e)

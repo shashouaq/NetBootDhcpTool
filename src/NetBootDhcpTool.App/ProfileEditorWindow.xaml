@@ -1,0 +1,18 @@
+<Window x:Class="NetBootDhcpTool.App.ProfileEditorWindow" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" xmlns:help="clr-namespace:NetBootDhcpTool.App" Width="520" Height="300" MinWidth="460" WindowStartupLocation="CenterOwner" ResizeMode="NoResize" Background="#F7FAFD" FontFamily="Microsoft YaHei UI, Segoe UI">
+  <Border x:Name="EditorRoot" Padding="20" BorderBrush="#D0D7DE" BorderThickness="1" CornerRadius="14" Background="#F7FAFD">
+    <Grid>
+      <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+      <TextBlock x:Name="TitleText" FontSize="19" FontWeight="SemiBold" Margin="0,0,0,16"/>
+      <TextBlock x:Name="NameLabel" Grid.Row="1" Margin="0,0,0,5"/>
+      <TextBox x:Name="NameBox" Grid.Row="2" Height="32" VerticalAlignment="Top" Margin="0,0,0,10"/>
+      <StackPanel Grid.Row="3">
+        <TextBlock x:Name="DescriptionLabel" Margin="0,0,0,5"/>
+        <TextBox x:Name="DescriptionBox" Height="54" AcceptsReturn="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"/>
+        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,16,0,0">
+          <Button x:Name="CancelButton" help:HelpButtonService.HelpKey="help.profile.cancel" MinWidth="92" Margin="4" Click="CancelButton_Click"/>
+          <Button x:Name="SaveButton" help:HelpButtonService.HelpKey="help.profile.save" MinWidth="92" Margin="4" FontWeight="SemiBold" Background="#1769AA" Foreground="White" Click="SaveButton_Click"/>
+        </StackPanel>
+      </StackPanel>
+    </Grid>
+  </Border>
+</Window>

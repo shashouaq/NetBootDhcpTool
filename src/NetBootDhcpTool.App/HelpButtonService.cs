@@ -1,4 +1,5 @@
 using System.Windows;
+using System.Windows.Automation;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
 using System.Windows.Data;
@@ -139,10 +140,13 @@ public static class HelpButtonService
             Background = new SolidColorBrush(Color.FromRgb(238, 246, 255)),
             BorderBrush = new SolidColorBrush(Color.FromRgb(159, 186, 214)),
             BorderThickness = new Thickness(1),
-            Focusable = false,
+            Focusable = true,
             Visibility = actionButton.Visibility == Visibility.Visible ? Visibility.Visible : Visibility.Collapsed,
             Template = CreateHelpTemplate()
         };
+        AutomationProperties.SetName(helpButton, "Help / 帮助");
+        AutomationProperties.SetHelpText(helpButton, helpKey);
+        AutomationProperties.SetHelpText(actionButton, helpKey);
         var helpTip = new ToolTip { MaxWidth = 460, Content = "Hover for help / 悬浮查看帮助" };
         helpButton.ToolTip = helpTip;
         helpButton.Click += HelpButton_Click;

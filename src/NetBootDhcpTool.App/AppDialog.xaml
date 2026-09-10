@@ -20,7 +20,7 @@
       </Setter>
     </Style>
   </Window.Resources>
-  <Border Padding="22" BorderBrush="#D0D7DE" BorderThickness="1" CornerRadius="14" Background="#F7FAFD" xmlns:help="clr-namespace:NetBootDhcpTool.App">
+  <Border x:Name="DialogRoot" Padding="22" BorderBrush="#D0D7DE" BorderThickness="1" CornerRadius="14" Background="#F7FAFD" xmlns:help="clr-namespace:NetBootDhcpTool.App">
     <Grid>
       <Grid.RowDefinitions>
         <RowDefinition Height="Auto"/>
@@ -33,7 +33,7 @@
         </Border>
         <TextBlock x:Name="TitleText" FontSize="18" FontWeight="SemiBold" Foreground="#162033" TextWrapping="Wrap"/>
       </DockPanel>
-      <TextBlock x:Name="MessageText" Grid.Row="1" Margin="50,12,0,18" FontSize="14" LineHeight="22" Foreground="#2F3B4C" TextWrapping="Wrap"/>
+      <TextBox x:Name="MessageText" Grid.Row="1" Margin="50,12,0,18" FontSize="14" Foreground="#2F3B4C" TextWrapping="Wrap" AcceptsReturn="True" IsReadOnly="True" BorderThickness="0" Background="Transparent" Padding="0" MaxHeight="520" VerticalScrollBarVisibility="Auto"/>
       <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right">
         <Button x:Name="CancelButton" help:HelpButtonService.HelpKey="help.dialog.cancel" Content="取消 / Cancel" MinWidth="108" Margin="6,0,0,0" Padding="12,6" Click="CancelButton_Click"/>
         <Button x:Name="OkButton" help:HelpButtonService.HelpKey="help.dialog.ok" Content="确定 / OK" MinWidth="108" Margin="6,0,0,0" Padding="12,6" FontWeight="SemiBold" Background="#1769AA" Foreground="White" Click="OkButton_Click"/>
