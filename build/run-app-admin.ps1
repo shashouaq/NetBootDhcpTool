@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
-$sourceExe = Join-Path $root "src\NetBootDhcpTool.App\bin\Release\net8.0-windows\NetBootDhcpTool.exe"
+$sourceExe = Join-Path $root "src\NetBootDhcpTool.App\bin\Release\net10.0-windows\NetBootDhcpTool.exe"
 $releaseExe = Join-Path $root "release\NetBootDhcpTool\NetBootDhcpTool.exe"
 if (Test-Path $sourceExe) {
     $exe = $sourceExe

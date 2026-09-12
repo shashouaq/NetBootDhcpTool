@@ -1,0 +1,40 @@
+name: Windows CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.401
+      - name: Restore
+        run: dotnet restore .\NetBootDhcpTool.sln
+      - name: Verify release and localization consistency
+        shell: pwsh
+        run: .\build\verify-maintenance.ps1
+      - name: Build
+        run: dotnet build .\NetBootDhcpTool.sln -c Release --no-restore
+      - name: Run unit tests
+        run: dotnet test .\src\NetBootDhcpTool.UnitTests\NetBootDhcpTool.UnitTests.csproj -c Release --no-build --minimum-expected-tests 1
+      - name: Run network and persistence smoke tests
+        run: dotnet run --project .\src\NetBootDhcpTool.Tests\NetBootDhcpTool.Tests.csproj -c Release --no-build
+      - name: Run non-admin WPF UI smoke when available
+        shell: pwsh
+        run: |
+          $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+          $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+          if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+            Write-Host 'UI smoke skipped because this runner is elevated; run it on a standard-user Windows session.'
+            exit 0
+          }
+          .\build\ui-automation-smoke.ps1

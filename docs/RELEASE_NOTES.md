@@ -1,5 +1,22 @@
 # Release Notes
 
+## v1.0.12
+
+NetBoot DHCP Tool v1.0.12 moves the project to .NET 10, adds repeatable Windows CI and focused regression tests, and makes recovery safer to inspect and apply item by item.
+
+### Changes
+
+- Migrated all projects to .NET 10 and pinned the SDK and Microsoft Testing Platform runner used by local and CI tests.
+- Added unit coverage for CIDR and route validation, DHCP lease behavior, JSON backups, legacy-data migration failures, and adapter identity matching; added a Windows build/test workflow and maintenance consistency gate.
+- Split Recovery Center into its own UI and `MainWindow` partial. Each adapter snapshot, pending MAC restore, and session route is listed independently with adapter identity, capture time, confirmation, and operation history; restore checks the resulting state.
+- Made legacy configuration/log migration report individual copy failures, continue with later files, and retain the original data.
+- Reduced the main-window minimum to 900x560 DIP and enabled layout rounding for compact/high-DPI screens.
+- Tightened release cleanup so it does not stop machine-wide PktMon capture or filters and refuses to package while the application is open.
+
+### Validation
+
+- .NET 10.0.401 Release solution build passed with 0 warnings and 0 errors; all 17 MSTest tests passed; the existing protocol/persistence smoke returned `OK`; non-admin WPF UI automation passed at compact bounds. Maintenance checks reported 265 synchronized localization keys and 60/60 static buttons with help keys; the dependency audit found no vulnerable packages. The approximately 56.7 MB self-contained archive passed 7-Zip testing; its SHA-256 sidecar and manifest match, and its file version is `1.0.12.0`. The administrator-only Hyper-V route smoke was not run because this terminal is not elevated.
+
 ## v1.0.10
 
 NetBoot DHCP Tool v1.0.10 adds temporary multi-adapter IPv4/IPv6 static routes with automatic route metrics and safer route cleanup, while hardening HTTPS reachability probes to use normal certificate validation.

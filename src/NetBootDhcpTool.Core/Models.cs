@@ -99,7 +99,9 @@ public sealed class AdapterIpHistoryItem
 public sealed class AdapterConfigBackup
 {
     public string InterfaceIndex { get; set; } = "";
+    public string AdapterId { get; set; } = "";
     public string AdapterName { get; set; } = "";
+    public string AdapterMac { get; set; } = "";
     public DateTime CapturedAt { get; set; } = DateTime.Now;
     public bool DhcpEnabled { get; set; }
     public string IpAddress { get; set; } = "";

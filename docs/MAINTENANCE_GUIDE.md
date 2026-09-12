@@ -7,7 +7,7 @@ This guide is the operating standard for maintaining NetBoot DHCP Tool. Follow i
 - GitHub repository: `https://github.com/shashouaq/NetBootDhcpTool`
 - Default branch: `main`
 - Release tag format: `v<version>`
-- Current application version: `1.0.10`
+- Current application version: `1.0.12`
 - Current release manifest URL:
 
 ```text
@@ -24,7 +24,7 @@ https://github.com/shashouaq/NetBootDhcpTool/releases/latest/download/latest.jso
 - Run relevant validation when feasible.
 - For documentation-only changes, run lightweight checks instead of a full build unless the docs affect packaging or release behavior.
 - Unless the user explicitly says to publish/release, finish every completed change by building and opening the local program for preview; do not push or publish externally.
-- Before opening the preview, always check whether `NetBootDhcpTool` is already running. If it is running, close and restart it from the current source `Release` output; if it is not running, start it from the current source `Release` output. `build\\run-app-admin.ps1` prefers `src\\NetBootDhcpTool.App\\bin\\Release\\net8.0-windows` and falls back to the packaged `release\\NetBootDhcpTool` output only when the source build is absent.
+- Before opening the preview, always check whether `NetBootDhcpTool` is already running. If it is running, close and restart it from the current source `Release` output; if it is not running, start it from the current source `Release` output. `build\\run-app-admin.ps1` prefers `src\\NetBootDhcpTool.App\\bin\\Release\\net10.0-windows` and falls back to the packaged `release\\NetBootDhcpTool` output only when the source build is absent.
 - Only when the user explicitly says to publish/release may source, packages, tags, or GitHub Releases be pushed. After publishing, verify the remote commit/release/assets and report the exact GitHub URL or commit; never claim publication from a local command alone.
 - Every version upgrade must update local release artifacts and GitHub Release assets.
 - Every application run must create a new UTF-8 session log whose filename contains the start timestamp; user actions and slow-operation start/completion, elapsed time, and errors must be traceable in that run's log.
@@ -60,7 +60,9 @@ git pull --ff-only
 ```powershell
 $dotnet = .\build\resolve-dotnet.ps1
 & $dotnet build .\NetBootDhcpTool.sln -c Release --no-restore
+& $dotnet test .\src\NetBootDhcpTool.UnitTests\NetBootDhcpTool.UnitTests.csproj -c Release --no-build --minimum-expected-tests 1
 & $dotnet run --project .\src\NetBootDhcpTool.Tests\NetBootDhcpTool.Tests.csproj -c Release
+& .\build\verify-maintenance.ps1
 ```
 
 For documentation-only changes, at minimum run:
@@ -98,6 +100,7 @@ rg -n "<old-version>|v<old-version>" .
 ```powershell
 $dotnet = .\build\resolve-dotnet.ps1
 & $dotnet build .\NetBootDhcpTool.sln -c Release --no-restore
+& $dotnet test .\src\NetBootDhcpTool.UnitTests\NetBootDhcpTool.UnitTests.csproj -c Release --no-build --minimum-expected-tests 1
 & $dotnet run --project .\src\NetBootDhcpTool.Tests\NetBootDhcpTool.Tests.csproj -c Release
 ```
 

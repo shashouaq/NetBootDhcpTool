@@ -1,4 +1,4 @@
-﻿using System.Collections.ObjectModel;
+using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.IO;
 using System.Net;
@@ -109,6 +109,7 @@ public partial class MainWindow : Window
         _paths = new AppPaths(AppContext.BaseDirectory);
         Defaults.EnsureFiles(_paths);
         _logger = (Application.Current as App)?.Logger ?? new FileLogger(_paths);
+        foreach (var warning in _paths.MigrationWarnings) _logger.Warn($"Legacy data migration warning: {warning}");
         _logger.LineWritten += line => Dispatcher.BeginInvoke(() =>
         {
             AppendLogLine(line);
@@ -160,6 +161,10 @@ public partial class MainWindow : Window
         {
             SetBusy(false);
             if (!_safetyOnboardingCompleted) ShowSafetyGuide(firstRun: true);
+            if (_paths.MigrationWarnings.Count > 0)
+            {
+                AppDialog.Show(this, Ui("migration.warning.title"), Ui("migration.warning.body", string.Join(Environment.NewLine, _paths.MigrationWarnings)), danger: true);
+            }
             _ = InitializeNetworkStateAsync();
             _ = CheckForUpdatesAsync();
         }, DispatcherPriority.ApplicationIdle);
@@ -714,121 +719,6 @@ public partial class MainWindow : Window
         AdapterSummaryGrid.ColumnDefinitions[8].Width = new GridLength(compact ? 120 : 145);
         TxtAdapterDetails.TextWrapping = compact ? TextWrapping.Wrap : TextWrapping.NoWrap;
         _logger.Info($"Responsive layout changed: compact={compact} width={ActualWidth:0}");
-    }
-
-    private void OpenRecovery_Click(object sender, RoutedEventArgs e)
-    {
-        var window = new Window
-        {
-            Owner = this,
-            Title = Ui("recovery.title"),
-            Width = 620,
-            Height = 420,
-            MinWidth = 520,
-            MinHeight = 340,
-            WindowStartupLocation = WindowStartupLocation.CenterOwner,
-            Background = Resources["WindowBackgroundBrush"] as Brush
-        };
-        var root = new DockPanel { Margin = new Thickness(16) };
-        var buttons = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right };
-        var close = new Button { Content = Ui("recovery.close"), MinWidth = 90 };
-        var restoreMac = new Button { Content = Ui("recovery.restore.mac"), MinWidth = 150, IsEnabled = _originalAdapterMacs.Values.Any(x => x.RestoreOnExit) };
-        var restoreAdapter = new Button { Content = Ui("recovery.restore.adapter"), MinWidth = 150, IsEnabled = SelectedAdapter != null && _adapterBackups.Any(x => x.InterfaceIndex == SelectedAdapter.InterfaceIndex) };
-        var restoreRoutes = new Button { Content = Ui("recovery.restore.routes"), MinWidth = 140, IsEnabled = _appliedStaticRoutes.Count > 0 };
-        HelpButtonService.Attach(restoreRoutes, "help.recovery.center");
-        HelpButtonService.Attach(restoreAdapter, "help.recovery.center");
-        HelpButtonService.Attach(restoreMac, "help.recovery.center");
-        HelpButtonService.Attach(close, "help.dialog.cancel");
-        buttons.Children.Add(restoreRoutes);
-        buttons.Children.Add(restoreAdapter);
-        buttons.Children.Add(restoreMac);
-        buttons.Children.Add(close);
-        DockPanel.SetDock(buttons, Dock.Bottom);
-        root.Children.Add(buttons);
-
-        var content = new StackPanel { Margin = new Thickness(0, 0, 0, 12) };
-        content.Children.Add(new TextBlock { Text = Ui("recovery.summary"), TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 16) });
-        content.Children.Add(new TextBlock { Text = Ui("recovery.routes", _appliedStaticRoutes.Count), Margin = new Thickness(0, 4, 0, 4) });
-        content.Children.Add(new TextBlock { Text = Ui("recovery.adapter", _adapterBackups.Count), Margin = new Thickness(0, 4, 0, 4) });
-        content.Children.Add(new TextBlock { Text = Ui("recovery.mac", _originalAdapterMacs.Values.Count(x => x.RestoreOnExit)), Margin = new Thickness(0, 4, 0, 4) });
-        var selected = SelectedAdapter;
-        content.Children.Add(new TextBlock
-        {
-            Text = selected == null ? Ui("recovery.no.adapter") : (IsChineseUi() ? $"当前选中网卡：{selected.Name}" : $"Selected adapter: {selected.Name}"),
-            Foreground = Resources["MutedTextBrush"] as Brush,
-            TextWrapping = TextWrapping.Wrap,
-            Margin = new Thickness(0, 16, 0, 0)
-        });
-        root.Children.Add(content);
-        window.Content = root;
-        close.Click += (_, _) => window.Close();
-        restoreRoutes.Click += async (_, _) =>
-        {
-            if (!AppDialog.Show(this, Ui("recovery.restore.routes"), IsChineseUi() ? "将删除本次运行创建的静态路由。确认继续？" : "Static routes created in this run will be removed. Continue?", confirm: true, danger: true)) return;
-            window.Close();
-            try
-            {
-                SetBusy(true, IsChineseUi() ? "正在清理恢复中心路由..." : "Clearing Recovery Center routes...");
-                if (!await ClearAppliedRoutesAsync(OperationToken)) AppDialog.Show(this, Ui("recovery.title"), IsChineseUi() ? "部分路由未能清理，请查看日志。" : "Some routes could not be cleared; see the log.", danger: true);
-                else ShowActionFeedbackKey("recovery.restore.routes");
-            }
-            catch (Exception ex) { _logger.Error("Recovery Center route cleanup failed", ex); AppDialog.Show(this, Ui("recovery.title"), ExplainFailure(ex, _lang.T("help.recovery.center")), danger: true); }
-            finally { SetBusy(false); UpdateRecoveryBanner(); }
-        };
-        restoreAdapter.Click += async (_, _) =>
-        {
-            if (selected == null) { AppDialog.Show(this, Ui("recovery.title"), Ui("recovery.no.adapter")); return; }
-            var backup = _adapterBackups.LastOrDefault(x => x.InterfaceIndex == selected.InterfaceIndex);
-            if (backup == null) { AppDialog.Show(this, Ui("recovery.title"), Ui("recovery.no.adapter")); return; }
-            if (!AppDialog.Show(this, Ui("recovery.restore.adapter"), IsChineseUi() ? $"将恢复 {backup.AdapterName} 在 {backup.CapturedAt:yyyy-MM-dd HH:mm:ss} 保存的配置。确认继续？" : $"Restore the configuration saved for {backup.AdapterName} at {backup.CapturedAt:yyyy-MM-dd HH:mm:ss}?", confirm: true, danger: true)) return;
-            window.Close();
-            try
-            {
-                SetBusy(true, IsChineseUi() ? "正在恢复选中网卡..." : "Restoring selected adapter...");
-                await RestoreAdapterBackupAsync(selected, backup, OperationToken);
-                ShowActionFeedbackKey("recovery.restore.adapter");
-            }
-            catch (Exception ex) { _logger.Error("Recovery Center adapter restore failed", ex); AppDialog.Show(this, Ui("recovery.title"), ExplainFailure(ex, _lang.T("help.recovery.center")), danger: true); }
-            finally { SetBusy(false); UpdateRecoveryBanner(); }
-        };
-        restoreMac.Click += async (_, _) =>
-        {
-            if (!AppDialog.Show(this, Ui("recovery.restore.mac"), IsChineseUi() ? "将恢复所有已记录且标记为退出时还原的 MAC。确认继续？" : "Restore all recorded MAC addresses marked for exit restoration. Continue?", confirm: true, danger: true)) return;
-            window.Close();
-            try
-            {
-                SetBusy(true, IsChineseUi() ? "正在恢复 MAC..." : "Restoring MAC addresses...");
-                if (!await RestoreOriginalMacAddressesAsync(OperationToken)) AppDialog.Show(this, Ui("recovery.title"), IsChineseUi() ? "部分 MAC 未能恢复，请查看日志。" : "Some MAC addresses could not be restored; see the log.", danger: true);
-                else ShowActionFeedbackKey("recovery.restore.mac");
-                await RefreshAdaptersAsync();
-            }
-            catch (Exception ex) { _logger.Error("Recovery Center MAC restore failed", ex); AppDialog.Show(this, Ui("recovery.title"), ExplainFailure(ex, _lang.T("help.recovery.center")), danger: true); }
-            finally { SetBusy(false); UpdateRecoveryBanner(); }
-        };
-        ApplyOwnedWindowTheme(window);
-        window.ShowDialog();
-    }
-
-    private async Task RestoreAdapterBackupAsync(NetworkAdapterInfo adapter, AdapterConfigBackup backup, CancellationToken ct)
-    {
-        var snapshot = new AdapterIpv4Snapshot
-        {
-            DhcpEnabled = backup.DhcpEnabled,
-            Addresses = backup.Addresses,
-            Routes = backup.Routes,
-            IpAddress = backup.IpAddress,
-            PrefixLength = backup.PrefixLength,
-            Gateway = backup.Gateway,
-            Dns = backup.Dns,
-            AutomaticMetric = backup.AutomaticMetric,
-            InterfaceMetric = backup.InterfaceMetric
-        };
-        await _adapterService.RestoreIPv4ConfigAsync(adapter, snapshot, ct);
-        await VerifyRestoredAdapterConfigAsync(adapter, snapshot, ct);
-        adapter.IPv4Address = snapshot.IpAddress;
-        UpdateAdapterIpText(adapter);
-        AddOperationHistory("Recovery", snapshot.IpAddress, adapter.MacAddress, "Completed / 已完成", "Adapter backup restored / 网卡备份已恢复", scope: adapter.Name);
-        await RefreshAdaptersAsync();
     }
 
     private void RefreshOperationHistoryView()
@@ -2909,7 +2799,8 @@ public partial class MainWindow : Window
         var adapter = SelectedAdapter;
         if (adapter == null) return;
         if (!EnsureSafetyOnboarding()) return;
-        var backup = _adapterBackups.LastOrDefault(x => x.InterfaceIndex == adapter.InterfaceIndex);
+        var backup = _adapterBackups.LastOrDefault(x =>
+            ResolveAdapterForBackup(x)?.Id.Equals(adapter.Id, StringComparison.OrdinalIgnoreCase) == true);
         if (backup == null)
         {
             AppDialog.Show(this, "Rollback / 回滚", "No saved backup for this adapter / 此网卡没有已保存备份。");
@@ -3582,13 +3473,10 @@ public partial class MainWindow : Window
         }
 
         var succeeded = true;
-        var available = Adapters.ToList();
         foreach (var backup in pending)
         {
             ct.ThrowIfCancellationRequested();
-            var adapter = available.FirstOrDefault(x =>
-                (!string.IsNullOrWhiteSpace(backup.AdapterId) && x.Id.Equals(backup.AdapterId, StringComparison.OrdinalIgnoreCase))
-                || (!string.IsNullOrWhiteSpace(backup.InterfaceIndex) && x.InterfaceIndex.Equals(backup.InterfaceIndex, StringComparison.OrdinalIgnoreCase)));
+            var adapter = ResolveAdapterForMacBackup(backup);
             if (adapter == null)
             {
                 _logger.Warn($"MAC restoration skipped: adapter unavailable idx={backup.InterfaceIndex} name={backup.AdapterName}");
@@ -4139,11 +4027,15 @@ public partial class MainWindow : Window
             _originalAdapterConfigs[adapter.InterfaceIndex] = await _adapterService.CaptureIPv4ConfigAsync(adapter, ct);
         }
         var snapshot = _originalAdapterConfigs[adapter.InterfaceIndex];
-        _adapterBackups.RemoveAll(x => x.InterfaceIndex == adapter.InterfaceIndex);
+        _adapterBackups.RemoveAll(x =>
+            (!string.IsNullOrWhiteSpace(adapter.Id) && x.AdapterId.Equals(adapter.Id, StringComparison.OrdinalIgnoreCase))
+            || (string.IsNullOrWhiteSpace(x.AdapterId) && x.InterfaceIndex == adapter.InterfaceIndex));
         _adapterBackups.Add(new AdapterConfigBackup
         {
             InterfaceIndex = adapter.InterfaceIndex,
+            AdapterId = adapter.Id,
             AdapterName = adapter.Name,
+            AdapterMac = adapter.MacAddress,
             CapturedAt = DateTime.Now,
             DhcpEnabled = snapshot.DhcpEnabled,
             IpAddress = snapshot.IpAddress,
@@ -4324,9 +4216,8 @@ public partial class MainWindow : Window
     private async Task VerifyMacAddressAsync(AdapterMacBackup backup, string expectedMac, CancellationToken ct)
     {
         var expected = NetworkAdapterService.NormalizeMacAddress(expectedMac);
-        var observed = (await Task.Run(() => _adapterService.GetAdapters(logAdapters: false), ct))
-            .FirstOrDefault(x => (!string.IsNullOrWhiteSpace(backup.AdapterId) && x.Id.Equals(backup.AdapterId, StringComparison.OrdinalIgnoreCase))
-                || (!string.IsNullOrWhiteSpace(backup.InterfaceIndex) && x.InterfaceIndex.Equals(backup.InterfaceIndex, StringComparison.OrdinalIgnoreCase)));
+        var observedAdapters = await Task.Run(() => _adapterService.GetAdapters(logAdapters: false), ct);
+        var observed = AdapterIdentityMatcher.Find(observedAdapters, backup);
         var actual = observed == null || string.IsNullOrWhiteSpace(observed.MacAddress) ? "" : NetworkAdapterService.NormalizeMacAddress(observed.MacAddress);
         var matched = observed != null && actual.Equals(expected, StringComparison.OrdinalIgnoreCase);
         _logger.Info($"Post-change MAC verification: idx={backup.InterfaceIndex} expected={expected} actual={actual} matched={matched}");

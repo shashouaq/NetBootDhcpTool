@@ -83,7 +83,7 @@
 ## Change and publication boundary
 
 - Unless the user explicitly requests publication/release, after each completed change build the project and open the local program for preview; do not push source or release artifacts externally.
-- The preview step is mandatory after every completed change: check for a running `NetBootDhcpTool` process, restart it from the current source `Release` output when present, otherwise start it. `build\run-app-admin.ps1` prefers `src\NetBootDhcpTool.App\bin\Release\net8.0-windows` and falls back to the packaged release output only when the source build is absent.
+- The preview step is mandatory after every completed change: check for a running `NetBootDhcpTool` process, restart it from the current source `Release` output when present, otherwise start it. `build\run-app-admin.ps1` prefers `src\NetBootDhcpTool.App\bin\Release\net10.0-windows` and falls back to the packaged release output only when the source build is absent.
 - Only explicit publication authorization permits pushing to GitHub or creating/updating a GitHub Release. After publication, verify and report the exact remote commit/release/assets; local success must never be described as GitHub publication.
 - Every application run creates a new UTF-8 session log named with its start timestamp; user button/tab actions, slow-operation start/completion, elapsed time, and errors must be logged so UI freezes can be diagnosed from one run without mixing historical sessions.
 

@@ -2,6 +2,8 @@ namespace NetBootDhcpTool.Core;
 
 public sealed class AppPaths
 {
+    private readonly List<string> _migrationWarnings = [];
+
     public AppPaths(string baseDirectory)
     {
         BaseDirectory = baseDirectory;
@@ -40,6 +42,7 @@ public sealed class AppPaths
     public string NetworkHistoryFile { get; }
     public string OperationHistoryFile { get; }
     public string ProfilesFile { get; }
+    public IReadOnlyList<string> MigrationWarnings => _migrationWarnings;
 
     public void Ensure()
     {
@@ -64,14 +67,8 @@ public sealed class AppPaths
             Directory.CreateDirectory(ConfigDirectory);
             Directory.CreateDirectory(LogsDirectory);
 
-            if (!File.Exists(SettingsFile) && File.Exists(legacySettings))
-            {
-                File.Copy(legacySettings, SettingsFile, overwrite: false);
-            }
-            if (!File.Exists(FavoritesFile) && File.Exists(legacyFavorites))
-            {
-                File.Copy(legacyFavorites, FavoritesFile, overwrite: false);
-            }
+            CopyLegacyFile(legacySettings, SettingsFile, "settings");
+            CopyLegacyFile(legacyFavorites, FavoritesFile, "favorites");
             if (Directory.Exists(legacyLogsDir))
             {
                 foreach (var file in Directory.EnumerateFiles(legacyLogsDir, "*.log", SearchOption.TopDirectoryOnly))
@@ -79,13 +76,27 @@ public sealed class AppPaths
                     var dest = Path.Combine(LogsDirectory, Path.GetFileName(file));
                     if (!File.Exists(dest))
                     {
-                        File.Copy(file, dest, overwrite: false);
+                        CopyLegacyFile(file, dest, "log");
                     }
                 }
             }
         }
-        catch
+        catch (Exception ex)
         {
+            _migrationWarnings.Add($"data directory: {ex.Message}");
+        }
+    }
+
+    private void CopyLegacyFile(string source, string destination, string kind)
+    {
+        if (File.Exists(destination) || !File.Exists(source)) return;
+        try
+        {
+            File.Copy(source, destination, overwrite: false);
+        }
+        catch (Exception ex)
+        {
+            _migrationWarnings.Add($"{kind} ({Path.GetFileName(source)}): {ex.Message}");
         }
     }
 }

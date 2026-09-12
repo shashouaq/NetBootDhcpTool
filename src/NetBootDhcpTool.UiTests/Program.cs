@@ -38,6 +38,13 @@ internal static class Program
             if (completed) return;
             try
             {
+                window.Width = 900;
+                window.Height = 560;
+                window.UpdateLayout();
+                if (window.MinWidth > 900 || window.MinHeight > 560
+                    || window.ActualWidth > 940 || window.ActualHeight > 600)
+                    throw new InvalidOperationException($"main window did not honor compact bounds: min={window.MinWidth:0}x{window.MinHeight:0} actual={window.ActualWidth:0}x{window.ActualHeight:0}");
+
                 var element = AutomationElement.FromHandle(new System.Windows.Interop.WindowInteropHelper(window).Handle);
                 var required = new[]
                 {
@@ -63,7 +70,7 @@ internal static class Program
                     && FindByName(element, "恢复") == null && FindByName(element, "恢复中心") == null)
                     throw new InvalidOperationException("missing recovery action");
 
-                Console.WriteLine("UI_SMOKE_OK: non-admin WPF window, automation names, recovery action, and persistent-history action verified.");
+                Console.WriteLine("UI_SMOKE_OK: non-admin WPF window at compact bounds, automation names, recovery action, and persistent-history action verified.");
                 completed = true;
                 timer.Stop();
                 window.Close();

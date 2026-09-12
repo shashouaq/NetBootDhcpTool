@@ -1,5 +1,17 @@
 # Feature Change Log
 
+## Unreleased
+
+- No unpublished changes.
+
+## v1.0.12 / 2026-09-12
+
+- Type: Maintenance / Recovery UX / Compatibility / Accessibility
+- Affected files/modules: `global.json`, `src/NetBootDhcpTool.*`, `src/NetBootDhcpTool.App/MainWindow.Recovery.cs`, `src/NetBootDhcpTool.App/RecoveryCenterWindow.cs`, `src/NetBootDhcpTool.Network/AdapterIdentityMatcher.cs`, `src/NetBootDhcpTool.Core/AppPaths.cs`, `src/NetBootDhcpTool.UnitTests/`, `.github/workflows/windows-ci.yml`, `build/`, `README.md`, `docs/`, `i18n/`
+- Concrete change: Moved all projects to .NET 10 and pinned SDK 10.0.401 plus its test runner; made the resolver honor `global.json` from any caller directory and bootstrap the exact SDK; added focused MSTest coverage and a Windows CI workflow; added a maintenance gate for versions, target frameworks, translation key parity, and static help coverage; made recovery actions item-by-item with stable adapter identity matching, per-action confirmation, post-restore checks, and operation history; report legacy data-copy failures while continuing later files and retaining originals; split Recovery Center orchestration into a separate `MainWindow` partial and its own window; lowered the WPF minimum window size to 900x560 DIP and enabled layout rounding; limited package cleanup to repository test runners and left machine-wide PktMon captures/filters untouched.
+- Verification: .NET 10.0.401 Release solution build passed with 0 warnings and 0 errors; all 17 MSTest tests passed; the existing protocol/persistence smoke returned `OK`; non-admin WPF automation passed at compact bounds. Maintenance checks reported 265 synchronized localization keys and 60/60 static buttons with help keys; dependency audit found no vulnerable packages; `git diff --check` passed. The self-contained archive is about 56.7 MB and passed 7-Zip testing; its SHA-256 sidecar and local manifest match, and file version is `1.0.12.0`. Administrator-only Hyper-V route smoke was not run because the current terminal is not elevated.
+- User impact: Maintainers get a repeatable .NET 10 test/build/release path and CI checks. Users can inspect and restore one recovery item at a time, avoid restoring onto a different adapter after interface-index reuse, see migration failures rather than silently missing data, and use the main window on smaller/high-DPI displays.
+
 ## v1.0.11 / 2026-09-10
 
 - Type: UX / Safety / Validation

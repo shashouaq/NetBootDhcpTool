@@ -8,8 +8,8 @@ For day-to-day maintenance, required change-log practice, GitHub synchronization
 
 - The application version is defined in `src/NetBootDhcpTool.App/NetBootDhcpTool.App.csproj`.
 - `build/publish.ps1` reads that version and must not use a separate hard-coded version.
-- Release tags must use `v<version>`, for example `v1.0.8`.
-- The resolver selects a project-local or system .NET 8 SDK and bootstraps the local SDK when neither is available.
+- Release tags must use `v<version>`, for example `v1.0.12`.
+- The repository pins the .NET 10 SDK in `global.json`; the resolver selects a matching local or system SDK and bootstraps it when neither is available.
 
 ## Required Checks
 
@@ -18,7 +18,9 @@ Run these checks before publishing:
 ```powershell
 $dotnet = .\build\resolve-dotnet.ps1
 & $dotnet build .\NetBootDhcpTool.sln -c Release --no-restore
+& $dotnet test .\src\NetBootDhcpTool.UnitTests\NetBootDhcpTool.UnitTests.csproj -c Release --no-build --minimum-expected-tests 1
 & $dotnet run --project .\src\NetBootDhcpTool.Tests\NetBootDhcpTool.Tests.csproj -c Release
+& .\build\verify-maintenance.ps1
 ```
 
 If only documentation changed, a lightweight Markdown/content review is acceptable, but the change must still be recorded in `docs/FEATURE_CHANGELOG.md`.

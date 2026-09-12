@@ -54,7 +54,10 @@ $changeItems = @()
 $changeLogPath = Join-Path $root "docs\FEATURE_CHANGELOG.md"
 if (Test-Path $changeLogPath) {
     $changeLog = Get-Content -Raw $changeLogPath
-    $section = [regex]::Match($changeLog, "(?ms)^##\s+(?:Unreleased|v$version)\b.*?(?=^##\s+|\z)")
+    $section = [regex]::Match($changeLog, "(?ms)^##\s+v$([regex]::Escape($version))\b.*?(?=^##\s+|\z)")
+    if (-not $section.Success) {
+        $section = [regex]::Match($changeLog, "(?ms)^##\s+Unreleased\b.*?(?=^##\s+|\z)")
+    }
     if ($section.Success) {
         $releaseNotes = $section.Value.Trim()
         $changeItems = @([regex]::Matches($releaseNotes, "(?m)^-\s+(?:Concrete change|User impact|变更内容|用户影响)[：:]?\s*(.+)$") | ForEach-Object { $_.Groups[1].Value.Trim() })
