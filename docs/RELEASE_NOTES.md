@@ -7,7 +7,7 @@ NetBoot DHCP Tool v1.0.12 moves the project to .NET 10, adds repeatable Windows 
 ### Changes
 
 - Migrated all projects to .NET 10 and pinned the SDK and Microsoft Testing Platform runner used by local and CI tests.
-- Added unit coverage for CIDR and route validation, DHCP lease behavior, JSON backups, legacy-data migration failures, and adapter identity matching; added a Windows build/test workflow and maintenance consistency gate.
+- Added unit coverage for CIDR and route validation, DHCP lease behavior, JSON backups, legacy-data migration failures, and adapter identity matching; added a Windows build/test workflow using the Node 24-compatible `setup-dotnet@v5` action and a maintenance consistency gate.
 - Split Recovery Center into its own UI and `MainWindow` partial. Each adapter snapshot, pending MAC restore, and session route is listed independently with adapter identity, capture time, confirmation, and operation history; restore checks the resulting state.
 - Made legacy configuration/log migration report individual copy failures, continue with later files, and retain the original data.
 - Reduced the main-window minimum to 900x560 DIP and enabled layout rounding for compact/high-DPI screens.
