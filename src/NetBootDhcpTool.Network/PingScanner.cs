@@ -1,79 +1,186 @@
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.NetworkInformation;
+using System.Net.Sockets;
 using NetBootDhcpTool.Core;
 
 namespace NetBootDhcpTool.Network;
 
+public interface IScanTargetProbe
+{
+    Task<ScanResult?> ProbeAsync(IPAddress ip, int pingTimeoutMs, int httpTimeoutMs, CancellationToken cancellationToken);
+}
+
+public sealed class NetworkScanTargetProbe : IScanTargetProbe
+{
+    private static readonly TimeSpan DnsTimeout = TimeSpan.FromSeconds(1.5);
+    private readonly Func<IPAddress, TimeSpan, CancellationToken, Task<(bool success, long roundTripTime)>> _pingAsync;
+    private readonly Func<IPAddress, CancellationToken, Task<string>> _resolveHostAsync;
+    private readonly Func<string, int, CancellationToken, Task<(bool http, bool https)>> _httpProbeAsync;
+    private readonly TimeSpan _dnsTimeout;
+
+    public NetworkScanTargetProbe(HttpProbeService httpProbe)
+        : this(SendPingAsync, ResolveHostAsync, CreateHttpProbe(httpProbe), DnsTimeout) { }
+
+    internal NetworkScanTargetProbe(
+        Func<IPAddress, TimeSpan, CancellationToken, Task<(bool success, long roundTripTime)>> pingAsync,
+        Func<IPAddress, CancellationToken, Task<string>> resolveHostAsync,
+        Func<string, int, CancellationToken, Task<(bool http, bool https)>> httpProbeAsync,
+        TimeSpan dnsTimeout)
+    {
+        _pingAsync = pingAsync ?? throw new ArgumentNullException(nameof(pingAsync));
+        _resolveHostAsync = resolveHostAsync ?? throw new ArgumentNullException(nameof(resolveHostAsync));
+        _httpProbeAsync = httpProbeAsync ?? throw new ArgumentNullException(nameof(httpProbeAsync));
+        if (dnsTimeout <= TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(dnsTimeout));
+        _dnsTimeout = dnsTimeout;
+    }
+
+    public async Task<ScanResult?> ProbeAsync(IPAddress ip, int pingTimeoutMs, int httpTimeoutMs, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var ping = await _pingAsync(ip, TimeSpan.FromMilliseconds(Math.Max(1, pingTimeoutMs)), cancellationToken).ConfigureAwait(false);
+        if (!ping.success) return null;
+
+        var result = new ScanResult
+        {
+            IpAddress = ip.ToString(),
+            PingOk = true,
+            LatencyMs = ping.roundTripTime,
+            Hostname = await ResolveHostBoundedAsync(ip, cancellationToken).ConfigureAwait(false),
+            LastSeen = DateTime.Now
+        };
+        var probes = await _httpProbeAsync(ip.ToString(), httpTimeoutMs, cancellationToken).ConfigureAwait(false);
+        cancellationToken.ThrowIfCancellationRequested();
+        result.HttpOk = probes.http;
+        result.HttpsOk = probes.https;
+        return result;
+    }
+
+    private async Task<string> ResolveHostBoundedAsync(IPAddress ip, CancellationToken cancellationToken)
+    {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(_dnsTimeout);
+        try
+        {
+            return await _resolveHostAsync(ip, timeout.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested) { return ""; }
+        catch (SocketException) { return ""; }
+    }
+
+    private static async Task<(bool success, long roundTripTime)> SendPingAsync(IPAddress ip, TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        using var ping = new Ping();
+        var reply = await ping.SendPingAsync(ip, timeout, new byte[32], new PingOptions(), cancellationToken).ConfigureAwait(false);
+        return (reply.Status == IPStatus.Success, reply.RoundtripTime);
+    }
+
+    private static async Task<string> ResolveHostAsync(IPAddress ip, CancellationToken cancellationToken)
+    {
+        var entry = await Dns.GetHostEntryAsync(ip.ToString(), AddressFamily.Unspecified, cancellationToken).ConfigureAwait(false);
+        return entry.HostName;
+    }
+
+    private static Func<string, int, CancellationToken, Task<(bool http, bool https)>> CreateHttpProbe(HttpProbeService httpProbe)
+    {
+        ArgumentNullException.ThrowIfNull(httpProbe);
+        return httpProbe.ProbeAsync;
+    }
+}
+
 public sealed class PingScanner
 {
+    public const int MaxConcurrency = 64;
     private readonly ILogger _logger;
-    private readonly HttpProbeService _probe;
+    private readonly IScanTargetProbe _targetProbe;
 
     public PingScanner(ILogger logger, HttpProbeService probe)
+        : this(logger, new NetworkScanTargetProbe(probe)) { }
+
+    public PingScanner(ILogger logger, IScanTargetProbe targetProbe)
     {
         _logger = logger;
-        _probe = probe;
+        _targetProbe = targetProbe;
     }
 
-    public async Task<IReadOnlyList<ScanResult>> ScanAsync(IPAddress localIp, IPAddress mask, int concurrency, int pingTimeoutMs, int httpTimeoutMs, IProgress<(int done, int total, ScanResult? result)> progress, CancellationToken ct)
+    public Task<IReadOnlyList<ScanResult>> ScanAsync(IPAddress localIp, IPAddress mask, int concurrency, int pingTimeoutMs,
+        int httpTimeoutMs, IProgress<(int done, int total, ScanResult? result)> progress, CancellationToken ct)
     {
-        var hosts = IpNetwork.Hosts(localIp, mask).Where(x => !x.Equals(localIp)).ToList();
-        return await ScanHostsAsync(hosts, $"{localIp}/{IpNetwork.PrefixLength(mask)}", concurrency, pingTimeoutMs, httpTimeoutMs, progress, ct);
+        if (!ScanRangePlan.TryCreate(localIp.ToString(), mask.ToString(), "", out var plan, out var error))
+            throw new ArgumentException($"Invalid scan range: {error}");
+        return ScanPlanAsync(plan!, concurrency, pingTimeoutMs, httpTimeoutMs, progress, ct);
     }
 
-    public async Task<IReadOnlyList<ScanResult>> ScanTargetsAsync(IReadOnlyList<IPAddress> targets, int concurrency, int pingTimeoutMs, int httpTimeoutMs, IProgress<(int done, int total, ScanResult? result)> progress, CancellationToken ct)
+    public Task<IReadOnlyList<ScanResult>> ScanPlanAsync(ScanRangePlan plan, int concurrency, int pingTimeoutMs,
+        int httpTimeoutMs, IProgress<(int done, int total, ScanResult? result)> progress, CancellationToken ct)
     {
-        return await ScanHostsAsync(targets.Distinct().ToList(), string.Join(",", targets.Select(x => x.ToString())), concurrency, pingTimeoutMs, httpTimeoutMs, progress, ct);
+        ArgumentNullException.ThrowIfNull(plan);
+        if (plan.TargetCount is < 1 or > ScanRangePlan.MaxProbeTargets)
+            throw new ArgumentOutOfRangeException(nameof(plan), "Scan target count is outside the permitted range.");
+        var scope = plan.IsSingleTarget
+            ? plan.TargetIp!.ToString()
+            : $"{plan.LocalIp}/{plan.PrefixLength}";
+        return ScanHostsAsync(plan.EnumerateTargets(), plan.TargetCount, scope, concurrency, pingTimeoutMs, httpTimeoutMs, progress, ct);
     }
 
-    private async Task<IReadOnlyList<ScanResult>> ScanHostsAsync(IReadOnlyList<IPAddress> hosts, string scope, int concurrency, int pingTimeoutMs, int httpTimeoutMs, IProgress<(int done, int total, ScanResult? result)> progress, CancellationToken ct)
+    public Task<IReadOnlyList<ScanResult>> ScanTargetsAsync(IReadOnlyList<IPAddress> targets, int concurrency, int pingTimeoutMs,
+        int httpTimeoutMs, IProgress<(int done, int total, ScanResult? result)> progress, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(targets);
+        var unique = new List<IPAddress>(Math.Min(targets.Count, ScanRangePlan.MaxProbeTargets));
+        var seen = new HashSet<IPAddress>();
+        foreach (var target in targets)
+        {
+            if (target.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork)
+                throw new ArgumentException("Only IPv4 scan targets are supported.", nameof(targets));
+            if (seen.Add(target))
+            {
+                if (unique.Count == ScanRangePlan.MaxProbeTargets)
+                    throw new ArgumentOutOfRangeException(nameof(targets), $"A scan may probe at most {ScanRangePlan.MaxProbeTargets} addresses.");
+                unique.Add(target);
+            }
+        }
+        if (unique.Count == 0) throw new ArgumentException("At least one scan target is required.", nameof(targets));
+        return ScanHostsAsync(unique, unique.Count, string.Join(",", unique.Select(x => x.ToString())),
+            concurrency, pingTimeoutMs, httpTimeoutMs, progress, ct);
+    }
+
+    private async Task<IReadOnlyList<ScanResult>> ScanHostsAsync(IEnumerable<IPAddress> hosts, int total, string scope,
+        int concurrency, int pingTimeoutMs, int httpTimeoutMs,
+        IProgress<(int done, int total, ScanResult? result)> progress, CancellationToken ct)
     {
         var results = new ConcurrentBag<ScanResult>();
         var done = 0;
-        _logger.Info($"Scan start: {scope} hosts={hosts.Count}");
-        await Parallel.ForEachAsync(hosts, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, concurrency), CancellationToken = ct }, async (ip, token) =>
+        var degree = Math.Clamp(concurrency, 1, MaxConcurrency);
+        _logger.Info($"Scan start: {scope} hosts={total} concurrency={degree}");
+        await Parallel.ForEachAsync(hosts, new ParallelOptions
+        {
+            MaxDegreeOfParallelism = degree,
+            CancellationToken = ct
+        }, async (ip, token) =>
         {
             ScanResult? result = null;
             try
             {
-                using var ping = new Ping();
-                var reply = await ping.SendPingAsync(ip, pingTimeoutMs);
-                if (reply.Status == IPStatus.Success)
+                result = await _targetProbe.ProbeAsync(ip, pingTimeoutMs, httpTimeoutMs, token).ConfigureAwait(false);
+                if (result is not null)
                 {
-                    result = new ScanResult
-                    {
-                        IpAddress = ip.ToString(),
-                        PingOk = true,
-                        LatencyMs = reply.RoundtripTime,
-                        Hostname = ResolveHost(ip),
-                        LastSeen = DateTime.Now
-                    };
-                    var probes = await _probe.ProbeAsync(ip.ToString(), httpTimeoutMs, token);
-                    result.HttpOk = probes.http;
-                    result.HttpsOk = probes.https;
                     results.Add(result);
                     _logger.Info($"Scan hit: {result.IpAddress} {result.LatencyMs}ms http={result.HttpOk} https={result.HttpsOk}");
                 }
             }
-            catch (OperationCanceledException) { }
+            catch (OperationCanceledException) when (token.IsCancellationRequested) { throw; }
             catch (Exception ex)
             {
                 _logger.Error($"Scan failed: {ip}", ex);
             }
             finally
             {
-                progress.Report((Interlocked.Increment(ref done), hosts.Count, result));
+                progress.Report((Interlocked.Increment(ref done), total, result));
             }
-        });
+        }).ConfigureAwait(false);
         _logger.Info("Scan stop");
         return results.OrderBy(x => IPAddress.Parse(x.IpAddress).GetAddressBytes(), ByteArrayComparer.Instance).ToList();
-    }
-
-    private static string ResolveHost(IPAddress ip)
-    {
-        try { return Dns.GetHostEntry(ip).HostName; }
-        catch { return ""; }
     }
 
     private sealed class ByteArrayComparer : IComparer<byte[]>

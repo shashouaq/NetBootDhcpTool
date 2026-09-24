@@ -18,6 +18,8 @@ public enum DhcpMessageType : byte
 
 public sealed class DhcpServerSettings
 {
+    public string AdapterId { get; set; } = "";
+    public int InterfaceIndex { get; set; }
     public IPAddress ServerIp { get; set; } = IPAddress.Parse("192.168.100.1");
     public IPAddress SubnetMask { get; set; } = IPAddress.Parse("255.255.255.0");
     public IPAddress PoolStart { get; set; } = IPAddress.Parse("192.168.100.100");
@@ -29,13 +31,18 @@ public sealed class DhcpServerSettings
 
 public sealed class DhcpLease : INotifyPropertyChanged
 {
-    private DateTime _time = DateTime.Now;
+    private DateTime _time = DateTime.MinValue;
     private string _macAddress = "";
     private string _ipAddress = "";
+    private string _clientKey = "";
+    private string _clientIdentifier = "";
     private string _hostname = "";
     private DateTime _leaseStart = DateTime.Now;
     private DateTime _leaseEnd = DateTime.Now.AddHours(1);
     private string _status = "Assigned";
+    private bool _isActiveLease = true;
+    private bool _isCurrentSession = true;
+    private string _sessionId = "";
     private bool _httpOk;
     private bool _httpsOk;
     private long _pingLatencyMs = -1;
@@ -45,6 +52,8 @@ public sealed class DhcpLease : INotifyPropertyChanged
     public DateTime Time { get => _time; set => Set(ref _time, value); }
     public string MacAddress { get => _macAddress; set => Set(ref _macAddress, value); }
     public string IpAddress { get => _ipAddress; set => Set(ref _ipAddress, value); }
+    public string ClientKey { get => _clientKey; set => Set(ref _clientKey, value); }
+    public string ClientIdentifier { get => _clientIdentifier; set => Set(ref _clientIdentifier, value); }
     public string Hostname { get => _hostname; set => Set(ref _hostname, value); }
     public DateTime LeaseStart { get => _leaseStart; set => Set(ref _leaseStart, value); }
     public DateTime LeaseEnd { get => _leaseEnd; set => Set(ref _leaseEnd, value); }
@@ -58,17 +67,25 @@ public sealed class DhcpLease : INotifyPropertyChanged
             OnPropertyChanged(nameof(StatusHelp));
         }
     }
+    public bool IsActiveLease { get => _isActiveLease; set => Set(ref _isActiveLease, value); }
+    public bool IsCurrentSession { get => _isCurrentSession; set { if (Set(ref _isCurrentSession, value)) OnPropertyChanged(nameof(SessionText)); } }
+    public string SessionId { get => _sessionId; set => Set(ref _sessionId, value); }
+    public string SessionText => IsCurrentSession ? "Current / 当前会话" : "History / 历史";
     public string StatusText => Status switch
     {
         "Online" => "Online / 在线",
         "Offline" => "Offline / 离线",
         "Assigned" => "Assigned / 已分配",
+        "Released" => "Released / 已释放",
+        "Declined" => "Declined / 地址冲突",
+        "Expired" => "Expired / 已过期",
         _ => $"{Status} / 状态"
     };
     public string StatusHelp =>
         "Assigned / 已分配: DHCP lease was assigned, waiting for ping confirmation.\n" +
-        "Online / 在线: Device is reachable by ping.\n" +
-        "Offline / 离线: Lease exists but ping failed. Check client power, cable, adapter state, and IP configuration.";
+        "Released / 已释放: Client released this binding.\n" +
+        "Declined / 地址冲突: Client reported an address conflict and the address is quarantined.\n" +
+        "Expired / 已过期: Lease time ended. Ping reachability is shown separately.";
     public bool HttpOk { get => _httpOk; set => Set(ref _httpOk, value); }
     public bool HttpsOk { get => _httpsOk; set => Set(ref _httpsOk, value); }
     public long PingLatencyMs { get => _pingLatencyMs; set => Set(ref _pingLatencyMs, value); }
@@ -83,4 +100,49 @@ public sealed class DhcpLease : INotifyPropertyChanged
     }
 
     private void OnPropertyChanged(string? name) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
+}
+
+public sealed class DhcpLeaseBinding
+{
+    public string ClientKey { get; set; } = "";
+    public string MacAddress { get; set; } = "";
+    public string ClientIdentifierHex { get; set; } = "";
+    public string IpAddress { get; set; } = "";
+    public string Hostname { get; set; } = "";
+    public DateTimeOffset LeaseStart { get; set; }
+    public DateTimeOffset LeaseEnd { get; set; }
+}
+
+public sealed class DhcpDeclinedAddress
+{
+    public string IpAddress { get; set; } = "";
+    public string ClientKey { get; set; } = "";
+    public DateTimeOffset ExpiresAt { get; set; }
+}
+
+public sealed class DhcpLeaseTableSnapshot
+{
+    public List<DhcpLeaseBinding> Bindings { get; set; } = [];
+    public List<DhcpDeclinedAddress> DeclinedAddresses { get; set; } = [];
+}
+
+public sealed class DhcpLeaseScopeState
+{
+    public string AdapterId { get; set; } = "";
+    public string ServerIp { get; set; } = "";
+    public string SubnetMask { get; set; } = "";
+    public string PoolStart { get; set; } = "";
+    public string PoolEnd { get; set; } = "";
+    public List<DhcpLeaseBinding> Bindings { get; set; } = [];
+    public List<DhcpDeclinedAddress> DeclinedAddresses { get; set; } = [];
+}
+
+public sealed class DhcpLeaseJournal
+{
+    public List<DhcpLeaseScopeState> Scopes { get; set; } = [];
+}
+
+public sealed record DhcpLeaseDecision(DhcpMessageType? ResponseType, IPAddress? Address, DhcpLease? ChangedLease = null)
+{
+    public static DhcpLeaseDecision Ignore { get; } = new(null, null);
 }

@@ -1,3 +1,4 @@
+using System.IO;
 using System.Windows;
 using NetBootDhcpTool.Core;
 using NetBootDhcpTool.Network;
@@ -53,7 +54,8 @@ public partial class MainWindow
 
         foreach (var route in _appliedStaticRoutes)
         {
-            var available = ResolveAdapterForRoute(route) != null;
+            var ownershipVerified = route.OwnershipVerified && !string.IsNullOrWhiteSpace(route.InstanceId);
+            var available = ownershipVerified && ResolveAdapterForRoute(route) != null;
             entries.Add(new RecoveryEntryViewModel
             {
                 Kind = RecoveryEntryKind.StaticRoute,
@@ -62,9 +64,34 @@ public partial class MainWindow
                 AdapterName = route.AdapterName,
                 IdentityDisplay = RecoveryIdentity(route.AdapterId, route.InterfaceIndex.ToString(), route.AdapterMac),
                 CapturedAtDisplay = Ui("recovery.entry.session"),
-                Summary = Ui("recovery.entry.route.summary", route.DestinationPrefix, route.NextHop, route.RouteMetric),
-                StatusDisplay = Ui(available ? "recovery.status.available" : "recovery.status.unavailable"),
+                Summary = ownershipVerified
+                    ? Ui("recovery.entry.route.summary", route.DestinationPrefix, route.NextHop, route.RouteMetric)
+                    : Ui("recovery.entry.route.pending", route.DestinationPrefix, route.NextHop, route.RouteMetric),
+                StatusDisplay = Ui(!ownershipVerified ? "recovery.status.pending" : available ? "recovery.status.available" : "recovery.status.unavailable"),
                 IsAvailable = available
+            });
+        }
+
+        foreach (var lease in _dhcpFirewallRecoveries.Where(x => _dhcpFirewallRules?.LeaseId != x.LeaseId))
+        {
+            var pendingVerification = lease.Rules.Any(x => !x.OwnershipVerified || string.IsNullOrWhiteSpace(x.InstanceId));
+            var firewallServiceActive = _dhcpServer.IsRunning;
+            var details = string.Join(", ", lease.Rules.Select(x => $"{x.Direction} UDP {x.LocalPort}/{x.RemotePort}"));
+            entries.Add(new RecoveryEntryViewModel
+            {
+                Kind = RecoveryEntryKind.DhcpFirewall,
+                Payload = lease,
+                TypeDisplay = Ui("recovery.kind.firewall"),
+                AdapterName = lease.InterfaceAlias,
+                IdentityDisplay = $"{lease.LeaseId} | {lease.Rules.Count} rule(s)",
+                CapturedAtDisplay = lease.CreatedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss"),
+                Summary = pendingVerification
+                    ? Ui("recovery.entry.firewall.pending", details)
+                    : Ui("recovery.entry.firewall.summary", details),
+                StatusDisplay = firewallServiceActive
+                    ? Ui("recovery.status.firewall.active")
+                    : pendingVerification ? Ui("recovery.status.firewall.pending") : Ui("recovery.status.available"),
+                IsAvailable = _dhcpFirewallJournalWritable && !firewallServiceActive
             });
         }
 
@@ -81,14 +108,31 @@ public partial class MainWindow
 
     private async Task RestoreRecoveryEntryAsync(RecoveryEntryViewModel entry)
     {
+        if (!EnsureSafetyOnboarding()) return;
         var confirmed = entry.Payload switch
         {
             AdapterConfigBackup backup => AppDialog.Show(this, Ui("recovery.restore.adapter"), Ui("recovery.restore.adapter.confirm", backup.AdapterName, backup.CapturedAt.ToString("yyyy-MM-dd HH:mm:ss")), confirm: true, danger: true),
             AdapterMacBackup backup => AppDialog.Show(this, Ui("recovery.restore.mac"), Ui("recovery.restore.mac.confirm", backup.AdapterName, backup.OriginalMacAddress), confirm: true, danger: true),
             AppliedStaticRoute route => AppDialog.Show(this, Ui("recovery.restore.routes"), Ui("recovery.restore.route.confirm", $"{route.DestinationPrefix} -> {route.AdapterName} ({route.NextHop})"), confirm: true, danger: true),
+            DhcpFirewallRuleLease lease => AppDialog.Show(this, Ui("recovery.firewall.title"), Ui("recovery.restore.firewall.confirm", lease.InterfaceAlias, lease.Rules.Count), confirm: true, danger: true),
             _ => false
         };
         if (!confirmed) return;
+        await ExecuteRecoveryEntryAsync(entry);
+    }
+
+    internal async Task<bool> ExecuteRecoveryEntryAsync(RecoveryEntryViewModel entry)
+    {
+        if (!_safetyOnboardingCompleted)
+        {
+            ShowActionFeedback(
+                "请先完成安全引导，再恢复网络配置。",
+                "Complete the Safety Guide before restoring network configuration.",
+                error: true);
+            return false;
+        }
+        var workflow = TryBeginNetworkWorkflow("Recovery Center restore");
+        if (workflow is null) return false;
 
         try
         {
@@ -104,7 +148,7 @@ public partial class MainWindow
                 }
                 case AdapterMacBackup backup:
                     await RestoreMacBackupAsync(backup, OperationToken);
-                    await RefreshAdaptersAsync();
+                    await RefreshAdaptersAsync(allowDuringNetworkWorkflow: true, cancellationToken: CancellationToken.None);
                     ShowActionFeedbackKey("recovery.restore.mac");
                     break;
                 case AppliedStaticRoute route:
@@ -114,26 +158,47 @@ public partial class MainWindow
                     ShowActionFeedbackKey("recovery.restore.routes");
                     break;
                 }
+                case DhcpFirewallRuleLease firewallLease:
+                {
+                    if (!_dhcpFirewallJournalWritable) throw new InvalidOperationException(Ui("firewall.journal.unreadable"));
+                    if (_dhcpFirewallRules?.LeaseId == firewallLease.LeaseId || _dhcpServer.IsRunning)
+                        throw new InvalidOperationException(Ui("firewall.recovery.active"));
+                    var stored = _dhcpFirewallRecoveries.FirstOrDefault(x => x.LeaseId.Equals(firewallLease.LeaseId, StringComparison.OrdinalIgnoreCase))
+                        ?? throw new InvalidOperationException(Ui("recovery.status.unavailable"));
+                    await _adapterService.RemoveDhcpFirewallRulesAsync(stored, CommitDhcpFirewallLease, OperationToken);
+                    AddOperationHistory("DHCP firewall recovery", "", "", "Completed / 已完成",
+                        "Owned DHCP firewall rules were verified removed / 已核实删除所属 DHCP 防火墙规则", scope: stored.InterfaceAlias, rollbackAvailable: false);
+                    ShowActionFeedbackKey("recovery.restore.firewall");
+                    break;
+                }
             }
+            return true;
         }
         catch (OperationCanceledException)
         {
             _logger.Warn("Recovery Center restore canceled by user");
+            return false;
         }
         catch (Exception ex)
         {
             _logger.Error("Recovery Center restore failed", ex);
-            AppDialog.Show(this, Ui("recovery.title"), ExplainFailure(ex, _lang.T("help.recovery.center")), danger: true);
+            if (entry.Payload is DhcpFirewallRuleLease firewallLease)
+                AddOperationHistory("DHCP firewall recovery", "", "", "Pending / 待处理", ex.Message, scope: firewallLease.InterfaceAlias, rollbackAvailable: true);
+            if (!_closingCleanupStarted)
+                AppDialog.Show(this, Ui("recovery.title"), ExplainFailure(ex, _lang.T("help.recovery.center")), danger: true);
+            return false;
         }
         finally
         {
             SetBusy(false);
+            EndNetworkWorkflow(workflow);
             UpdateRecoveryBanner();
         }
     }
 
     private async Task RestoreAdapterBackupAsync(NetworkAdapterInfo adapter, AdapterConfigBackup backup, CancellationToken ct)
     {
+        var preRestoreSnapshot = await _adapterService.CaptureIPv4ConfigAsync(adapter, ct);
         var snapshot = new AdapterIpv4Snapshot
         {
             DhcpEnabled = backup.DhcpEnabled,
@@ -143,15 +208,25 @@ public partial class MainWindow
             PrefixLength = backup.PrefixLength,
             Gateway = backup.Gateway,
             Dns = backup.Dns,
+            DnsMode = backup.DnsMode,
+            AdapterEnabled = backup.AdapterEnabled,
             AutomaticMetric = backup.AutomaticMetric,
             InterfaceMetric = backup.InterfaceMetric
         };
-        await _adapterService.RestoreIPv4ConfigAsync(adapter, snapshot, ct);
-        await VerifyRestoredAdapterConfigAsync(adapter, snapshot, ct);
+        try
+        {
+            await _adapterService.RestoreIPv4ConfigAsync(adapter, snapshot, ct);
+            await VerifyRestoredAdapterConfigAsync(adapter, snapshot, ct);
+        }
+        catch
+        {
+            await CompensateAdapterConfigAsync(adapter, preRestoreSnapshot, "Recovery Center adapter restore");
+            throw;
+        }
         adapter.IPv4Address = snapshot.IpAddress;
         UpdateAdapterIpText(adapter);
         AddOperationHistory("Recovery", snapshot.IpAddress, adapter.MacAddress, "Completed / 已完成", "Adapter backup restored / 网卡备份已恢复", scope: adapter.Name);
-        await RefreshAdaptersAsync();
+        await RefreshAdaptersAsync(allowDuringNetworkWorkflow: true, cancellationToken: CancellationToken.None);
     }
 
     private NetworkAdapterInfo? ResolveAdapterForBackup(AdapterConfigBackup backup) =>
@@ -162,13 +237,36 @@ public partial class MainWindow
 
     private async Task RestoreMacBackupAsync(AdapterMacBackup backup, CancellationToken ct)
     {
+        if (!_macBackupsWritable)
+            throw new InvalidOperationException("MAC recovery records could not be read; refusing to change the adapter without a writable recovery record.");
         var adapter = ResolveAdapterForMacBackup(backup)
             ?? throw new InvalidOperationException(Ui("recovery.status.unavailable"));
-        await _adapterService.RestoreMacAddressAsync(adapter, backup.OriginalMacAddress, ct);
-        await VerifyMacAddressAsync(backup, backup.OriginalMacAddress, ct);
+        var preRestoreMac = adapter.MacAddress;
+        try
+        {
+            await _adapterService.RestoreMacAddressAsync(adapter, backup.OriginalMacAddress, ct);
+            await VerifyMacAddressAsync(backup, backup.OriginalMacAddress, ct);
+        }
+        catch
+        {
+            try
+            {
+                await _adapterService.RestoreMacAddressAsync(adapter, preRestoreMac, CancellationToken.None);
+                await VerifyMacAddressAsync(backup, preRestoreMac, CancellationToken.None);
+            }
+            catch (Exception compensationEx)
+            {
+                _logger.Error("Recovery Center MAC restore compensation failed; recovery entry remains available", compensationEx);
+            }
+            throw;
+        }
 
         _originalAdapterMacs.Remove(MacBackupKey(backup));
-        SaveMacBackups();
+        if (!SaveMacBackups())
+        {
+            _originalAdapterMacs[MacBackupKey(backup)] = backup;
+            throw new IOException("The restored MAC recovery record could not be updated on disk.");
+        }
         AddOperationHistory("MAC Recovery / MAC 恢复", "", backup.OriginalMacAddress, "Completed / 已完成",
             "Original MAC address restored / 已恢复原始 MAC 地址", scope: backup.AdapterName);
         _logger.Info($"Adapter MAC restored from Recovery Center: idx={backup.InterfaceIndex} name={backup.AdapterName} mac={backup.OriginalMacAddress}");
@@ -176,13 +274,13 @@ public partial class MainWindow
 
     private async Task RemoveAppliedRouteAsync(AppliedStaticRoute route, NetworkAdapterInfo adapter, CancellationToken ct)
     {
+        if (!_routeJournalWritable)
+            throw new InvalidOperationException("The static route recovery journal could not be read; refusing to remove an untracked route.");
         if (!_appliedStaticRoutes.Contains(route))
             throw new InvalidOperationException(Ui("recovery.status.unavailable"));
 
         await _routeService.RemoveAsync(route, adapter, ct);
-        _appliedStaticRoutes.Remove(route);
-        SaveStaticRouteSession();
-        UpdateRouteStatuses();
+        RemoveAppliedRouteRecord(route);
         await LoadCurrentStaticRoutesAsync(Adapters.ToList(), ct);
         AddOperationHistory("Static Route Recovery / 静态路由恢复", "", adapter.MacAddress, "Completed / 已完成",
             $"Removed {route.DestinationPrefix} via {route.NextHop} / 已删除路由 {route.DestinationPrefix}，下一跳 {route.NextHop}", scope: adapter.Name);

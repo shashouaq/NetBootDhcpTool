@@ -267,6 +267,7 @@
               <DataGridTextColumn Header="Start / 开始" Binding="{Binding LeaseStart}" Width="145" ElementStyle="{StaticResource CellText}"/>
               <DataGridTextColumn Header="End / 结束" Binding="{Binding LeaseEnd}" Width="145" ElementStyle="{StaticResource CellText}"/>
               <DataGridTextColumn Header="Status / 状态" Binding="{Binding StatusText}" Width="125" ElementStyle="{StaticResource StatusText}"/>
+              <DataGridTextColumn Header="Session / 会话" Binding="{Binding SessionText}" Width="125" ElementStyle="{StaticResource CellText}"/>
               <DataGridTextColumn Header="Ping ms" Binding="{Binding PingLatencyMs}" Width="80" ElementStyle="{StaticResource CellText}"/>
               <DataGridTextColumn Header="Remark / 备注" Binding="{Binding Remark}" Width="*" ElementStyle="{StaticResource CellText}"/>
             </DataGrid.Columns>
@@ -414,7 +415,9 @@
             <Button x:Name="BtnClearFavoriteSearch" help:HelpButtonService.HelpKey="help.clear.filter" Click="ClearFavoriteSearch_Click" Content="Clear filter / 清除筛选" MinWidth="125"/>
             <TextBlock x:Name="TxtFavoriteSelectionHint" Foreground="{DynamicResource MutedTextBrush}" VerticalAlignment="Center" Margin="4,0,8,0"/>
             <Button x:Name="BtnNewFavorite" help:HelpButtonService.HelpKey="help.new.favorite" Click="NewFavorite_Click"/>
+            <Button x:Name="BtnEditFavorite" help:HelpButtonService.HelpKey="help.edit.favorite" Click="EditFavorite_Click"/>
             <Button x:Name="BtnTemplateFavorite" help:HelpButtonService.HelpKey="help.template.favorite" Content="Templates / 模板" Click="TemplateFavorite_Click"/>
+            <Button x:Name="BtnRestoreFavoritePresets" help:HelpButtonService.HelpKey="help.restore.favorite.presets" Content="Restore Presets / 恢复预设" Click="RestoreFavoritePresets_Click"/>
             <Button x:Name="BtnImportFavorite" help:HelpButtonService.HelpKey="help.import.favorite" Content="Import / 导入" Click="ImportFavorites_Click"/>
             <Button x:Name="BtnExportFavorite" help:HelpButtonService.HelpKey="help.export.favorite" Content="Export / 导出" Click="ExportFavorites_Click"/>
             <Button x:Name="BtnFavoriteColumns" help:HelpButtonService.HelpKey="help.favorite.columns" Content="Columns / 列" Click="FavoriteColumns_Click"/>
@@ -511,7 +514,6 @@
                 <Border Background="{DynamicResource PanelBackgroundBrush}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1" CornerRadius="12" Padding="16" Margin="0,0,0,12">
               <StackPanel>
                 <TextBlock Text="Network safety / 网卡操作安全" FontSize="18" FontWeight="SemiBold" Margin="0,0,0,10"/>
-                <CheckBox x:Name="AllowWifi" Margin="0,4" Checked="SettingsInput_Changed" Unchecked="SettingsInput_Changed"/>
                 <CheckBox x:Name="AllowGateway" Margin="0,4" Checked="SettingsInput_Changed" Unchecked="SettingsInput_Changed"/>
                 <CheckBox x:Name="DetectExistingDhcp" Margin="0,4" Checked="SettingsInput_Changed" Unchecked="SettingsInput_Changed"/>
                 <CheckBox x:Name="AllowRestartAnyAdapter" Margin="0,4" Checked="SettingsInput_Changed" Unchecked="SettingsInput_Changed"/>
@@ -531,8 +533,11 @@
   </DockPanel>
   <Border x:Name="BusyOverlay" Background="#AAFFFFFF" Visibility="Visible">
     <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" MinWidth="260">
-      <ProgressBar IsIndeterminate="True" Height="16"/>
-      <TextBlock x:Name="BusyText" Text="Please wait... / 请稍后..." FontSize="16" FontWeight="SemiBold" HorizontalAlignment="Center" Margin="0,12,0,0"/>
+      <ProgressBar x:Name="BusyActivityProgress" IsIndeterminate="True" Height="16" AutomationProperties.Name="Current operation / 当前操作"/>
+      <ProgressBar x:Name="BusyStageProgress" Minimum="0" Maximum="1" Value="0" Height="6" Margin="0,8,0,0" Visibility="Collapsed" AutomationProperties.Name="Operation stages / 操作阶段"/>
+      <TextBlock x:Name="BusyText" Text="Initializing... / 正在初始化..." FontSize="16" FontWeight="SemiBold" HorizontalAlignment="Center" Margin="0,12,0,0" TextWrapping="Wrap" TextAlignment="Center"/>
+      <TextBlock x:Name="BusyStageText" FontSize="12" HorizontalAlignment="Center" Margin="0,8,0,0"/>
+      <TextBlock x:Name="BusyElapsedText" FontSize="12" Foreground="Gray" HorizontalAlignment="Center" Margin="0,4,0,0"/>
       <Button x:Name="BtnCancelOperation" help:HelpButtonService.HelpKey="help.cancel.operation" Content="Cancel / 取消" Visibility="Collapsed" HorizontalAlignment="Center" Margin="0,12,0,0" Click="CancelOperation_Click"/>
     </StackPanel>
   </Border>

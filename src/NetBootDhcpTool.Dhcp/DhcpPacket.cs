@@ -20,4 +20,9 @@ public sealed class DhcpPacket
     public string Hostname { get; set; } = "";
     public DhcpMessageType MessageType { get; set; }
     public IPAddress? RequestedIp { get; set; }
+    public IPAddress? ServerIdentifier { get; set; }
+    public byte[]? ClientIdentifier { get; set; }
+    public string ClientKey => ClientIdentifier is { Length: > 0 }
+        ? "ID:" + Convert.ToHexString(ClientIdentifier)
+        : "MAC:" + MacAddress;
 }

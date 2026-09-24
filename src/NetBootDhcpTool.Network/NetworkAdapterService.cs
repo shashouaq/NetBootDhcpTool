@@ -3,6 +3,7 @@ using System.IO;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Security.Principal;
+using System.Runtime.ExceptionServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -10,13 +11,24 @@ using NetBootDhcpTool.Core;
 
 namespace NetBootDhcpTool.Network;
 
+public delegate Task<string> PowerShellScriptExecutor(string script, string summary, CancellationToken cancellationToken, bool logOutput);
+
 public sealed class NetworkAdapterService
 {
-    private readonly ILogger _logger;
+    public const int DhcpHostAdapterMetric = 9000;
 
-    public NetworkAdapterService(ILogger logger)
+    private readonly ILogger _logger;
+    private readonly PowerShellScriptExecutor? _powerShellScriptExecutor;
+    private readonly Func<TimeSpan, CancellationToken, Task> _delayAsync;
+
+    public NetworkAdapterService(
+        ILogger logger,
+        PowerShellScriptExecutor? powerShellScriptExecutor = null,
+        Func<TimeSpan, CancellationToken, Task>? delayAsync = null)
     {
         _logger = logger;
+        _powerShellScriptExecutor = powerShellScriptExecutor;
+        _delayAsync = delayAsync ?? Task.Delay;
     }
 
     public bool IsAdministrator()
@@ -69,26 +81,105 @@ public sealed class NetworkAdapterService
         return adapters;
     }
 
-    public async Task RestartAdapterAsync(NetworkAdapterInfo adapter, bool allowAnyAdapter, CancellationToken ct = default)
+    public async Task<AdapterRestartResult> RestartAdapterAsync(NetworkAdapterInfo adapter, bool allowAnyAdapter, CancellationToken ct = default, bool? expectedEnabledBefore = null)
+    {
+        EnsureControlTargetAdapter(adapter, allowAnyAdapter);
+        var originalStatus = await GetAdapterStatusAsync(adapter, ct);
+        var wasDisabled = IsAdministrativeStateDisabled(originalStatus);
+        if (expectedEnabledBefore.HasValue && expectedEnabledBefore.Value != !wasDisabled)
+            throw new InvalidOperationException("The adapter administrative state changed after its recovery snapshot was saved. No restart was attempted.");
+        var mutationAttempted = false;
+        try
+        {
+            if (wasDisabled)
+            {
+                mutationAttempted = true;
+                await SetAdapterAdministrativeStateAsync(adapter, enabled: true, ct);
+                await _delayAsync(TimeSpan.FromMilliseconds(500), ct);
+            }
+
+            ct.ThrowIfCancellationRequested();
+            mutationAttempted = true;
+            await SetAdapterAdministrativeStateAsync(adapter, enabled: false, ct);
+            await _delayAsync(TimeSpan.FromMilliseconds(750), ct);
+            ct.ThrowIfCancellationRequested();
+            await SetAdapterAdministrativeStateAsync(adapter, enabled: true, ct);
+            var finalStatus = await GetAdapterStatusAsync(adapter, ct);
+            if (IsAdministrativeStateDisabled(finalStatus))
+                throw new InvalidOperationException($"Adapter {adapter.InterfaceIndex} remains disabled after restart.");
+            return new AdapterRestartResult(wasDisabled, finalStatus);
+        }
+        catch (Exception operationError)
+        {
+            if (!mutationAttempted) throw;
+            try
+            {
+                using var compensationTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(25));
+                await SetAdapterAdministrativeStateAsync(adapter, enabled: !wasDisabled, compensationTimeout.Token);
+                var restoredStatus = await GetAdapterStatusAsync(adapter, compensationTimeout.Token);
+                var restoredDisabled = IsAdministrativeStateDisabled(restoredStatus);
+                if (restoredDisabled != wasDisabled)
+                    throw new InvalidOperationException($"Adapter administrative-state restore verification failed: expectedDisabled={wasDisabled}, actualStatus={restoredStatus}.");
+            }
+            catch (Exception compensationError)
+            {
+                _logger.Error($"Adapter restart failed and original administrative state could not be verified: idx={adapter.InterfaceIndex} name={adapter.Name}", compensationError);
+                throw new AggregateException("Adapter restart failed; restoring its previous enabled/disabled state also failed. Check the adapter state before retrying.", operationError, compensationError);
+            }
+            throw;
+        }
+    }
+
+    public async Task<bool> IsAdapterEnabledAsync(NetworkAdapterInfo adapter, CancellationToken ct = default)
+    {
+        EnsureInterfaceIndex(adapter);
+        return !IsAdministrativeStateDisabled(await GetAdapterStatusAsync(adapter, ct));
+    }
+
+    public async Task EnsureAdapterEnabledAsync(NetworkAdapterInfo adapter, bool allowAnyAdapter, CancellationToken ct = default)
     {
         EnsureControlTargetAdapter(adapter, allowAnyAdapter);
         var script = $$"""
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [Console]::OutputEncoding
 $PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
-$idx={{adapter.InterfaceIndex}}
-$netAdapter = Get-NetAdapter -InterfaceIndex $idx -ErrorAction Stop
-$wasDisabled = $netAdapter.Status -eq 'Disabled'
-if ($wasDisabled) {
-  Enable-NetAdapter -InterfaceIndex $idx -Confirm:$false -ErrorAction Stop
-  Start-Sleep -Milliseconds 500
+{{BuildAdapterLookup(adapter)}}
+if ($netAdapter.AdminStatus -ne 'Up') {
+  Enable-NetAdapter -InputObject $netAdapter -Confirm:$false -ErrorAction Stop
 }
-Disable-NetAdapter -InterfaceIndex $idx -Confirm:$false -ErrorAction Stop
-Start-Sleep -Milliseconds 750
-Enable-NetAdapter -InterfaceIndex $idx -Confirm:$false -ErrorAction Stop
-[pscustomobject]@{ InterfaceIndex = $idx; WasDisabled = [bool]$wasDisabled; Status = (Get-NetAdapter -InterfaceIndex $idx -ErrorAction SilentlyContinue).Status } | ConvertTo-Json -Compress
+$finalAdapter = Get-NetAdapter -InterfaceIndex $idx -ErrorAction Stop
+if ($finalAdapter.AdminStatus -ne 'Up') { throw "Adapter $idx remains administratively disabled after cleanup." }
+[pscustomobject]@{ InterfaceIndex = $idx; AdminStatus = $finalAdapter.AdminStatus } | ConvertTo-Json -Compress
 """;
-        await RunPowerShellAsync(script, $"PowerShell action restart adapter idx={adapter.InterfaceIndex} name={adapter.Name}", ct);
+        await RunPowerShellAsync(script, $"PowerShell cleanup ensure adapter enabled idx={adapter.InterfaceIndex} name={adapter.Name}", ct);
+    }
+
+    private async Task<string> GetAdapterStatusAsync(NetworkAdapterInfo adapter, CancellationToken ct)
+    {
+        var script = "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8" + Environment.NewLine
+            + "$OutputEncoding = [Console]::OutputEncoding" + Environment.NewLine
+            + BuildAdapterLookup(adapter) + Environment.NewLine
+            + "[string]$netAdapter.AdminStatus";
+        var status = (await RunPowerShellOutputAsync(script, $"PowerShell read adapter administrative status idx={adapter.InterfaceIndex}", ct, false)).Trim();
+        if (string.IsNullOrWhiteSpace(status)) throw new InvalidDataException("PowerShell returned no adapter status.");
+        return status;
+    }
+
+    private Task SetAdapterAdministrativeStateAsync(NetworkAdapterInfo adapter, bool enabled, CancellationToken ct)
+    {
+        var targetAdminStatus = enabled ? "Up" : "Down";
+        var transition = enabled
+            ? "if ($netAdapter.AdminStatus -ne 'Up') { Enable-NetAdapter -InputObject $netAdapter -Confirm:$false -ErrorAction Stop }"
+            : "if ($netAdapter.AdminStatus -ne 'Down') { Disable-NetAdapter -InputObject $netAdapter -Confirm:$false -ErrorAction Stop }";
+        var script = "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8" + Environment.NewLine
+            + "$OutputEncoding = [Console]::OutputEncoding" + Environment.NewLine
+            + BuildAdapterLookup(adapter) + Environment.NewLine
+            + transition + Environment.NewLine
+            + "$finalAdapter = Get-NetAdapter -InterfaceIndex $idx -ErrorAction Stop" + Environment.NewLine
+            + $"if ($finalAdapter.AdminStatus -ne '{targetAdminStatus}') {{ throw \"Adapter $idx administrative state did not become {targetAdminStatus}; current state is $($finalAdapter.AdminStatus).\" }}" + Environment.NewLine
+            + "[string]$finalAdapter.AdminStatus";
+        var action = enabled ? "enabled" : "disabled";
+        return RunPowerShellAsync(script, $"PowerShell set adapter administrative state {action} idx={adapter.InterfaceIndex}", ct);
     }
 
     public async Task ChangeMacAddressAsync(NetworkAdapterInfo adapter, string macAddress, bool allowAnyAdapter, CancellationToken ct = default)
@@ -99,9 +190,8 @@ Enable-NetAdapter -InterfaceIndex $idx -Confirm:$false -ErrorAction Stop
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [Console]::OutputEncoding
 $PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
-$idx={{adapter.InterfaceIndex}}
 $mac={{PsQuote(normalized)}}
-$netAdapter = Get-NetAdapter -InterfaceIndex $idx -ErrorAction Stop
+{{BuildAdapterLookup(adapter)}}
 $netAdapter | Set-NetAdapter -MacAddress $mac -Confirm:$false -ErrorAction Stop
 Start-Sleep -Milliseconds 500
 [pscustomobject]@{ InterfaceIndex = $idx; RequestedMac = $mac; CurrentMac = (Get-NetAdapter -InterfaceIndex $idx -ErrorAction Stop).MacAddress } | ConvertTo-Json -Compress
@@ -146,16 +236,112 @@ Start-Sleep -Milliseconds 500
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [Console]::OutputEncoding
 $PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
-$idx={{adapter.InterfaceIndex}}
-Set-NetIPInterface -InterfaceIndex $idx -Dhcp Disabled -ErrorAction SilentlyContinue
-Get-NetIPAddress -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
-Get-NetRoute -InterfaceIndex $idx -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
+{{BuildAdapterLookup(adapter)}}
+Set-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -Dhcp Disabled -ErrorAction Stop
+foreach ($address in @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop | Where-Object { [int]$_.InterfaceIndex -eq $idx })) {
+  $address | Remove-NetIPAddress -Confirm:$false -ErrorAction Stop
+}
+foreach ($route in @(Get-NetRoute -AddressFamily IPv4 -ErrorAction Stop | Where-Object { [int]$_.InterfaceIndex -eq $idx -and [string]$_.DestinationPrefix -eq '0.0.0.0/0' })) {
+  $route | Remove-NetRoute -Confirm:$false -ErrorAction Stop
+}
 New-NetIPAddress -InterfaceIndex $idx -IPAddress {{PsQuote(parsedIp)}} -PrefixLength {{prefix}} -ErrorAction Stop | Out-Null
-Set-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -AutomaticMetric Disabled -InterfaceMetric 9000 -ErrorAction Stop
-Set-DnsClientServerAddress -InterfaceIndex $idx -ResetServerAddresses -ErrorAction SilentlyContinue
+Set-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -AutomaticMetric Disabled -InterfaceMetric {{DhcpHostAdapterMetric}} -ErrorAction Stop
+Set-DnsClientServerAddress -InterfaceIndex $idx -ResetServerAddresses -ErrorAction Stop
 'OK'
 """;
         await RunPowerShellAsync(script, "PowerShell action apply target adapter static IPv4", ct);
+    }
+
+    public async Task RunWithIPv4RecoveryAsync(
+        NetworkAdapterInfo adapter,
+        AdapterIpv4Snapshot originalSnapshot,
+        Func<CancellationToken, Task> operation,
+        string operationName,
+        CancellationToken operationToken,
+        Action? onRestored = null)
+    {
+        ArgumentNullException.ThrowIfNull(adapter);
+        ArgumentNullException.ThrowIfNull(originalSnapshot);
+        ArgumentNullException.ThrowIfNull(operation);
+        if (string.IsNullOrWhiteSpace(adapter.Id)) throw new InvalidOperationException("A stable adapter ID is required before a recoverable IPv4 change.");
+        originalSnapshot.NormalizeLegacyFields();
+        if (originalSnapshot.DnsMode == AdapterDnsMode.Unknown || !originalSnapshot.AdapterEnabled.HasValue)
+            throw new InvalidDataException("The original adapter snapshot is incomplete; no IPv4 change was attempted.");
+
+        try
+        {
+            // Mark the operation as potentially mutating before entering the system command.
+            // A PowerShell command can change Windows state and then fail before returning.
+            await operation(operationToken);
+        }
+        catch (Exception operationError)
+        {
+            try
+            {
+                using var compensation = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+                await RestoreIPv4ConfigAsync(adapter, originalSnapshot, compensation.Token);
+                var restored = await CaptureIPv4ConfigAsync(adapter, compensation.Token);
+                if (!AdapterIpv4SnapshotComparer.Equivalent(originalSnapshot, restored))
+                    throw new InvalidOperationException("IPv4 compensation readback did not match the saved adapter snapshot.");
+                onRestored?.Invoke();
+                _logger.Warn($"{operationName} failed after its write attempt; the original adapter snapshot was restored and verified");
+            }
+            catch (Exception compensationError)
+            {
+                _logger.Error($"{operationName} failed and IPv4 compensation could not be verified; recovery data must remain pending", compensationError);
+                throw new AggregateException($"{operationName} failed and compensation also failed. The saved recovery record must be retained.", operationError, compensationError);
+            }
+
+            ExceptionDispatchInfo.Capture(operationError).Throw();
+            throw;
+        }
+    }
+
+    public async Task RunWithMacRecoveryAsync(
+        NetworkAdapterInfo adapter,
+        string originalMacAddress,
+        Func<CancellationToken, Task> operation,
+        Func<string, CancellationToken, Task> verifyRestored,
+        string operationName,
+        CancellationToken operationToken,
+        Action? onRestored = null,
+        Action<Exception>? onRecoveryRequired = null)
+    {
+        ArgumentNullException.ThrowIfNull(adapter);
+        ArgumentNullException.ThrowIfNull(operation);
+        ArgumentNullException.ThrowIfNull(verifyRestored);
+        if (string.IsNullOrWhiteSpace(adapter.Id)) throw new InvalidOperationException("A stable adapter ID is required before a recoverable MAC change.");
+        var normalizedOriginal = NormalizeMacAddress(originalMacAddress);
+
+        try
+        {
+            // A failed PowerShell response can follow a successful Set-NetAdapter write.
+            await operation(operationToken);
+        }
+        catch (Exception operationError)
+        {
+            try
+            {
+                using var compensation = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+                await RestoreMacAddressAsync(adapter, normalizedOriginal, compensation.Token);
+                await verifyRestored(normalizedOriginal, compensation.Token);
+                onRestored?.Invoke();
+                _logger.Warn($"{operationName} failed after its write attempt; the original MAC was restored and verified");
+            }
+            catch (Exception compensationError)
+            {
+                try { onRecoveryRequired?.Invoke(compensationError); }
+                catch (Exception recordError)
+                {
+                    compensationError = new AggregateException("MAC restoration failed and its recovery record could not be updated.", compensationError, recordError);
+                }
+                _logger.Error($"{operationName} failed and MAC compensation could not be verified; recovery data must remain pending", compensationError);
+                throw new AggregateException($"{operationName} failed and MAC compensation also failed. The saved recovery record must be retained.", operationError, compensationError);
+            }
+
+            ExceptionDispatchInfo.Capture(operationError).Throw();
+            throw;
+        }
     }
 
     public async Task RestoreDhcpAsync(NetworkAdapterInfo adapter, CancellationToken ct = default)
@@ -165,10 +351,10 @@ Set-DnsClientServerAddress -InterfaceIndex $idx -ResetServerAddresses -ErrorActi
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [Console]::OutputEncoding
 $PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
-$idx={{adapter.InterfaceIndex}}
-Set-NetIPInterface -InterfaceIndex $idx -Dhcp Enabled -ErrorAction Stop
-Set-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -AutomaticMetric Enabled -ErrorAction SilentlyContinue
-Set-DnsClientServerAddress -InterfaceIndex $idx -ResetServerAddresses -ErrorAction SilentlyContinue
+{{BuildAdapterLookup(adapter)}}
+Set-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -Dhcp Enabled -ErrorAction Stop
+Set-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -AutomaticMetric Enabled -ErrorAction Stop
+Set-DnsClientServerAddress -InterfaceIndex $idx -ResetServerAddresses -ErrorAction Stop
 'OK'
 """;
         await RunPowerShellAsync(script, "PowerShell action restore target adapter DHCP", ct);
@@ -181,15 +367,22 @@ Set-DnsClientServerAddress -InterfaceIndex $idx -ResetServerAddresses -ErrorActi
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [Console]::OutputEncoding
 $PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
-$idx={{adapter.InterfaceIndex}}
+{{BuildAdapterLookup(adapter)}}
 $ipif = Get-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction Stop
-$ips = @(Get-NetIPAddress -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -notlike '169.254.*' } | Sort-Object SkipAsSource,IPAddress | ForEach-Object {
-  [pscustomobject]@{ IpAddress = $_.IPAddress; PrefixLength = [int]$_.PrefixLength }
+$ips = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop | Where-Object { [int]$_.InterfaceIndex -eq $idx -and $_.IPAddress -notlike '169.254.*' } | Sort-Object SkipAsSource,IPAddress | ForEach-Object {
+  [pscustomobject]@{ IpAddress = $_.IPAddress; PrefixLength = [int]$_.PrefixLength; SkipAsSource = [bool]$_.SkipAsSource }
 })
-$routes = @(Get-NetRoute -InterfaceIndex $idx -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Sort-Object RouteMetric,NextHop | ForEach-Object {
-  [pscustomobject]@{ DestinationPrefix = $_.DestinationPrefix; NextHop = $_.NextHop; RouteMetric = [int]$_.RouteMetric; PolicyStore = [string]$_.PolicyStore }
+$routes = @(Get-NetRoute -AddressFamily IPv4 -ErrorAction Stop | Where-Object { [int]$_.InterfaceIndex -eq $idx -and [string]$_.DestinationPrefix -eq '0.0.0.0/0' } | Sort-Object RouteMetric,NextHop | ForEach-Object {
+  [pscustomobject]@{ DestinationPrefix = $_.DestinationPrefix; NextHop = $_.NextHop; RouteMetric = [int]$_.RouteMetric; PolicyStore = [string]$_.PolicyStore; Protocol = [string]$_.Protocol }
 })
-$dns = @(Get-DnsClientServerAddress -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses
+$dns = @(Get-DnsClientServerAddress -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction Stop).ServerAddresses
+$dnsMode = 0
+try {
+  $adapterGuid = [guid]$netAdapter.InterfaceGuid
+  $tcpipKey = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\' + $adapterGuid.ToString('B')
+  $nameServer = (Get-ItemProperty -LiteralPath $tcpipKey -ErrorAction Stop).NameServer
+  $dnsMode = if ([string]::IsNullOrWhiteSpace([string]$nameServer)) { 1 } else { 2 }
+} catch { $dnsMode = 0 }
 [pscustomobject]@{
   DhcpEnabled = ($ipif.Dhcp -eq 'Enabled')
   Addresses = [object[]]$ips
@@ -198,6 +391,8 @@ $dns = @(Get-DnsClientServerAddress -InterfaceIndex $idx -AddressFamily IPv4 -Er
   PrefixLength = if ($ips.Count -gt 0) { [int]$ips[0].PrefixLength } else { 24 }
   Gateway = if ($routes.Count -gt 0) { $routes[0].NextHop } else { '' }
   Dns = @($dns)
+  DnsMode = [int]$dnsMode
+  AdapterEnabled = [bool]($netAdapter.AdminStatus -eq 'Up')
   AutomaticMetric = [bool]$ipif.AutomaticMetric
   InterfaceMetric = [int]$ipif.InterfaceMetric
 } | ConvertTo-Json -Compress -Depth 5
@@ -213,13 +408,14 @@ $dns = @(Get-DnsClientServerAddress -InterfaceIndex $idx -AddressFamily IPv4 -Er
     {
         EnsureAllowedTargetAdapter(adapter);
         snapshot.NormalizeLegacyFields();
-        var restoreDnsCommand = snapshot.Dns.Count == 0
-            ? "Set-DnsClientServerAddress -InterfaceIndex $idx -ResetServerAddresses -ErrorAction Stop"
-            : "Set-DnsClientServerAddress -InterfaceIndex $idx -ServerAddresses @("
-              + string.Join(",", snapshot.Dns.Where(x => IPAddress.TryParse(x, out var dns) && dns.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork).Select(PsQuote))
-              + ") -ErrorAction Stop";
-        if (snapshot.DhcpEnabled || snapshot.Addresses.Count == 0)
+        var restoreDnsCommand = BuildRestoreDnsCommand(snapshot);
+        var restoreAdminCommand = BuildRestoreAdministrativeStateCommand(snapshot.AdapterEnabled);
+        var staticRoutes = GetRoutesToRestore(snapshot);
+        var routeCommands = string.Join(Environment.NewLine, staticRoutes.Select(BuildRouteRestoreCommand));
+        if (snapshot.DhcpEnabled)
         {
+            if (snapshot.Routes.Any(x => string.IsNullOrWhiteSpace(x.Protocol)))
+                throw new InvalidDataException("This older adapter backup does not identify which default routes were assigned by DHCP. It was preserved; use a fresh snapshot before retrying.");
             var metricScript = snapshot.AutomaticMetric
                 ? "Set-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -AutomaticMetric Enabled -ErrorAction Stop"
                 : $"Set-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -AutomaticMetric Disabled -InterfaceMetric {Math.Max(1, snapshot.InterfaceMetric)} -ErrorAction Stop";
@@ -227,12 +423,19 @@ $dns = @(Get-DnsClientServerAddress -InterfaceIndex $idx -AddressFamily IPv4 -Er
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [Console]::OutputEncoding
 $PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
-$idx={{adapter.InterfaceIndex}}
-Set-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -Dhcp Disabled -ErrorAction SilentlyContinue
-Get-NetIPAddress -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
+{{BuildAdapterLookup(adapter)}}
+Set-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -Dhcp Disabled -ErrorAction Stop
+foreach ($address in @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop | Where-Object { [int]$_.InterfaceIndex -eq $idx })) {
+  $address | Remove-NetIPAddress -Confirm:$false -ErrorAction Stop
+}
+foreach ($route in @(Get-NetRoute -AddressFamily IPv4 -ErrorAction Stop | Where-Object { [int]$_.InterfaceIndex -eq $idx -and [string]$_.DestinationPrefix -eq '0.0.0.0/0' })) {
+  $route | Remove-NetRoute -Confirm:$false -ErrorAction Stop
+}
 Set-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -Dhcp Enabled -ErrorAction Stop
 {{metricScript}}
 {{restoreDnsCommand}}
+{{routeCommands}}
+{{restoreAdminCommand}}
 'OK'
 """;
             await RunPowerShellAsync(dhcpScript, "PowerShell action restore target adapter original DHCP", ct);
@@ -243,20 +446,25 @@ Set-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -Dhcp Enabled -Error
             ? "Set-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -AutomaticMetric Enabled -ErrorAction Stop"
             : $"Set-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -AutomaticMetric Disabled -InterfaceMetric {Math.Max(1, snapshot.InterfaceMetric)} -ErrorAction Stop";
         var addressCommands = string.Join(Environment.NewLine, snapshot.Addresses.Select(address =>
-            $"New-NetIPAddress -InterfaceIndex $idx -IPAddress {PsQuote(address.IpAddress)} -PrefixLength {ValidatePrefix(address.PrefixLength)} -ErrorAction Stop | Out-Null"));
-        var routeCommands = string.Join(Environment.NewLine, snapshot.Routes.Select(BuildRouteRestoreCommand));
+            $"New-NetIPAddress -InterfaceIndex $idx -IPAddress {PsQuote(address.IpAddress)} -PrefixLength {ValidatePrefix(address.PrefixLength)} -SkipAsSource ${address.SkipAsSource.ToString().ToLowerInvariant()} -ErrorAction Stop | Out-Null"));
+        var staticRouteCommands = string.Join(Environment.NewLine, snapshot.Routes.Select(BuildRouteRestoreCommand));
         var script = $$"""
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [Console]::OutputEncoding
 $PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
-$idx={{adapter.InterfaceIndex}}
-Set-NetIPInterface -InterfaceIndex $idx -Dhcp Disabled -ErrorAction SilentlyContinue
-Get-NetIPAddress -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
-Get-NetRoute -InterfaceIndex $idx -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
+{{BuildAdapterLookup(adapter)}}
+Set-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -Dhcp Disabled -ErrorAction Stop
+foreach ($address in @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop | Where-Object { [int]$_.InterfaceIndex -eq $idx })) {
+  $address | Remove-NetIPAddress -Confirm:$false -ErrorAction Stop
+}
+foreach ($route in @(Get-NetRoute -AddressFamily IPv4 -ErrorAction Stop | Where-Object { [int]$_.InterfaceIndex -eq $idx -and [string]$_.DestinationPrefix -eq '0.0.0.0/0' })) {
+  $route | Remove-NetRoute -Confirm:$false -ErrorAction Stop
+}
 {{addressCommands}}
-{{routeCommands}}
+{{staticRouteCommands}}
 {{metricRestore}}
 {{restoreDnsCommand}}
+{{restoreAdminCommand}}
 'OK'
 """;
         await RunPowerShellAsync(script, "PowerShell action restore target adapter original static IPv4", ct);
@@ -269,49 +477,157 @@ Get-NetRoute -InterfaceIndex $idx -AddressFamily IPv4 -DestinationPrefix '0.0.0.
         return state;
     }
 
-    public async Task<DhcpFirewallRuleLease> EnsureDhcpFirewallRulesAsync(CancellationToken ct = default)
+    public Task<DhcpFirewallRuleLease> EnsureDhcpFirewallRulesAsync(string interfaceAlias, CancellationToken ct = default) =>
+        EnsureDhcpFirewallRulesAsync(interfaceAlias, null, ct);
+
+    public async Task<DhcpFirewallRuleLease> EnsureDhcpFirewallRulesAsync(
+        string interfaceAlias,
+        Action<DhcpFirewallRuleLease>? onLeaseChanged,
+        CancellationToken ct = default)
     {
+        if (string.IsNullOrWhiteSpace(interfaceAlias)) throw new ArgumentException("A selected adapter alias is required to scope the DHCP firewall rules.", nameof(interfaceAlias));
         var programPath = Environment.ProcessPath ?? Process.GetCurrentProcess().MainModule?.FileName ?? "";
-        var programPart = string.IsNullOrWhiteSpace(programPath) ? "" : $" -Program {PsQuote(programPath)}";
-        var script = """
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-$OutputEncoding = [Console]::OutputEncoding
-$PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
-$inName='NetBoot DHCP Tool DHCP In'
-$outName='NetBoot DHCP Tool DHCP Out'
-$group='NetBootDhcpTool'
-$created=@()
-if (-not (Get-NetFirewallRule -DisplayName $inName -ErrorAction SilentlyContinue)) {
-  New-NetFirewallRule -DisplayName $inName -Group $group -Direction Inbound -Action Allow -Protocol UDP -LocalPort 67 -Profile Any__PROGRAM__ | Out-Null
-  $created += $inName
-}
-if (-not (Get-NetFirewallRule -DisplayName $outName -ErrorAction SilentlyContinue)) {
-  New-NetFirewallRule -DisplayName $outName -Group $group -Direction Outbound -Action Allow -Protocol UDP -RemotePort 68 -Profile Any__PROGRAM__ | Out-Null
-  $created += $outName
-}
-[pscustomobject]@{ CreatedRuleNames = @($created) } | ConvertTo-Json -Compress
-""".Replace("__PROGRAM__", programPart, StringComparison.Ordinal);
-        var output = await RunPowerShellOutputAsync(script, "PowerShell action ensure DHCP firewall rules", ct, false);
-        return JsonSerializer.Deserialize<DhcpFirewallRuleLease>(output, JsonStore.Options) ?? new DhcpFirewallRuleLease();
+        if (string.IsNullOrWhiteSpace(programPath)) throw new InvalidOperationException("The application path could not be determined; DHCP firewall rules were not created.");
+
+        var lease = new DhcpFirewallRuleLease
+        {
+            LeaseId = Guid.NewGuid().ToString("N"),
+            InterfaceAlias = interfaceAlias,
+            ProgramPath = Path.GetFullPath(programPath),
+            CreatedAt = DateTimeOffset.Now
+        };
+        lease.Rules.Add(CreateDhcpFirewallRuleRecord(lease, "Inbound", localPort: "67"));
+        lease.Rules.Add(CreateDhcpFirewallRuleRecord(lease, "Outbound", remotePort: "68"));
+
+        // The durable callback must succeed before the first system mutation.
+        onLeaseChanged?.Invoke(lease);
+        foreach (var rule in lease.Rules)
+        {
+            ct.ThrowIfCancellationRequested();
+            var script = BuildCreateDhcpFirewallRuleScript(rule);
+            var output = await RunPowerShellOutputAsync(script, $"PowerShell action create DHCP firewall rule {rule.Name}", ct, false);
+            var readback = JsonSerializer.Deserialize<DhcpFirewallRuleReadback>(output, JsonStore.Options)
+                ?? throw new InvalidDataException("Firewall rule readback was empty.");
+            if (!string.Equals(readback.Name, rule.Name, StringComparison.OrdinalIgnoreCase) || string.IsNullOrWhiteSpace(readback.InstanceId))
+                throw new InvalidDataException("Firewall rule readback did not prove the requested rule identity.");
+            rule.InstanceId = readback.InstanceId;
+            rule.OwnershipVerified = true;
+            rule.VerifiedAt = DateTimeOffset.Now;
+            onLeaseChanged?.Invoke(lease);
+        }
+        return lease;
     }
 
-    public Task RemoveDhcpFirewallRulesAsync(DhcpFirewallRuleLease? lease, CancellationToken ct = default)
+    public Task RemoveDhcpFirewallRulesAsync(DhcpFirewallRuleLease? lease, CancellationToken ct = default) =>
+        RemoveDhcpFirewallRulesAsync(lease, null, ct);
+
+    public async Task RemoveDhcpFirewallRulesAsync(
+        DhcpFirewallRuleLease? lease,
+        Action<DhcpFirewallRuleLease>? onLeaseChanged,
+        CancellationToken ct = default)
     {
-        if (lease == null || lease.CreatedRuleNames.Count == 0) return Task.CompletedTask;
-        var names = string.Join(",", lease.CreatedRuleNames.Distinct(StringComparer.OrdinalIgnoreCase).Select(PsQuote));
-        var script = $$"""
+        if (lease == null || lease.Rules.Count == 0) return;
+        foreach (var rule in lease.Rules.ToList())
+        {
+            ct.ThrowIfCancellationRequested();
+            var script = BuildRemoveDhcpFirewallRuleScript(rule);
+            await RunPowerShellAsync(script, $"PowerShell action remove owned DHCP firewall rule {rule.Name}", ct);
+            lease.Rules.Remove(rule);
+            onLeaseChanged?.Invoke(lease);
+        }
+    }
+
+    private static DhcpFirewallRuleRecord CreateDhcpFirewallRuleRecord(DhcpFirewallRuleLease lease, string direction, string localPort = "Any", string remotePort = "Any")
+    {
+        var ruleId = Guid.NewGuid().ToString("N");
+        var description = $"NetBootDhcpTool Owner={lease.LeaseId} Rule={ruleId}";
+        return new DhcpFirewallRuleRecord
+        {
+            Name = $"NetBootDhcpTool-{ruleId}",
+            DisplayName = $"NetBoot DHCP Tool {direction} {ruleId[..8]}",
+            Description = description,
+            Group = "NetBootDhcpTool",
+            Direction = direction,
+            Protocol = "UDP",
+            LocalPort = localPort,
+            RemotePort = remotePort,
+            InterfaceAlias = lease.InterfaceAlias,
+            ProgramPath = lease.ProgramPath,
+            LeaseId = lease.LeaseId
+        };
+    }
+
+    private static string BuildCreateDhcpFirewallRuleScript(DhcpFirewallRuleRecord rule)
+    {
+        var localPort = rule.LocalPort == "Any" ? "" : $" -LocalPort {PsQuote(rule.LocalPort)}";
+        var remotePort = rule.RemotePort == "Any" ? "" : $" -RemotePort {PsQuote(rule.RemotePort)}";
+        var expectedLocal = PsQuote(rule.LocalPort);
+        var expectedRemote = PsQuote(rule.RemotePort);
+        return $$"""
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [Console]::OutputEncoding
 $PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
-$group='NetBootDhcpTool'
-$names=@({{names}})
-foreach ($name in $names) {
-  Get-NetFirewallRule -DisplayName $name -Group $group -ErrorAction SilentlyContinue | Remove-NetFirewallRule -Confirm:$false -ErrorAction Stop
-}
+$name={{PsQuote(rule.Name)}}; $display={{PsQuote(rule.DisplayName)}}; $description={{PsQuote(rule.Description)}}
+$group={{PsQuote(rule.Group)}}; $direction={{PsQuote(rule.Direction)}}; $interface={{PsQuote(rule.InterfaceAlias)}}; $program={{PsQuote(rule.ProgramPath)}}
+$localPort={{expectedLocal}}; $remotePort={{expectedRemote}}; $owner={{PsQuote(rule.LeaseId)}}
+if (@(Get-NetFirewallRule -Name $name -ErrorAction SilentlyContinue).Count -gt 0) { throw 'Firewall rule identity collision; no existing rule was adopted.' }
+$createArgs=@{ Name=$name; DisplayName=$display; Description=$description; Group=$group; Direction=$direction; Action='Allow'; Protocol='UDP'; Profile='Any'; Program=$program; InterfaceAlias=$interface; ErrorAction='Stop' }
+if ($localPort -ne 'Any') { $createArgs.LocalPort=$localPort }
+if ($remotePort -ne 'Any') { $createArgs.RemotePort=$remotePort }
+New-NetFirewallRule @createArgs | Out-Null
+$rules=@(Get-NetFirewallRule -Name $name -ErrorAction Stop)
+if ($rules.Count -ne 1) { throw 'Firewall rule readback did not return exactly one rule.' }
+$rule=$rules[0]
+$port=@(Get-NetFirewallPortFilter -AssociatedNetFirewallRule $rule -ErrorAction Stop)
+$app=@(Get-NetFirewallApplicationFilter -AssociatedNetFirewallRule $rule -ErrorAction Stop)
+$iface=@(Get-NetFirewallInterfaceFilter -AssociatedNetFirewallRule $rule -ErrorAction Stop)
+$actualLocal=if ($port.Count -eq 1) { (@($port[0].LocalPort) -join ',') } else { '' }
+$actualRemote=if ($port.Count -eq 1) { (@($port[0].RemotePort) -join ',') } else { '' }
+$protocol=if ($port.Count -eq 1) { [string]$port[0].Protocol } else { '' }
+$actualProgram=if ($app.Count -eq 1) { [string]$app[0].Program } else { '' }
+$actualInterfaces=@()
+if ($iface.Count -eq 1) { $actualInterfaces=@($iface[0].InterfaceAlias) }
+$protocolOk=($protocol -ieq 'UDP' -or $protocol -eq '17')
+$valid=$rule.Name -ceq $name -and $rule.DisplayName -ceq $display -and $rule.Description -ceq $description -and $rule.Group -ceq $group -and
+  [string]$rule.Direction -ieq $direction -and [string]$rule.Action -ieq 'Allow' -and [bool]$rule.Enabled -and [string]$rule.Profile -ieq 'Any' -and $protocolOk -and
+  $actualLocal -ceq $localPort -and $actualRemote -ceq $remotePort -and $actualProgram -ieq $program -and
+  $actualInterfaces.Count -eq 1 -and $actualInterfaces[0] -ieq $interface
+if (-not $valid) { throw 'Firewall rule readback did not match the requested owner and scope.' }
+[pscustomobject]@{ Name=[string]$rule.Name; InstanceId=[string]$rule.InstanceID } | ConvertTo-Json -Compress
+""";
+    }
+
+    private static string BuildRemoveDhcpFirewallRuleScript(DhcpFirewallRuleRecord rule) => $$"""
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [Console]::OutputEncoding
+$PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
+$name={{PsQuote(rule.Name)}}; $display={{PsQuote(rule.DisplayName)}}; $description={{PsQuote(rule.Description)}}
+$group={{PsQuote(rule.Group)}}; $direction={{PsQuote(rule.Direction)}}; $interface={{PsQuote(rule.InterfaceAlias)}}; $program={{PsQuote(rule.ProgramPath)}}
+$localPort={{PsQuote(rule.LocalPort)}}; $remotePort={{PsQuote(rule.RemotePort)}}; $leaseId={{PsQuote(rule.LeaseId)}}; $instanceId={{PsQuote(rule.InstanceId)}}
+$rules=@(Get-NetFirewallRule -Name $name -ErrorAction SilentlyContinue)
+if ($rules.Count -eq 0) { 'OK'; exit 0 }
+if ($rules.Count -ne 1) { throw 'Firewall rule identity is ambiguous; journal retained.' }
+$rule=$rules[0]
+$port=@(Get-NetFirewallPortFilter -AssociatedNetFirewallRule $rule -ErrorAction Stop)
+$app=@(Get-NetFirewallApplicationFilter -AssociatedNetFirewallRule $rule -ErrorAction Stop)
+$iface=@(Get-NetFirewallInterfaceFilter -AssociatedNetFirewallRule $rule -ErrorAction Stop)
+$actualLocal=if ($port.Count -eq 1) { (@($port[0].LocalPort) -join ',') } else { '' }
+$actualRemote=if ($port.Count -eq 1) { (@($port[0].RemotePort) -join ',') } else { '' }
+$protocol=if ($port.Count -eq 1) { [string]$port[0].Protocol } else { '' }
+$actualProgram=if ($app.Count -eq 1) { [string]$app[0].Program } else { '' }
+$actualInterfaces=@()
+if ($iface.Count -eq 1) { $actualInterfaces=@($iface[0].InterfaceAlias) }
+$protocolOk=($protocol -ieq 'UDP' -or $protocol -eq '17')
+$identityOk=($rule.Name -ceq $name -and $rule.DisplayName -ceq $display -and $rule.Description -ceq $description -and $rule.Description -match [regex]::Escape("Owner=$leaseId") -and $rule.Group -ceq $group)
+$instanceOk=([string]::IsNullOrWhiteSpace($instanceId) -or [string]$rule.InstanceID -ieq $instanceId)
+$valid=$identityOk -and $instanceOk -and [string]$rule.Direction -ieq $direction -and [string]$rule.Action -ieq 'Allow' -and [bool]$rule.Enabled -and [string]$rule.Profile -ieq 'Any' -and $protocolOk -and
+  $actualLocal -ceq $localPort -and $actualRemote -ceq $remotePort -and $actualProgram -ieq $program -and
+  $actualInterfaces.Count -eq 1 -and $actualInterfaces[0] -ieq $interface
+if (-not $valid) { throw 'Firewall rule ownership or attributes changed; journal retained.' }
+$rule | Remove-NetFirewallRule -Confirm:$false -ErrorAction Stop
+if (@(Get-NetFirewallRule -Name $name -ErrorAction SilentlyContinue).Count -gt 0) { throw 'Firewall rule still exists after removal; journal retained.' }
 'OK'
 """;
-        return RunPowerShellAsync(script, "PowerShell action remove DHCP firewall rules", ct);
-    }
 
     private async Task<WlanReadonlyState> GetReadonlyWlanStateAsync(CancellationToken ct)
     {
@@ -357,6 +673,13 @@ $policyEvent = Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-WLAN-A
     private async Task<string> RunPowerShellOutputAsync(string script, string summary, CancellationToken ct, bool logOutput)
     {
         _logger.Info(summary);
+        if (_powerShellScriptExecutor is not null)
+        {
+            var testOutput = await _powerShellScriptExecutor(script, summary, ct, logOutput);
+            if (logOutput) _logger.Info($"{summary} result: exit=0 detail={SummarizePowerShellMessage(testOutput.Trim())}");
+            return testOutput;
+        }
+
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeoutCts.CancelAfter(TimeSpan.FromSeconds(30));
         var operationToken = timeoutCts.Token;
@@ -375,8 +698,7 @@ $policyEvent = Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-WLAN-A
         process.Start();
         try
         {
-            var output = await process.StandardOutput.ReadToEndAsync(operationToken);
-            var error = await process.StandardError.ReadToEndAsync(operationToken);
+            var (output, error) = await PowerShellProcessOutput.ReadStandardStreamsAsync(process, operationToken);
             await process.WaitForExitAsync(operationToken);
 
             var trimmedOutput = output.Trim();
@@ -452,6 +774,49 @@ $policyEvent = Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-WLAN-A
         if (!int.TryParse(adapter.InterfaceIndex, out var index) || index <= 0)
             throw new InvalidOperationException("InterfaceIndex is invalid");
     }
+
+    private static string BuildAdapterLookup(NetworkAdapterInfo adapter)
+    {
+        EnsureInterfaceIndex(adapter);
+        if (!Guid.TryParse(adapter.Id, out var adapterGuid))
+            throw new InvalidOperationException("A stable adapter identity is required before modifying or restoring this adapter.");
+        return $"$idx={int.Parse(adapter.InterfaceIndex, System.Globalization.CultureInfo.InvariantCulture)}{Environment.NewLine}"
+            + $"$expectedGuid=[guid]{PsQuote(adapterGuid.ToString("B"))}{Environment.NewLine}"
+            + "$netAdapter = Get-NetAdapter -InterfaceIndex $idx -ErrorAction Stop" + Environment.NewLine
+            + "if ([guid]$netAdapter.InterfaceGuid -ne $expectedGuid) { throw \"The interface index now belongs to a different adapter.\" }";
+    }
+
+    private static string BuildRestoreDnsCommand(AdapterIpv4Snapshot snapshot)
+    {
+        return snapshot.DnsMode switch
+        {
+            AdapterDnsMode.Automatic => "Set-DnsClientServerAddress -InterfaceIndex $idx -ResetServerAddresses -ErrorAction Stop",
+            AdapterDnsMode.Static when snapshot.Dns.Count > 0 && snapshot.Dns.All(IsValidIpv4) =>
+                "Set-DnsClientServerAddress -InterfaceIndex $idx -ServerAddresses @("
+                + string.Join(",", snapshot.Dns.Select(PsQuote)) + ") -ErrorAction Stop",
+            AdapterDnsMode.Static => throw new InvalidDataException("The saved manual DNS configuration is empty or invalid; the backup was preserved and no changes were made."),
+            _ => throw new InvalidDataException("This older adapter backup does not record whether DNS was automatic or manual. It was preserved and cannot be restored safely.")
+        };
+    }
+
+    private static bool IsValidIpv4(string value) =>
+        IPAddress.TryParse(value, out var ip) && ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork;
+
+    private static IReadOnlyList<AdapterRouteSnapshot> GetRoutesToRestore(AdapterIpv4Snapshot snapshot) =>
+        snapshot.DhcpEnabled
+            ? snapshot.Routes.Where(x => !x.Protocol.Equals("Dhcp", StringComparison.OrdinalIgnoreCase)).ToArray()
+            : snapshot.Routes;
+
+    private static string BuildRestoreAdministrativeStateCommand(bool? enabled) => enabled switch
+    {
+        true => "$currentAdapter = Get-NetAdapter -InterfaceIndex $idx -ErrorAction Stop; if ($currentAdapter.AdminStatus -ne 'Up') { Enable-NetAdapter -InputObject $currentAdapter -Confirm:$false -ErrorAction Stop }; $restoredAdapter = Get-NetAdapter -InterfaceIndex $idx -ErrorAction Stop; if ($restoredAdapter.AdminStatus -ne 'Up') { throw \"Adapter $idx was not restored to administrative state Up.\" }",
+        false => "$currentAdapter = Get-NetAdapter -InterfaceIndex $idx -ErrorAction Stop; if ($currentAdapter.AdminStatus -ne 'Down') { Disable-NetAdapter -InputObject $currentAdapter -Confirm:$false -ErrorAction Stop }; $restoredAdapter = Get-NetAdapter -InterfaceIndex $idx -ErrorAction Stop; if ($restoredAdapter.AdminStatus -ne 'Down') { throw \"Adapter $idx was not restored to administrative state Down.\" }",
+        null => ""
+    };
+
+    private static bool IsAdministrativeStateDisabled(string status) =>
+        status.Equals("Down", StringComparison.OrdinalIgnoreCase)
+        || status.Equals("Disabled", StringComparison.OrdinalIgnoreCase);
 
     private IPv4InterfaceProperties? TryGetIPv4Properties(IPInterfaceProperties props, string adapterName)
     {
@@ -564,11 +929,16 @@ public sealed class AdapterIpv4Snapshot
     public int PrefixLength { get; set; } = 24;
     public string Gateway { get; set; } = "";
     public List<string> Dns { get; set; } = [];
+    public AdapterDnsMode DnsMode { get; set; }
+    public bool? AdapterEnabled { get; set; }
     public bool AutomaticMetric { get; set; } = true;
     public int InterfaceMetric { get; set; } = 0;
 
     public void NormalizeLegacyFields()
     {
+        Addresses ??= [];
+        Routes ??= [];
+        Dns ??= [];
         if (Addresses.Count == 0 && !string.IsNullOrWhiteSpace(IpAddress))
         {
             Addresses.Add(new AdapterIpv4AddressSnapshot { IpAddress = IpAddress, PrefixLength = PrefixLength });
@@ -596,9 +966,39 @@ public sealed class AdapterIpv4Snapshot
     }
 }
 
+public sealed record AdapterRestartResult(bool WasDisabledBefore, string FinalStatus);
+
 public sealed class DhcpFirewallRuleLease
 {
-    public List<string> CreatedRuleNames { get; set; } = [];
+    public string LeaseId { get; set; } = "";
+    public string InterfaceAlias { get; set; } = "";
+    public string ProgramPath { get; set; } = "";
+    public DateTimeOffset CreatedAt { get; set; }
+    public List<DhcpFirewallRuleRecord> Rules { get; set; } = [];
+}
+
+public sealed class DhcpFirewallRuleRecord
+{
+    public string Name { get; set; } = "";
+    public string DisplayName { get; set; } = "";
+    public string Description { get; set; } = "";
+    public string Group { get; set; } = "";
+    public string Direction { get; set; } = "";
+    public string Protocol { get; set; } = "UDP";
+    public string LocalPort { get; set; } = "Any";
+    public string RemotePort { get; set; } = "Any";
+    public string InterfaceAlias { get; set; } = "";
+    public string ProgramPath { get; set; } = "";
+    public string LeaseId { get; set; } = "";
+    public string InstanceId { get; set; } = "";
+    public bool OwnershipVerified { get; set; }
+    public DateTimeOffset? VerifiedAt { get; set; }
+}
+
+public sealed class DhcpFirewallRuleReadback
+{
+    public string Name { get; set; } = "";
+    public string InstanceId { get; set; } = "";
 }
 
 public sealed class WlanReadonlyState

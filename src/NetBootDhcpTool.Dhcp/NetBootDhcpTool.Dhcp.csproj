@@ -7,4 +7,7 @@
   <ItemGroup>
     <ProjectReference Include="..\NetBootDhcpTool.Core\NetBootDhcpTool.Core.csproj" />
   </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="NetBootDhcpTool.UnitTests" />
+  </ItemGroup>
 </Project>

@@ -2,49 +2,48 @@ namespace NetBootDhcpTool.Core;
 
 public static class Defaults
 {
-    public static void EnsureFiles(AppPaths paths)
+    public static void EnsureFiles(AppPaths paths, ILogger? logger = null)
     {
         paths.Ensure();
-        if (!File.Exists(paths.SettingsFile)) JsonStore.Save(paths.SettingsFile, new AppSettings());
-        if (!File.Exists(paths.ProfilesFile)) JsonStore.Save(paths.ProfilesFile, new List<NetworkProfile>());
-        if (!File.Exists(paths.FavoritesFile))
-        {
-            FavoriteStore.Save(paths.FavoritesFile, DefaultFavorites());
-        }
-        else
-        {
-            var existing = FavoriteStore.Load(paths.FavoritesFile, migrateLegacy: true);
-            var defaults = DefaultFavorites();
-            var changed = false;
-            foreach (var preset in defaults)
-            {
-                var current = existing.FirstOrDefault(x => x.Id.Equals(preset.Id, StringComparison.OrdinalIgnoreCase));
-                if (current == null)
-                {
-                    existing.Add(preset);
-                    changed = true;
-                    continue;
-                }
+        InitializeIfMissing(paths.SettingsFile, new AppSettings(), logger);
+        InitializeIfMissing(paths.ProfilesFile, new List<NetworkProfile>(), logger);
 
-                // Upgrade the shipped BMC templates once, without overwriting a
-                // user's separately-created favorite with the same display name.
-                if (current.RemarkName.Equals("BMC preset", StringComparison.OrdinalIgnoreCase))
-                {
-                    current.IsPublicDefault = true;
-                    current.Password = preset.Password;
-                    current.PublicPassword = preset.Password;
-                    current.Description = preset.Description;
-                    current.MemoryText = preset.MemoryText;
-                    current.CustomFields = preset.CustomFields;
-                    changed = true;
-                }
+        var presetState = FavoritePresetStore.Load(paths.FavoritePresetStateFile, logger);
+        var favoriteLoad = FavoriteStore.LoadWithStatus(paths.FavoritesFile, logger, migrateLegacy: true);
+        if (favoriteLoad.Status == DataLoadStatus.Failed)
+        {
+            logger?.Warn($"Favorite defaults were not added because both data sources are unreadable: {paths.FavoritesFile}");
+        }
+        else if (!presetState.IsWritable)
+        {
+            logger?.Warn($"Favorite presets were not initialized because deletion state is unreadable: {paths.FavoritePresetStateFile}");
+        }
+        else if (favoriteLoad.MigrationError is not null)
+        {
+            logger?.Warn("Favorite preset updates were skipped because credential migration did not persist");
+        }
+        else if (favoriteLoad.Status != DataLoadStatus.RestoredFromBackup)
+        {
+            var existing = favoriteLoad.HasData ? favoriteLoad.Favorites : [];
+            var changed = FavoritePresetStore.AddMissingPresets(existing, DefaultFavorites(), presetState.State);
+            if (favoriteLoad.Status == DataLoadStatus.Missing || changed)
+            {
+                try { FavoriteStore.Save(paths.FavoritesFile, existing, logger); }
+                catch (Exception ex) { logger?.Error($"Initialize favorite defaults failed: {paths.FavoritesFile}", ex); }
             }
-            if (existing.Count == 0 || changed) FavoriteStore.Save(paths.FavoritesFile, existing);
         }
         var zh = Path.Combine(paths.I18nDirectory, "zh-CN.json");
         var en = Path.Combine(paths.I18nDirectory, "en-US.json");
         if (!File.Exists(zh)) JsonStore.Save(zh, Zh());
         if (!File.Exists(en)) JsonStore.Save(en, En());
+    }
+
+    private static void InitializeIfMissing<T>(string path, T value, ILogger? logger)
+    {
+        var load = JsonStore.Load<T>(path, logger);
+        if (load.Status != DataLoadStatus.Missing) return;
+        try { JsonStore.Save(path, value); }
+        catch (Exception ex) { logger?.Error($"Initialize default JSON failed: {path}", ex); }
     }
 
     public static Dictionary<string, string> Zh() => new()
@@ -68,6 +67,7 @@ public static class Defaults
         ["new.version"] = "有新版本！",
         ["latest.version"] = "已是最新版本",
         ["update.failed"] = "检查更新失败",
+        ["update.download.canceled"] = "更新下载已取消",
         ["adapter"] = "网卡",
         ["current.ip"] = "上次/当前 IP",
         ["mac"] = "MAC",
@@ -103,7 +103,9 @@ public static class Defaults
         ["restore.scan"] = "恢复网卡",
         ["add.favorite"] = "加入收藏",
         ["new.favorite"] = "手动新增",
+        ["edit.favorite"] = "编辑",
         ["template.favorite"] = "模板",
+        ["restore.favorite.presets"] = "恢复预设",
         ["import.favorite"] = "导入",
         ["export.favorite"] = "导出",
         ["favorite.columns"] = "列",
@@ -135,7 +137,6 @@ public static class Defaults
         ["existing.dhcp"] = "检测到当前网络已有 DHCP 服务",
         ["blocked.virtual"] = "默认禁止在虚拟网卡启动 DHCP。",
         ["blocked.disconnected"] = "当前网卡未连接，不能启动 DHCP。",
-        ["allow.wifi"] = "允许在 Wi-Fi 网卡启动 DHCP",
         ["allow.gateway"] = "允许在有默认网关的网卡启动 DHCP",
         ["allow.restart.any"] = "允许重启无线、虚拟、未连接等所有网卡",
         ["allow.mac.any"] = "允许修改无线、虚拟、未连接等所有网卡 MAC",
@@ -158,11 +159,14 @@ public static class Defaults
         ["ok"] = "确定",
         ["cancel"] = "取消",
         ["help.open.history"] = "打开操作历史，查看最近一次结果和完整操作记录。",
-        ["help.recovery.center"] = "查看本次运行残留的路由、网卡回滚备份和待恢复 MAC，并按需执行恢复。",
+        ["help.recovery.center"] = "查看本次运行残留的路由、网卡回滚备份、待恢复 MAC 和 DHCP 防火墙规则，并按需执行恢复。",
         ["help.clear.filter"] = "清除当前搜索和状态筛选，恢复显示全部内容。",
         ["filter.clear"] = "清除筛选",
         ["help.favorite.details.reveal"] = "显示当前收藏详情中的密码；显示后复制会再次确认。",
-        ["recovery.banner"] = "有 {0} 项本次运行变更待处理：路由 {1} 条，MAC {2} 个。",
+        ["recovery.banner"] = "有 {0} 项变更待处理：路由 {1} 条，MAC {2} 个，防火墙规则 {3} 条。",
+        ["recovery.banner.route.journal.unreadable"] = "静态路由恢复日志无法读取；路由变更已锁定，请修复恢复日志。",
+        ["recovery.banner.firewall.journal.unreadable"] = "DHCP 防火墙恢复日志无法读取；DHCP 启动已锁定，请修复恢复日志。",
+        ["recovery.banner.journals.unreadable"] = "静态路由和 DHCP 防火墙恢复日志无法读取；请修复日志后再执行相关操作。",
         ["recovery.title"] = "恢复中心",
         ["recovery.items.summary"] = "已保存的恢复项目。选择一项查看网卡身份与保存时间，然后显式恢复。",
         ["recovery.restore.selected"] = "恢复选中项目",
@@ -176,27 +180,40 @@ public static class Defaults
         ["recovery.kind.adapter"] = "网卡配置",
         ["recovery.kind.mac"] = "MAC 地址",
         ["recovery.kind.route"] = "静态路由",
+        ["recovery.kind.firewall"] = "DHCP 防火墙规则",
         ["recovery.status.available"] = "可恢复",
         ["recovery.status.unavailable"] = "网卡不可用或身份不匹配",
+        ["recovery.status.pending"] = "路由归属待核实；不会自动删除",
+        ["recovery.status.firewall.pending"] = "规则归属待核实；清理时逐项核对",
+        ["recovery.status.firewall.active"] = "DHCP 仍在运行；停止后才能清理",
+        ["firewall.journal.unreadable"] = "DHCP 防火墙恢复日志及其备份无法读取。为避免失去系统规则清理责任，DHCP 启动和防火墙清理已锁定；请修复或恢复日志后重启工具。",
+        ["firewall.recovery.required"] = "上次会话仍有 DHCP 防火墙规则待处理。请先在恢复中心核对并清理，再启动新的 DHCP 会话。",
+        ["firewall.recovery.active"] = "DHCP 服务仍在运行或该规则属于当前会话，不能从恢复中心接管。请先正常停止 DHCP。",
         ["recovery.entry.adapter.summary"] = "{0}；IPv4 {1}/{2}；网关 {3}",
         ["recovery.entry.mac.summary"] = "原始 MAC：{0}",
         ["recovery.entry.route.summary"] = "目标 {0}；下一跳 {1}；跃点 {2}",
+        ["recovery.entry.route.pending"] = "归属待核实：目标 {0}；下一跳 {1}；跃点 {2}",
+        ["recovery.entry.firewall.summary"] = "已读回归属；{0}",
+        ["recovery.entry.firewall.pending"] = "待核实规则；清理前会核对归属和属性：{0}",
         ["recovery.entry.session"] = "当前会话",
         ["recovery.operation.running"] = "正在恢复选中项目…",
         ["recovery.restore.adapter.confirm"] = "要恢复 {0} 在 {1} 保存的 IPv4 配置吗？这会覆盖该网卡当前的 IPv4 设置。",
         ["dhcp.enabled"] = "自动获取",
         ["dhcp.disabled"] = "固定 IPv4",
         ["recovery.restore.route.confirm"] = "将只删除本工具记录的这条会话路由：\n{0}\n确认继续？",
+        ["recovery.restore.firewall.confirm"] = "清理网卡 {0} 上记录的 {1} 条本工具规则？仅删除名称、归属标记、接口和规则属性均匹配的规则。",
+        ["recovery.firewall.title"] = "DHCP 防火墙恢复",
         ["recovery.restore.mac.confirm"] = "将把 {0} 的 MAC 地址恢复为 {1}。确认继续？",
         ["migration.warning.title"] = "旧数据迁移需要处理",
         ["migration.warning.body"] = "部分旧数据未能复制到用户数据目录。原文件仍保留，请查看日志并确认后再继续：\n{0}",
-        ["recovery.summary"] = "这里集中显示可回滚的网卡备份、本次运行创建的静态路由和待恢复的 MAC。所有恢复动作都需要你明确点击确认。",
+        ["recovery.summary"] = "这里集中显示可回滚的网卡备份、本次运行创建的静态路由、待恢复的 MAC 和 DHCP 防火墙规则。所有恢复动作都需要你明确点击确认。",
         ["recovery.routes"] = "本次运行静态路由：{0} 条",
         ["recovery.adapter"] = "网卡回滚备份：{0} 条",
         ["recovery.mac"] = "待恢复 MAC：{0} 个",
         ["recovery.restore.routes"] = "清理本次路由",
         ["recovery.restore.adapter"] = "恢复选中网卡",
         ["recovery.restore.mac"] = "恢复待处理 MAC",
+        ["recovery.restore.firewall"] = "清理 DHCP 防火墙规则",
         ["recovery.close"] = "关闭",
         ["recovery.no.adapter"] = "请先在主窗口选择有回滚备份的网卡。",
         ["last.operation.none"] = "最近操作：暂无",
@@ -212,6 +229,15 @@ public static class Defaults
         ["selection.route"] = "请选择路由草稿后再删除。",
         ["verify.static.failed"] = "变更后校验失败：网卡当前状态与目标配置不一致。",
         ["verify.restore.failed"] = "恢复后校验失败：网卡当前状态与保存的原始配置不一致。",
+        ["adapter.restore.snapshot.missing"] = "没有属于这张网卡的有效备份，未执行恢复写入。请在恢复中心选择已保存的备份并确认。",
+        ["dhcp.restore.identity.missing"] = "系统没有提供这张网卡的稳定身份，无法安全启动 DHCP。未修改网卡。",
+        ["dhcp.start.adapter.unavailable"] = "刚才选择的网卡已不可用或被替换；DHCP 未启动，也未修改网卡。请刷新后重新选择。",
+        ["dhcp.start.adapter.ambiguous"] = "多个网卡匹配当前选择的稳定身份；为避免误改，DHCP 未启动。请刷新并重新选择网卡。",
+        ["dhcp.start.adapter.changed"] = "保存快照后网卡接口索引发生变化；为避免将快照用于另一张网卡，DHCP 未启动，也未修改网卡。请刷新后重试。",
+        ["dhcp.restore.adapter.unavailable"] = "原 DHCP 网卡当前不可用或已被替换；未更改其他网卡。请连接原网卡后重试，或在恢复中心人工恢复。",
+        ["dhcp.restore.adapter.ambiguous"] = "检测到多个网卡匹配原 DHCP 网卡身份；为避免误改，未执行恢复。请在恢复中心确认目标。",
+        ["dhcp.restore.snapshot.missing"] = "缺少本次 DHCP 会话的变更后快照；为避免覆盖未知配置，未执行自动恢复。请在恢复中心人工恢复。",
+        ["dhcp.restore.conflict"] = "网卡配置在 DHCP 会话后又发生变化；为避免覆盖外部修改，已保留恢复记录，请在恢复中心确认后处理。",
         ["about.details"] = "IPv4 DHCP / 扫描 / 静态路由 / 收藏夹\n作者：Joel & Codex\n邮箱：1406829360@qq.com",
         ["help.language"] = "选择自动、中文或 English 界面语言。",
         ["help.favorite.search"] = "按名称、设备、序列号、备注或 IP 筛选收藏夹。",
@@ -289,9 +315,11 @@ public static class Defaults
         ["help.apply.routes"] = "应用本次新增规则；不修改已有路由，若目标网段存在更具体冲突会阻止应用，同前缀会自动计算更高优先级。",
         ["help.clear.applied.routes"] = "清除本次运行已应用并记录的静态路由。",
         ["help.new.favorite"] = "手动创建收藏夹条目。",
+        ["help.edit.favorite"] = "编辑选中的收藏夹；使用副本进行修改，取消或保存失败不会覆盖原记录。可显式重录或清空密码。",
+        ["help.restore.favorite.presets"] = "恢复被删除的内置厂商预设；只新增缺失项，不覆盖已有备注、凭据和自定义字段。",
         ["help.template.favorite"] = "从常见服务器厂商模板创建 BMC 收藏夹。",
-        ["help.import.favorite"] = "从 JSON 文件导入收藏夹，并合并到本地收藏夹。",
-        ["help.export.favorite"] = "将收藏夹导出为不含密码的 JSON 文件。",
+        ["help.import.favorite"] = "从 JSON 文件导入收藏夹；空字段保留本地值，自定义字段按字段名合并，凭据替换会在确认预览中显示。",
+        ["help.export.favorite"] = "将收藏夹导出为不含任何密码载荷的 JSON；个人、公共和 DPAPI 密文都会移除。",
         ["help.favorite.columns"] = "选择收藏夹表格显示的列；可拖动表头调整顺序。",
         ["help.open.favorite"] = "用收藏夹目标 IP 打开 HTTP 或 HTTPS 管理页面。",
         ["help.load.favorite"] = "把选中收藏夹的本机 IP、掩码和对端 IP 加载到手动扫描页，不执行扫描。",
@@ -299,7 +327,7 @@ public static class Defaults
         ["help.delete.favorite"] = "删除选中的收藏夹；删除前请确认是否还有需要保留的备注。",
         ["help.save.settings"] = "保存设置中的安全开关和恢复选项。",
         ["support.redact"] = "支持包默认脱敏网络地址",
-        ["help.favorite.ok"] = "确认并保存收藏夹字段和自定义字段；名称、本机 IP、掩码为必填。",
+        ["help.favorite.ok"] = "确认并保存收藏夹字段和自定义字段；名称、本机 IP、掩码为必填。空白密码保留当前凭据，显式勾选后才清空。",
         ["help.favorite.cancel"] = "取消编辑并关闭窗口，不保存本次修改。",
         ["help.favorite.add.field"] = "新增一个自定义字段，并进入编辑状态。",
         ["help.favorite.delete.field"] = "删除当前选中的自定义字段。",
@@ -337,6 +365,7 @@ public static class Defaults
         ["new.version"] = "New version available!",
         ["latest.version"] = "Up to date",
         ["update.failed"] = "Update check failed",
+        ["update.download.canceled"] = "Update download canceled",
         ["adapter"] = "Adapter",
         ["current.ip"] = "Last / Current IP",
         ["mac"] = "MAC",
@@ -372,7 +401,9 @@ public static class Defaults
         ["restore.scan"] = "Restore Adapter",
         ["add.favorite"] = "Add Favorite",
         ["new.favorite"] = "New",
+        ["edit.favorite"] = "Edit",
         ["template.favorite"] = "Templates",
+        ["restore.favorite.presets"] = "Restore Presets",
         ["import.favorite"] = "Import",
         ["export.favorite"] = "Export",
         ["favorite.columns"] = "Columns",
@@ -404,7 +435,6 @@ public static class Defaults
         ["existing.dhcp"] = "Existing DHCP service detected",
         ["blocked.virtual"] = "Starting DHCP on a virtual adapter is blocked by default.",
         ["blocked.disconnected"] = "The selected adapter is disconnected. DHCP cannot start.",
-        ["allow.wifi"] = "Allow DHCP on Wi-Fi",
         ["allow.gateway"] = "Allow DHCP on adapter with default gateway",
         ["allow.restart.any"] = "Allow restarting wireless, virtual, disconnected, and all other adapters",
         ["allow.mac.any"] = "Allow changing MAC on wireless, virtual, disconnected, and all other adapters",
@@ -427,11 +457,14 @@ public static class Defaults
         ["ok"] = "OK",
         ["cancel"] = "Cancel",
         ["help.open.history"] = "Open Operation History to review the latest result and the complete local record.",
-        ["help.recovery.center"] = "Review leftover routes, adapter rollback snapshots, and MAC restorations, then recover them as needed.",
+        ["help.recovery.center"] = "Review leftover routes, adapter rollback snapshots, MAC restorations, and DHCP firewall rules, then recover them as needed.",
         ["help.clear.filter"] = "Clear the current search and status filters to show all items.",
         ["filter.clear"] = "Clear filter",
         ["help.favorite.details.reveal"] = "Reveal the password in Favorite Details; copying it requires another confirmation.",
-        ["recovery.banner"] = "{0} session changes need attention: {1} route(s), {2} MAC restoration(s).",
+        ["recovery.banner"] = "{0} changes need attention: {1} route(s), {2} MAC restoration(s), {3} firewall rule(s).",
+        ["recovery.banner.route.journal.unreadable"] = "The static route recovery journal is unreadable; route changes are locked until it is repaired.",
+        ["recovery.banner.firewall.journal.unreadable"] = "The DHCP firewall recovery journal is unreadable; DHCP startup is locked until it is repaired.",
+        ["recovery.banner.journals.unreadable"] = "The static route and DHCP firewall recovery journals are unreadable. Repair them before using the affected operations.",
         ["recovery.title"] = "Recovery Center",
         ["recovery.items.summary"] = "Saved recovery items. Select one to review its adapter identity and capture time before explicitly restoring it.",
         ["recovery.restore.selected"] = "Restore selected item",
@@ -445,27 +478,40 @@ public static class Defaults
         ["recovery.kind.adapter"] = "Adapter config",
         ["recovery.kind.mac"] = "MAC address",
         ["recovery.kind.route"] = "Static route",
+        ["recovery.kind.firewall"] = "DHCP firewall rules",
         ["recovery.status.available"] = "Available",
         ["recovery.status.unavailable"] = "Adapter unavailable or identity mismatch",
+        ["recovery.status.pending"] = "Route ownership unverified; automatic removal blocked",
+        ["recovery.status.firewall.pending"] = "Rule ownership pending; cleanup verifies each attribute",
+        ["recovery.status.firewall.active"] = "DHCP is running; stop it before cleanup",
+        ["firewall.journal.unreadable"] = "The DHCP firewall recovery journal and its backup could not be read. DHCP startup and firewall cleanup are locked to avoid losing rule ownership; repair or restore the journal, then restart the tool.",
+        ["firewall.recovery.required"] = "DHCP firewall rules from a prior session need attention. Review and remove them in Recovery Center before starting a new DHCP session.",
+        ["firewall.recovery.active"] = "DHCP is still running or this rule belongs to the active session. Stop DHCP normally before taking over its recovery entry.",
         ["recovery.entry.adapter.summary"] = "{0}; IPv4 {1}/{2}; gateway {3}",
         ["recovery.entry.mac.summary"] = "Original MAC: {0}",
         ["recovery.entry.route.summary"] = "Destination {0}; next hop {1}; metric {2}",
+        ["recovery.entry.route.pending"] = "Ownership unverified: destination {0}; next hop {1}; metric {2}",
+        ["recovery.entry.firewall.summary"] = "Ownership was read back; {0}",
+        ["recovery.entry.firewall.pending"] = "Rule pending verification; ownership and attributes will be checked before cleanup: {0}",
         ["recovery.entry.session"] = "Current session",
         ["recovery.operation.running"] = "Restoring selected item...",
         ["recovery.restore.adapter.confirm"] = "Restore {0}'s IPv4 configuration saved on {1}? This will overwrite the adapter's current IPv4 settings.",
         ["dhcp.enabled"] = "DHCP enabled",
         ["dhcp.disabled"] = "Static IPv4",
         ["recovery.restore.route.confirm"] = "Only this session route recorded by the tool will be removed:\n{0}\nContinue?",
+        ["recovery.restore.firewall.confirm"] = "Remove {1} recorded tool-owned rule(s) from adapter {0}? A rule is removed only when its name, ownership marker, interface, and attributes all match.",
+        ["recovery.firewall.title"] = "DHCP firewall recovery",
         ["recovery.restore.mac.confirm"] = "Restore {0}'s MAC address to {1}?",
         ["migration.warning.title"] = "Legacy data migration needs attention",
         ["migration.warning.body"] = "Some legacy files could not be copied to the user data folder. The original files were retained. Review the log before continuing:\n{0}",
-        ["recovery.summary"] = "This center lists rollback-capable adapter snapshots, static routes created in this run, and MAC restorations. Every recovery action requires an explicit confirmation.",
+        ["recovery.summary"] = "This center lists rollback-capable adapter snapshots, static routes, MAC restorations, and DHCP firewall rules. Every recovery action requires an explicit confirmation.",
         ["recovery.routes"] = "Static routes created in this run: {0}",
         ["recovery.adapter"] = "Adapter rollback snapshots: {0}",
         ["recovery.mac"] = "MAC restorations pending: {0}",
         ["recovery.restore.routes"] = "Clear session routes",
         ["recovery.restore.adapter"] = "Restore selected adapter",
         ["recovery.restore.mac"] = "Restore pending MACs",
+        ["recovery.restore.firewall"] = "Remove DHCP firewall rules",
         ["recovery.close"] = "Close",
         ["recovery.no.adapter"] = "Select an adapter with a rollback snapshot in the main window first.",
         ["last.operation.none"] = "Latest operation: none",
@@ -481,6 +527,15 @@ public static class Defaults
         ["selection.route"] = "Select a route draft before removing it.",
         ["verify.static.failed"] = "Post-change verification failed: the adapter does not match the target configuration.",
         ["verify.restore.failed"] = "Restore verification failed: the adapter does not match the saved original configuration.",
+        ["adapter.restore.snapshot.missing"] = "No valid snapshot belongs to this adapter. No restore was written. Select a saved backup in Recovery Center and confirm it.",
+        ["dhcp.restore.identity.missing"] = "Windows did not provide a stable identity for this adapter. DHCP cannot start safely, and no adapter was changed.",
+        ["dhcp.start.adapter.unavailable"] = "The selected adapter became unavailable or was replaced. DHCP did not start and no adapter was changed. Refresh and select it again.",
+        ["dhcp.start.adapter.ambiguous"] = "Multiple adapters match the selected stable identity. DHCP did not start to avoid changing the wrong adapter. Refresh and select the adapter again.",
+        ["dhcp.start.adapter.changed"] = "The adapter interface index changed after its snapshot was captured. DHCP did not start and no adapter was changed. Refresh and retry.",
+        ["dhcp.restore.adapter.unavailable"] = "The original DHCP adapter is unavailable or was replaced. No other adapter was changed. Reconnect it and retry, or restore it manually in Recovery Center.",
+        ["dhcp.restore.adapter.ambiguous"] = "Multiple adapters match the original DHCP adapter identity. No restore was written. Confirm the target in Recovery Center.",
+        ["dhcp.restore.snapshot.missing"] = "The post-change snapshot for this DHCP session is missing. Automatic restore was blocked to avoid overwriting unknown settings; restore it manually in Recovery Center.",
+        ["dhcp.restore.conflict"] = "The adapter configuration changed after the DHCP session. The recovery record was kept to avoid overwriting external changes; review it in Recovery Center.",
         ["about.details"] = "IPv4 DHCP / Scan / Static Routes / Favorites\nAuthors: Joel & Codex\nEmail: 1406829360@qq.com",
         ["help.language"] = "Choose Auto, Chinese, or English for the interface language.",
         ["help.favorite.search"] = "Filter Favorites by name, device, serial number, remark, or IP.",
@@ -558,9 +613,11 @@ public static class Defaults
         ["help.apply.routes"] = "Apply the new rules without modifying existing routes. More-specific conflicts are blocked and same-prefix priority is calculated automatically.",
         ["help.clear.applied.routes"] = "Remove static routes applied and recorded by this run.",
         ["help.new.favorite"] = "Create a Favorite entry manually.",
+        ["help.edit.favorite"] = "Edit the selected Favorite on a copy. Cancel or save failure leaves the original unchanged; you can re-enter or explicitly clear its password.",
+        ["help.restore.favorite.presets"] = "Restore deleted built-in vendor presets by adding missing entries only; existing notes, credentials, and custom fields are preserved.",
         ["help.template.favorite"] = "Create a BMC Favorite from a common server-vendor template.",
-        ["help.import.favorite"] = "Import Favorites from JSON and merge them into the local collection.",
-        ["help.export.favorite"] = "Export Favorites to a JSON file without passwords.",
+        ["help.import.favorite"] = "Import Favorites from JSON. Blank fields preserve local values, custom fields merge by name, and credential replacements appear in the review.",
+        ["help.export.favorite"] = "Export Favorites without any password payload; personal, public, and DPAPI ciphertext fields are removed.",
         ["help.favorite.columns"] = "Choose visible Favorite columns and drag headers to reorder them.",
         ["help.open.favorite"] = "Open the Favorite target IP in an HTTP or HTTPS management page.",
         ["help.load.favorite"] = "Load the selected Favorite's local IP, mask, and target IP into Manual Scan without scanning.",
@@ -568,7 +625,7 @@ public static class Defaults
         ["help.delete.favorite"] = "Delete the selected Favorite. Confirm that any notes are no longer needed.",
         ["help.save.settings"] = "Save the safety switches and restoration options in Settings.",
         ["support.redact"] = "Redact network addresses in support package by default",
-        ["help.favorite.ok"] = "Validate and save Favorite fields and custom fields. Name, local IP, and mask are required.",
+        ["help.favorite.ok"] = "Validate and save Favorite fields and custom fields. Name, local IP, and mask are required. An unchanged password is kept; select Clear to remove it.",
         ["help.favorite.cancel"] = "Cancel editing and close the window without saving this edit.",
         ["help.favorite.add.field"] = "Add a custom field and enter edit mode.",
         ["help.favorite.delete.field"] = "Delete the selected custom field.",

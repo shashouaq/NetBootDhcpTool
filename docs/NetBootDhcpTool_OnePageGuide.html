@@ -29,7 +29,7 @@
       <div class="brand">
         <img class="logo" src="../assets/logo.png" alt="NetBoot DHCP Tool">
         <div>
-          <h1>NetBoot DHCP Tool v1.0.10</h1>
+          <h1>NetBoot DHCP Tool v1.0.13</h1>
           <div>IPv4 DHCP、手动 IP、静态路由、连通性探测和设备收藏工具</div>
         </div>
       </div>
@@ -41,6 +41,7 @@
         <h2>自动 DHCP 快速流程</h2>
         <ol>
           <li>选择已连接的以太网卡，确认当前网络是隔离调试网络。</li>
+          <li>DHCP 和手动 IPv4 配置不支持 WLAN；旧设置中的 Wi-Fi 允许项不会授权该操作。</li>
           <li>设置本机 IP、掩码、地址池，点击“开始 DHCP”。</li>
           <li>客户端执行 renew，或禁用/启用网卡、重新插拔网线。</li>
           <li>明细按 MAC 去重，状态显示 Assigned、Online、Offline 和 ping 延迟。</li>
@@ -80,12 +81,25 @@
         </ul>
       </div>
       <div class="card">
-        <h2>手动 IP / 扫描 / 收藏</h2>
-        <ul>
+      <h2>手动 IP / 扫描 / 收藏</h2>
+      <ul>
           <li>输入本机 IP、掩码和可选对端 IP；有对端 IP 时只探测该设备。</li>
-          <li>没有对端 IP 时按网段扫描，结果显示主机名、MAC、HTTP/HTTPS、状态和 ping。</li>
+          <li>填写对端 IP 时只持续探测该同网段地址；留空按网段扫描（排除本机），最多探测 4096 个实际地址。超过上限、非法目标或网段广播地址会在修改网卡前拒绝。/31 按点到点两端处理；/32 留空没有其他目标。结果显示主机名、MAC、HTTP/HTTPS、状态和 ping。</li>
           <li>手动配置不会写入网关和 DNS，避免影响电脑后续网络。</li>
           <li>收藏支持设备信息、自定义字段、JSON 导入/导出、DPAPI 密码保护、HTTPS 首选协议和常见 BMC 模板。</li>
+      </ul>
+      <div class="tip"><b>收藏维护</b>选中收藏后可编辑或删除；编辑取消不会改动原记录，空白可选字段的导入不会清除本地备注。删除内置厂商预设会记住删除状态，只有点击“恢复预设”才会重新加入。无密码导出会清除个人密码、公共预设密码和 DPAPI 密文。</div>
+      </div>
+    </section>
+
+    <section class="grid">
+      <div class="card">
+        <h2>配置方案</h2>
+        <ul>
+          <li>方案保存 DHCP 本机地址、掩码、地址池、网关、DNS、租期，手动扫描范围和静态路由。</li>
+          <li>保存、加载和导入会显示草稿/有效状态；草稿只能填入表单，DHCP、扫描或路由预览仍需分别通过对应校验。</li>
+          <li>加载只填表单，不会修改网卡、DHCP 服务或系统路由。网关/DNS 留空时会清除旧值并恢复“添加”按钮。</li>
+          <li>对比会检查 DHCP 网关、DNS、租期和所有路由目标；接口跃点在预览时按当前网卡重新计算。</li>
         </ul>
       </div>
     </section>
@@ -108,7 +122,7 @@
     </section>
 
     <footer>
-      <span>发布包：release\NetBootDhcpTool-v1.0.10</span>
+      <span>发布包：release\NetBootDhcpTool-v1.0.13</span>
       <span>配置：%LOCALAPPDATA%\NetBootDhcpTool / 说明：docs</span>
     </footer>
   </main>

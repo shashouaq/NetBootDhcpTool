@@ -6,5 +6,9 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\NetBootDhcpTool.Core\NetBootDhcpTool.Core.csproj" />
+    <ProjectReference Include="..\NetBootDhcpTool.Dhcp\NetBootDhcpTool.Dhcp.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="NetBootDhcpTool.UnitTests" />
   </ItemGroup>
 </Project>

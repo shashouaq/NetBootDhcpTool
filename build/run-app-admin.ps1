@@ -1,26 +1,39 @@
-$ErrorActionPreference = "Stop"
-$root = Split-Path -Parent $PSScriptRoot
-$sourceExe = Join-Path $root "src\NetBootDhcpTool.App\bin\Release\net10.0-windows\NetBootDhcpTool.exe"
-$releaseExe = Join-Path $root "release\NetBootDhcpTool\NetBootDhcpTool.exe"
-if (Test-Path $sourceExe) {
-    $exe = $sourceExe
-} elseif (Test-Path $releaseExe) {
-    $exe = $releaseExe
-} else {
-    throw "App not found. Build the Release project or run build\publish.ps1 first."
+[CmdletBinding()]
+param(
+    [switch]$TestOnly,
+    [int]$ExitTimeoutSeconds = 240
+)
+
+$ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'process-safety.ps1')
+
+function Resolve-NetBootPreviewTarget {
+    param([Parameter(Mandatory)][string]$RepositoryRoot)
+    $sourceDirectory = Join-Path $RepositoryRoot 'src\NetBootDhcpTool.App\bin\Release\net10.0-windows'
+    $releaseDirectory = Join-Path $RepositoryRoot 'release\NetBootDhcpTool'
+    $sourceExe = Join-Path $sourceDirectory 'NetBootDhcpTool.exe'
+    $releaseExe = Join-Path $releaseDirectory 'NetBootDhcpTool.exe'
+    if (Test-Path -LiteralPath $sourceExe) { $exe = $sourceExe }
+    elseif (Test-Path -LiteralPath $releaseExe) { $exe = $releaseExe }
+    else { throw 'App not found. Build the Release project or run build\publish.ps1 first.' }
+    return [pscustomobject]@{
+        Executable = $exe
+        OwnedEntryPoints = @(
+            $sourceExe,
+            (Join-Path $sourceDirectory 'NetBootDhcpTool.dll'),
+            $releaseExe,
+            (Join-Path $releaseDirectory 'NetBootDhcpTool.dll')
+        )
+    }
 }
 
-$running = @(Get-Process -Name "NetBootDhcpTool" -ErrorAction SilentlyContinue)
-if ($running.Count -gt 0) {
-    Write-Host "Existing NetBootDhcpTool process detected; restarting preview."
-    foreach ($process in $running) {
-        $null = $process.CloseMainWindow()
-    }
-    if (-not (Wait-Process -InputObject $running -Timeout 5 -ErrorAction SilentlyContinue)) {
-        $running | Stop-Process -Force
-    }
-    Start-Sleep -Milliseconds 500
+if (-not $TestOnly) {
+    $root = Split-Path -Parent $PSScriptRoot
+    $target = Resolve-NetBootPreviewTarget $root
+    Write-Host "Starting local preview after verified application cleanup: $($target.Executable)"
+    Invoke-NetBootAppPreviewRestart `
+        -RepositoryRoot $root `
+        -PreviewExecutable $target.Executable `
+        -OwnedAppEntryPoints $target.OwnedEntryPoints `
+        -ExitTimeoutSeconds $ExitTimeoutSeconds
 }
-
-Write-Host "Starting local preview: $exe"
-Start-Process -FilePath $exe -Verb RunAs

@@ -96,14 +96,19 @@ public sealed class StaticRoutePlanItem
 public sealed class StaticRouteService
 {
     private readonly ILogger _logger;
+    private readonly PowerShellScriptExecutor? _powerShellScriptExecutor;
+    private readonly Func<bool> _isAdministrator;
 
-    public StaticRouteService(ILogger logger)
+    public StaticRouteService(ILogger logger, PowerShellScriptExecutor? powerShellScriptExecutor = null, Func<bool>? isAdministrator = null)
     {
         _logger = logger;
+        _powerShellScriptExecutor = powerShellScriptExecutor;
+        _isAdministrator = isAdministrator ?? IsAdministrator;
     }
 
     public async Task<IReadOnlyList<CurrentStaticRoute>> GetCurrentStaticRoutesAsync(CancellationToken ct = default)
     {
+        var stopwatch = Stopwatch.StartNew();
         _logger.Info("Static route read started: all IPv4 and IPv6 interfaces");
         var script = """
 $interfaces = @{}
@@ -133,7 +138,7 @@ ConvertTo-Json -InputObject $routes -Compress -Depth 4
 """;
         var output = await RunPowerShellOutputAsync(script, "PowerShell action read current IPv4/IPv6 routes", ct, false);
         var routes = ParseJsonList<CurrentStaticRoute>(output);
-        _logger.Info($"Static route read completed: count={routes.Count}");
+        _logger.Info($"Static route read completed: count={routes.Count} elapsedMs={stopwatch.ElapsedMilliseconds}");
         return routes;
     }
 
@@ -196,7 +201,7 @@ ConvertTo-Json -InputObject $addresses -Compress -Depth 3
         CancellationToken ct = default)
     {
         if (targets.Count == 0) throw new InvalidOperationException("No static routes to preview / 没有可预览的静态路由");
-        EnsureAdministrator();
+        EnsureAdministratorForOperation();
         return await PreparePlanAsync(targets, ignoredOwnedRoutes, ct);
     }
 
@@ -204,10 +209,12 @@ ConvertTo-Json -InputObject $addresses -Compress -Depth 3
         IReadOnlyList<StaticRouteTarget> targets,
         Action<AppliedStaticRoute>? onCreated = null,
         IReadOnlyCollection<AppliedStaticRoute>? ignoredOwnedRoutes = null,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        Action<AppliedStaticRoute>? onCreating = null,
+        Action<AppliedStaticRoute>? onRemoved = null)
     {
         if (targets.Count == 0) throw new InvalidOperationException("No static routes to apply / 没有可应用的静态路由");
-        EnsureAdministrator();
+        EnsureAdministratorForOperation();
 
         var planned = await PreparePlanAsync(targets, ignoredOwnedRoutes, ct);
         var created = new List<(AppliedStaticRoute Route, NetworkAdapterInfo Adapter)>();
@@ -224,6 +231,8 @@ ConvertTo-Json -InputObject $addresses -Compress -Depth 3
                     continue;
                 }
 
+                var intent = CreateOwnershipIntent(item.Target);
+                onCreating?.Invoke(intent);
                 var applied = await CreateRouteAsync(item.Target, ct);
                 created.Add((applied, item.Target.Adapter));
                 onCreated?.Invoke(applied);
@@ -235,19 +244,33 @@ ConvertTo-Json -InputObject $addresses -Compress -Depth 3
         catch (Exception ex)
         {
             _logger.Warn($"Static route batch failed; rolling back {created.Count} route(s) / 静态路由批处理失败，正在回滚 {created.Count} 条路由");
+            var rollbackFailures = new List<string>();
+            var removedCount = 0;
             foreach (var item in created.AsEnumerable().Reverse())
             {
                 try
                 {
                     await RemoveAsync(item.Route, item.Adapter, CancellationToken.None);
+                    onRemoved?.Invoke(item.Route);
+                    removedCount++;
                 }
                 catch (Exception rollbackEx)
                 {
-                    _logger.Error("Static route rollback failed", rollbackEx);
+                    var failure = $"{item.Route.AddressFamily} {item.Route.DestinationPrefix} on {item.Adapter.Name}: {rollbackEx.Message}";
+                    rollbackFailures.Add(failure);
+                    _logger.Error($"Static route rollback failed: {failure}", rollbackEx);
                 }
             }
 
-            throw new InvalidOperationException("Static route batch failed and was rolled back where possible / 静态路由批处理失败，已尽力回滚", ex);
+            if (ex is OperationCanceledException && rollbackFailures.Count == 0) throw;
+
+            var rollbackSummary = rollbackFailures.Count == 0
+                ? $"Rollback verified for {removedCount}/{created.Count} route(s) / 已核实回滚 {removedCount}/{created.Count} 条路由"
+                : $"Rollback verified for {removedCount}/{created.Count} route(s); failures: {string.Join("; ", rollbackFailures)} / 已核实回滚 {removedCount}/{created.Count} 条路由；失败项：{string.Join("; ", rollbackFailures)}";
+            var failureCause = rollbackFailures.Count == 0
+                ? ex
+                : new AggregateException("Batch operation and rollback failures / 批量操作及回滚均失败", [ex, .. rollbackFailures.Select(x => new InvalidOperationException(x))]);
+            throw new InvalidOperationException($"Static route batch failed: {ex.Message}. {rollbackSummary}", failureCause);
         }
     }
 
@@ -366,11 +389,11 @@ ConvertTo-Json -InputObject $addresses -Compress -Depth 3
 
     public async Task RemoveAsync(AppliedStaticRoute route, NetworkAdapterInfo adapter, CancellationToken ct = default)
     {
-        EnsureAdministrator();
+        EnsureAdministratorForOperation();
         EnsureCleanupTarget(route, adapter);
-        if (string.IsNullOrWhiteSpace(route.InstanceId))
+        if (!route.OwnershipVerified || string.IsNullOrWhiteSpace(route.InstanceId))
         {
-            throw new InvalidOperationException("Route ownership identity is missing; refusing cleanup / 路由缺少归属实例标识，拒绝删除");
+            throw new InvalidOperationException("Route ownership identity is missing or unverified; refusing cleanup / 路由归属标识缺失或未验证，拒绝删除");
         }
         var family = FamilyName(ParseAddressFamily(route.AddressFamily));
         var instanceId = PsQuote(route.InstanceId ?? "");
@@ -383,10 +406,12 @@ $OutputEncoding = [Console]::OutputEncoding
 $PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
 $idx={{route.InterfaceIndex}}
 $family='{{family}}'
+$policyStore={{policyStore}}
 $destination={{destination}}
 $nextHop={{nextHop}}
 $instanceId={{instanceId}}
-$routes = @(Get-NetRoute -InterfaceIndex $idx -AddressFamily $family -DestinationPrefix $destination -ErrorAction Stop)
+$routes = @(Get-NetRoute -AddressFamily $family -ErrorAction Stop |
+  Where-Object { [int]$_.InterfaceIndex -eq $idx -and [string]$_.DestinationPrefix -eq $destination })
 $owned = @($routes | Where-Object { [string]$_.InstanceId -eq $instanceId })
 $selected = @($owned | Where-Object {
   [string]$_.NextHop -eq $nextHop -and
@@ -403,8 +428,8 @@ if ($owned.Count -eq 0) {
 }
 if ($selected.Count -eq 0) { throw 'Owned route parameters changed; refusing to remove it' }
 $selected | Remove-NetRoute -Confirm:$false -ErrorAction Stop
-$remaining = @(Get-NetRoute -InterfaceIndex $idx -AddressFamily $family -DestinationPrefix $destination -ErrorAction Stop |
-  Where-Object { [string]$_.InstanceId -eq $instanceId })
+$remaining = @(Get-NetRoute -AddressFamily $family -ErrorAction Stop |
+  Where-Object { [int]$_.InterfaceIndex -eq $idx -and [string]$_.DestinationPrefix -eq $destination -and [string]$_.InstanceId -eq $instanceId })
 if ($remaining.Count -gt 0) { throw 'Owned route still exists after removal' }
 'OK'
 """;
@@ -414,6 +439,7 @@ if ($remaining.Count -gt 0) { throw 'Owned route still exists after removal' }
     public async Task<bool> ExistsAsync(AppliedStaticRoute route, NetworkAdapterInfo adapter, CancellationToken ct = default)
     {
         EnsureCleanupTarget(route, adapter);
+        if (!route.OwnershipVerified || string.IsNullOrWhiteSpace(route.InstanceId)) return false;
         var addressFamily = ParseAddressFamily(route.AddressFamily);
         if (!IpNetwork.TryParseCidr(route.DestinationPrefix, out _, out var prefixLength, out _)) prefixLength = 0;
         var validated = new ValidatedStaticRoute(route.DestinationPrefix, route.NextHop, route.RouteMetric, addressFamily, prefixLength, prefixLength == 0);
@@ -442,7 +468,7 @@ $expectedMac={{PsQuote(target.Adapter.MacAddress ?? "")}}
 $netAdapter = Get-NetAdapter -InterfaceIndex $idx -ErrorAction Stop
 if ($netAdapter.Status -ne 'Up') { throw 'Selected adapter is not Up' }
 if (-not [string]::IsNullOrWhiteSpace($expectedMac) -and [string]$netAdapter.MacAddress -ne $expectedMac) { throw 'Selected adapter identity changed' }
-New-NetRoute -DestinationPrefix $destination -InterfaceIndex $idx -AddressFamily $family -NextHop $nextHop -RouteMetric {{target.Route.RouteMetric}} -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
+        New-NetRoute -DestinationPrefix $destination -InterfaceIndex $idx -AddressFamily $family -NextHop $nextHop -RouteMetric {{target.Route.RouteMetric}} -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
 $route = @(Get-NetRoute -InterfaceIndex $idx -AddressFamily $family -DestinationPrefix $destination -ErrorAction Stop |
   Where-Object {
     [string]$_.NextHop -eq $nextHop -and
@@ -486,6 +512,22 @@ ConvertTo-Json -InputObject $route[0] -Compress -Depth 4
         return applied;
     }
 
+    private static AppliedStaticRoute CreateOwnershipIntent(StaticRouteTarget target) => new()
+    {
+        RuleId = target.Rule.Id,
+        DestinationPrefix = target.Route.DestinationPrefix,
+        AddressFamily = FamilyName(target.Route.AddressFamily),
+        AdapterId = target.Adapter.Id,
+        AdapterName = target.Adapter.Name,
+        AdapterMac = target.Adapter.MacAddress ?? "",
+        InterfaceIndex = int.TryParse(target.Adapter.InterfaceIndex, out var index) ? index : 0,
+        NextHop = target.Route.NextHop,
+        RouteMetric = target.Route.RouteMetric,
+        PolicyStore = "ActiveStore",
+        InstanceId = "",
+        OwnershipVerified = false
+    };
+
     private async Task<List<RouteSnapshot>> GetExactRoutesAsync(string interfaceIndex, ValidatedStaticRoute route, CancellationToken ct)
     {
         if (!int.TryParse(interfaceIndex, out var index) || index <= 0) throw new InvalidOperationException("Invalid adapter InterfaceIndex / 网卡 InterfaceIndex 无效");
@@ -500,8 +542,8 @@ $idx={{index}}
 $family='{{family}}'
 $destination={{destination}}
 $nextHop={{nextHop}}
-$routes = @(Get-NetRoute -InterfaceIndex $idx -AddressFamily $family -DestinationPrefix $destination -ErrorAction Stop |
-  Where-Object { [string]$_.NextHop -eq $nextHop } |
+$routes = @(Get-NetRoute -AddressFamily $family -ErrorAction Stop |
+  Where-Object { [int]$_.InterfaceIndex -eq $idx -and [string]$_.DestinationPrefix -eq $destination -and [string]$_.NextHop -eq $nextHop } |
   ForEach-Object {
     [pscustomobject]@{
       AddressFamily = [string]$_.AddressFamily
@@ -667,14 +709,20 @@ ConvertTo-Json -InputObject $routes -Compress -Depth 4
         if (!int.TryParse(adapter.InterfaceIndex, out var index) || index <= 0) throw new InvalidOperationException("InterfaceIndex missing / 缺少网卡 InterfaceIndex");
     }
 
-    private static void EnsureAdministrator()
+    private void EnsureAdministratorForOperation()
     {
         if (!OperatingSystem.IsWindows()) return;
-        using var identity = WindowsIdentity.GetCurrent();
-        if (!new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator))
+        if (!_isAdministrator())
         {
             throw new InvalidOperationException("Administrator privileges are required to add or remove Windows routes. Restart the tool with Run as administrator. / 新增或删除 Windows 路由需要管理员权限，请使用‘以管理员身份运行’重新启动工具。");
         }
+    }
+
+    private static bool IsAdministrator()
+    {
+        if (!OperatingSystem.IsWindows()) return true;
+        using var identity = WindowsIdentity.GetCurrent();
+        return new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator);
     }
 
     private static void EnsureCleanupTarget(AppliedStaticRoute route, NetworkAdapterInfo adapter)
@@ -703,6 +751,12 @@ ConvertTo-Json -InputObject $routes -Compress -Depth 4
     {
         var started = Stopwatch.GetTimestamp();
         _logger.Info(summary);
+        if (_powerShellScriptExecutor is not null)
+        {
+            var injectedOutput = await _powerShellScriptExecutor(script, summary, ct, logOutput);
+            _logger.Info($"{summary} completed by injected executor: elapsedMs={Stopwatch.GetElapsedTime(started).TotalMilliseconds:0}");
+            return injectedOutput;
+        }
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeoutCts.CancelAfter(TimeSpan.FromSeconds(30));
         var operationToken = timeoutCts.Token;

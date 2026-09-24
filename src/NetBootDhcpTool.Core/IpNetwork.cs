@@ -113,24 +113,41 @@ public static class IpNetwork
         return count;
     }
 
+    public static bool TryGetPrefixLength(IPAddress mask, out int prefixLength)
+    {
+        prefixLength = 0;
+        if (mask.AddressFamily != AddressFamily.InterNetwork) return false;
+        var value = ToUInt32(mask);
+        var sawZero = false;
+        for (var bit = 31; bit >= 0; bit--)
+        {
+            var set = ((value >> bit) & 1) != 0;
+            if (set && sawZero) return false;
+            if (set) prefixLength++;
+            else sawZero = true;
+        }
+        return true;
+    }
+
     public static bool SameSubnet(IPAddress a, IPAddress b, IPAddress mask)
     {
         var m = ToUInt32(mask);
         return (ToUInt32(a) & m) == (ToUInt32(b) & m);
     }
 
-    public static IReadOnlyList<IPAddress> Hosts(IPAddress ip, IPAddress mask)
+    public static IEnumerable<IPAddress> Hosts(IPAddress ip, IPAddress mask)
     {
+        if (ip.AddressFamily != AddressFamily.InterNetwork || !TryGetPrefixLength(mask, out var prefixLength))
+            throw new ArgumentException("IPv4 address and a contiguous IPv4 subnet mask are required.");
         var m = ToUInt32(mask);
         var network = ToUInt32(ip) & m;
         var broadcast = network | ~m;
-        if (broadcast <= network + 1) return Array.Empty<IPAddress>();
-        var result = new List<IPAddress>();
-        for (var value = network + 1; value < broadcast; value++)
+        ulong start = prefixLength <= 30 ? (ulong)network + 1 : network;
+        ulong endExclusive = prefixLength <= 30 ? broadcast : (ulong)broadcast + 1;
+        for (var value = start; value < endExclusive; value++)
         {
-            result.Add(FromUInt32(value));
+            yield return FromUInt32((uint)value);
         }
-        return result;
     }
 
     public static IPAddress BroadcastAddress(IPAddress ip, IPAddress mask)

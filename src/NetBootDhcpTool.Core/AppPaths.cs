@@ -6,11 +6,13 @@ public sealed class AppPaths
 
     public AppPaths(string baseDirectory)
     {
-        BaseDirectory = baseDirectory;
+        BaseDirectory = Path.GetFullPath(baseDirectory);
         var testDataDirectory = Environment.GetEnvironmentVariable("NETBOOT_DATA_DIRECTORY");
-        DataDirectory = string.IsNullOrWhiteSpace(testDataDirectory)
+        var dataDirectory = string.IsNullOrWhiteSpace(testDataDirectory)
             ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "NetBootDhcpTool")
-            : Path.GetFullPath(testDataDirectory);
+            : testDataDirectory;
+        DataDirectory = NormalizeDirectoryPath(dataDirectory);
+        DataDirectoryIdentity = DataDirectory.ToUpperInvariant();
         ConfigDirectory = Path.Combine(DataDirectory, "config");
         I18nDirectory = Path.Combine(baseDirectory, "i18n");
         LogsDirectory = Path.Combine(DataDirectory, "logs");
@@ -18,17 +20,20 @@ public sealed class AppPaths
         DocsDirectory = Path.Combine(baseDirectory, "docs");
         SettingsFile = Path.Combine(ConfigDirectory, "appsettings.json");
         FavoritesFile = Path.Combine(ConfigDirectory, "favorites.json");
+        FavoritePresetStateFile = Path.Combine(ConfigDirectory, "favorite-presets.json");
         AdapterBackupsFile = Path.Combine(ConfigDirectory, "adapter-backups.json");
         MacBackupsFile = Path.Combine(ConfigDirectory, "mac-backups.json");
         StaticRouteSessionFile = Path.Combine(ConfigDirectory, "static-route-session.json");
+        DhcpFirewallSessionFile = Path.Combine(ConfigDirectory, "dhcp-firewall-session.json");
+        DhcpLeaseJournalFile = Path.Combine(ConfigDirectory, "dhcp-leases.json");
         NetworkHistoryFile = Path.Combine(DataDirectory, "network-history.json");
         OperationHistoryFile = Path.Combine(DataDirectory, "operation-history.json");
         ProfilesFile = Path.Combine(ConfigDirectory, "network-profiles.json");
-        MigrateLegacyData();
     }
 
     public string BaseDirectory { get; }
     public string DataDirectory { get; }
+    public string DataDirectoryIdentity { get; }
     public string ConfigDirectory { get; }
     public string I18nDirectory { get; }
     public string LogsDirectory { get; }
@@ -36,9 +41,12 @@ public sealed class AppPaths
     public string DocsDirectory { get; }
     public string SettingsFile { get; }
     public string FavoritesFile { get; }
+    public string FavoritePresetStateFile { get; }
     public string AdapterBackupsFile { get; }
     public string MacBackupsFile { get; }
     public string StaticRouteSessionFile { get; }
+    public string DhcpFirewallSessionFile { get; }
+    public string DhcpLeaseJournalFile { get; }
     public string NetworkHistoryFile { get; }
     public string OperationHistoryFile { get; }
     public string ProfilesFile { get; }
@@ -52,6 +60,13 @@ public sealed class AppPaths
         Directory.CreateDirectory(LogsDirectory);
         Directory.CreateDirectory(AssetsDirectory);
         Directory.CreateDirectory(DocsDirectory);
+        MigrateLegacyData();
+    }
+
+    private static string NormalizeDirectoryPath(string path)
+    {
+        var fullPath = Path.GetFullPath(path);
+        return Path.TrimEndingDirectorySeparator(fullPath);
     }
 
     private void MigrateLegacyData()

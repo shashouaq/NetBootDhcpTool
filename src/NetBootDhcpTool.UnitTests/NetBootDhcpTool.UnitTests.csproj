@@ -10,5 +10,6 @@
     <ProjectReference Include="..\NetBootDhcpTool.Core\NetBootDhcpTool.Core.csproj" />
     <ProjectReference Include="..\NetBootDhcpTool.Dhcp\NetBootDhcpTool.Dhcp.csproj" />
     <ProjectReference Include="..\NetBootDhcpTool.Network\NetBootDhcpTool.Network.csproj" />
+    <ProjectReference Include="..\NetBootDhcpTool.InstanceProbe\NetBootDhcpTool.InstanceProbe.csproj" />
   </ItemGroup>
 </Project>

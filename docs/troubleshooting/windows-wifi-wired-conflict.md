@@ -6,13 +6,13 @@
 - Manual Wi-Fi reconnect fails until the wired cable is removed.
 - `Microsoft-Windows-WLAN-AutoConfig/Operational` contains messages similar to `策略禁止在该接口上自动连接`.
 
-## What This Tool Now Does
+## What This Tool Does
 
-- Only changes the user-selected target wired adapter.
-- Never changes WLAN, Wi-Fi, Wireless, or `无线` adapters.
+- DHCP startup and manual IPv4 configuration are blocked on WLAN adapters, regardless of the legacy `AllowDhcpOnWifi` settings field. There is no Wi-Fi DHCP override.
+- Adapter restart and MAC changes may target wireless adapters only when their separate allow-any-adapter setting is enabled and the user confirms the operation.
 - Never writes WcmSvc wired/Wi-Fi coexistence registry policy keys.
 - Never runs `netsh wlan connect`.
-- Only applies `192.168.100.1/24`, no default gateway, no DNS, and metric `9000` to the selected debug adapter.
+- IPv4 debug configuration is applied only to the selected non-WLAN adapter; the tool does not set a host default gateway or DNS for that configuration.
 
 ## What To Check On Windows
 
@@ -21,7 +21,7 @@
 3. Review recent WLAN events:
    - Event log: `Microsoft-Windows-WLAN-AutoConfig/Operational`
    - Look for policy or auto-connect blocking messages within the last 30 minutes.
-4. If the issue persists after this tool no longer changes WLAN behavior:
+4. If the issue persists after checking this tool's selected-adapter operations:
    - reboot the PC once to clear stale WcmSvc connection policy cache
    - forget and reconnect the Wi-Fi profile
    - disable/enable the Wi-Fi adapter

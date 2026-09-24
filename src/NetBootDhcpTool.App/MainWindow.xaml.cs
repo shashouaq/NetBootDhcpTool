@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Net;
 using System.Net.NetworkInformation;
+using System.Net.Sockets;
 using System.IO.Compression;
 using System.Text;
 using System.Media;
@@ -38,10 +39,13 @@ public partial class MainWindow : Window
     private readonly CancellationTokenSource _updateCts = new();
     private readonly CancellationTokenSource _updateDownloadCts = new();
     private readonly SemaphoreSlim _leaseUpdateGate = new(1, 1);
+    private readonly NetworkWorkflowCoordinator _networkWorkflows = new();
+    private readonly List<string> _startupDataWarnings = [];
     private AppSettings _settings;
     private List<FavoriteConfig> _allFavorites = [];
     private List<AdapterConfigBackup> _adapterBackups = [];
     private List<AdapterMacBackup> _savedMacBackups = [];
+    private DhcpLeaseJournal _dhcpLeaseJournal = new();
     private List<OperationHistoryItem> _operationHistory = [];
     private List<NetworkProfile> _allProfiles = [];
     private CancellationTokenSource? _scanCts;
@@ -49,17 +53,28 @@ public partial class MainWindow : Window
     private readonly DispatcherTimer _leasePingTimer = new() { Interval = TimeSpan.FromSeconds(2) };
     private readonly DispatcherTimer _adapterStatusTimer = new() { Interval = TimeSpan.FromSeconds(3) };
     private readonly DispatcherTimer _feedbackTimer = new() { Interval = TimeSpan.FromSeconds(6) };
+    private readonly DispatcherTimer _busyProgressTimer = new() { Interval = TimeSpan.FromSeconds(1) };
+    private Stopwatch? _busyOperationStopwatch;
+    private Stopwatch? _busyPhaseStopwatch;
+    private string? _busyOperationId;
+    private string? _busyPhaseName;
+    private int _busyPhaseNumber;
+    private int _busyCompletedPhaseCount;
+    private int? _busyTotalPhaseCount;
     private bool _leaseProbeInProgress;
     private bool _closingCleanupStarted;
+    private bool _waitingForOperationBeforeClose;
+    private bool _unsavedSettingsExitConfirmed;
     private bool _closeAfterCleanup;
     private bool _scanRunning;
-    private bool _dhcpWasStartedInThisSession;
+    private readonly List<DhcpSessionRecovery> _dhcpSessionRecoveries = [];
+    private DhcpSessionRecovery? _activeDhcpSession;
     private readonly Dictionary<string, string> _lastAdapterIps = new();
     private readonly Dictionary<string, AdapterIpv4Snapshot> _originalAdapterConfigs = new();
     private readonly Dictionary<string, AdapterMacBackup> _originalAdapterMacs = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<AppliedStaticRoute> _appliedStaticRoutes = [];
+    private readonly List<DhcpFirewallRuleLease> _dhcpFirewallRecoveries = [];
     private TabItem? _lastBusinessTab;
-    private string? _activeDhcpAdapterIndex;
     private bool _adapterStatusRefreshInProgress;
     private bool _adapterRefreshInProgress;
     private bool _adapterActionInProgress;
@@ -67,14 +82,25 @@ public partial class MainWindow : Window
     private bool _updateSlowWarningShown;
     private bool _darkTheme;
     private bool _safetyOnboardingCompleted;
+    private bool _settingsWritable = true;
+    private bool _favoritesWritable = true;
+    private bool _favoritePresetStateWritable = true;
+    private bool _profilesWritable = true;
+    private bool _macBackupsWritable = true;
+    private bool _routeJournalWritable = true;
+    private bool _dhcpFirewallJournalWritable = true;
+    private bool _dhcpLeaseJournalWritable = true;
     private bool _settingsInputsLoading;
     private bool _settingsDirty;
     private string? _businessConfigurationFingerprint;
     private DhcpFirewallRuleLease? _dhcpFirewallRules;
+    private string? _activeDhcpUiSessionId;
     private UpdateCheckResult? _lastUpdateResult;
     private bool _updateCheckStarted;
     private string? _activeOperationText;
     private CancellationTokenSource? _operationCts;
+    private NetworkWorkflowLease? _activeNetworkWorkflow;
+    private TaskCompletionSource? _standaloneOperationCompletion;
     private long _operationStartedTimestamp;
     private bool _suppressProfileSelection;
     private Stopwatch? _scanStopwatch;
@@ -93,8 +119,10 @@ public partial class MainWindow : Window
     public ObservableCollection<OperationHistoryItem> OperationHistory => _viewModel.OperationHistory;
     public ObservableCollection<NetworkProfile> Profiles => _viewModel.Profiles;
 
-    public MainWindow()
+    public MainWindow(AppPaths paths, FileLogger? logger = null)
     {
+        ArgumentNullException.ThrowIfNull(paths);
+        var initializationStopwatch = Stopwatch.StartNew();
         InitializeComponent();
         ResizeMode = ResizeMode.CanResizeWithGrip;
         UseLayoutRounding = true;
@@ -106,15 +134,17 @@ public partial class MainWindow : Window
         _viewModel = new MainWindowViewModel();
         DataContext = _viewModel;
         CollectionViewSource.GetDefaultView(ScanResults).Filter = ScanResultFilter;
-        _paths = new AppPaths(AppContext.BaseDirectory);
-        Defaults.EnsureFiles(_paths);
-        _logger = (Application.Current as App)?.Logger ?? new FileLogger(_paths);
+        _paths = paths;
+        _logger = logger ?? new FileLogger(_paths);
         foreach (var warning in _paths.MigrationWarnings) _logger.Warn($"Legacy data migration warning: {warning}");
         _logger.LineWritten += line => Dispatcher.BeginInvoke(() =>
         {
             AppendLogLine(line);
         });
-        _settings = JsonStore.LoadOrDefault(_paths.SettingsFile, new AppSettings(), _logger);
+        var settingsLoad = JsonStore.Load<AppSettings>(_paths.SettingsFile, _logger);
+        _settings = settingsLoad.Value ?? new AppSettings();
+        _settingsWritable = settingsLoad.Status is not DataLoadStatus.Failed and not DataLoadStatus.Missing;
+        RecordStorageLoad("Settings / 设置", settingsLoad.Status, settingsLoad.SourcePath, settingsLoad.Error);
         _lang = new LanguageService(_paths);
         _lang.Load(_settings.Language);
         _adapterService = new NetworkAdapterService(_logger);
@@ -124,7 +154,13 @@ public partial class MainWindow : Window
         _dhcpDetector = new ExistingDhcpDetector(_logger);
         _dhcpServer = new DhcpServer(_logger);
         _updateService = new VersionUpdateService();
-        _dhcpServer.LeaseChanged += lease => Dispatcher.Invoke(() => _ = UpdateLeaseAsync(lease));
+        _dhcpServer.LeaseChanged += lease =>
+        {
+            lease.SessionId = _activeDhcpUiSessionId ?? "";
+            lease.IsCurrentSession = !string.IsNullOrWhiteSpace(lease.SessionId);
+            Dispatcher.BeginInvoke(() => _ = UpdateLeaseAsync(lease));
+        };
+        _dhcpServer.StoppedUnexpectedly += reason => Dispatcher.BeginInvoke(() => _ = HandleUnexpectedDhcpStopAsync(reason));
         _leasePingTimer.Tick += (_, _) => _ = RefreshLeasePingAsync();
         _adapterStatusTimer.Tick += (_, _) => RefreshSelectedAdapterStatus();
         _feedbackTimer.Tick += (_, _) =>
@@ -132,17 +168,27 @@ public partial class MainWindow : Window
             _feedbackTimer.Stop();
             if (TxtActionFeedback != null) TxtActionFeedback.Text = "";
         };
+        _busyProgressTimer.Tick += (_, _) => UpdateBusyElapsedText();
         NetworkChange.NetworkAddressChanged += NetworkChanged;
         NetworkChange.NetworkAvailabilityChanged += NetworkAvailabilityChanged;
         ApplyLanguage();
         LoadDefaults();
         LoadFavorites();
         LoadNetworkHistory();
-        _adapterBackups = JsonStore.LoadOrDefault(_paths.AdapterBackupsFile, new List<AdapterConfigBackup>(), _logger);
+        var adapterBackupsLoad = JsonStore.Load<List<AdapterConfigBackup>>(_paths.AdapterBackupsFile, _logger);
+        _adapterBackups = adapterBackupsLoad.HasData ? adapterBackupsLoad.Value! : [];
+        RecordStorageLoad("Adapter backups / 网卡备份", adapterBackupsLoad.Status, adapterBackupsLoad.SourcePath, adapterBackupsLoad.Error, missingIsExpected: true);
         LoadMacBackups();
-        _operationHistory = JsonStore.LoadOrDefault(_paths.OperationHistoryFile, new List<OperationHistoryItem>(), _logger);
+        LoadDhcpFirewallRecoveries();
+        LoadDhcpLeaseJournal();
+        var operationHistoryLoad = JsonStore.Load<List<OperationHistoryItem>>(_paths.OperationHistoryFile, _logger);
+        _operationHistory = operationHistoryLoad.HasData ? operationHistoryLoad.Value! : [];
+        RecordStorageLoad("Operation history / 操作历史", operationHistoryLoad.Status, operationHistoryLoad.SourcePath, operationHistoryLoad.Error, missingIsExpected: true);
         foreach (var item in _operationHistory.OrderByDescending(x => x.Time).Take(500)) OperationHistory.Add(item);
-        _allProfiles = ProfileStore.Load(_paths.ProfilesFile, _logger);
+        var profilesLoad = ProfileStore.LoadWithStatus(_paths.ProfilesFile, _logger);
+        _allProfiles = profilesLoad.HasData ? profilesLoad.Value! : [];
+        _profilesWritable = profilesLoad.Status is not DataLoadStatus.Failed and not DataLoadStatus.Missing;
+        RecordStorageLoad("Network profiles / 网络方案", profilesLoad.Status, profilesLoad.SourcePath, profilesLoad.Error);
         foreach (var profile in _allProfiles.OrderByDescending(x => x.UpdatedAt)) Profiles.Add(profile);
         SetDhcpRunningState(false);
         UpdateAdapterActionButtons();
@@ -157,6 +203,7 @@ public partial class MainWindow : Window
         UpdateEmptyStates();
         UpdateSessionStatus();
         _logger.Info("MainWindow ready");
+        _logger.Info($"MainWindow initialization phase completed: phase=load-local-state-and-build-view elapsedMs={initializationStopwatch.ElapsedMilliseconds}");
         Dispatcher.BeginInvoke(() =>
         {
             SetBusy(false);
@@ -165,6 +212,8 @@ public partial class MainWindow : Window
             {
                 AppDialog.Show(this, Ui("migration.warning.title"), Ui("migration.warning.body", string.Join(Environment.NewLine, _paths.MigrationWarnings)), danger: true);
             }
+            if (_startupDataWarnings.Count > 0)
+                AppDialog.Show(this, "Data recovery / 数据恢复", string.Join(Environment.NewLine, _startupDataWarnings), danger: true);
             _ = InitializeNetworkStateAsync();
             _ = CheckForUpdatesAsync();
         }, DispatcherPriority.ApplicationIdle);
@@ -172,8 +221,12 @@ public partial class MainWindow : Window
 
     private async Task InitializeNetworkStateAsync()
     {
+        var networkStateStopwatch = Stopwatch.StartNew();
         await RefreshAdaptersAsync();
+        _logger.Info($"Startup phase completed: phase=adapter-and-route-discovery elapsedMs={networkStateStopwatch.ElapsedMilliseconds}");
+        var recoveryStopwatch = Stopwatch.StartNew();
         await RecoverStaleRoutesAsync();
+        _logger.Info($"Startup phase completed: phase=stale-route-recovery elapsedMs={recoveryStopwatch.ElapsedMilliseconds}");
     }
 
     protected override async void OnClosing(System.ComponentModel.CancelEventArgs e)
@@ -189,7 +242,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        if (_settingsDirty && !AppDialog.Show(this,
+        if (_settingsDirty && !_unsavedSettingsExitConfirmed && !AppDialog.Show(this,
             IsChineseUi() ? "未保存设置" : "Unsaved Settings",
             IsChineseUi()
                 ? "设置页存在尚未保存的更改。关闭后这些更改会丢失，仍要退出吗？"
@@ -197,6 +250,43 @@ public partial class MainWindow : Window
             confirm: true))
         {
             e.Cancel = true;
+            return;
+        }
+        if (_settingsDirty) _unsavedSettingsExitConfirmed = true;
+
+        if (_activeNetworkWorkflow is not null || _standaloneOperationCompletion is not null)
+        {
+            e.Cancel = true;
+            if (_waitingForOperationBeforeClose) return;
+            var closeWaitStopwatch = Stopwatch.StartNew();
+            var activeOperationName = _activeOperationText ?? "unknown";
+            _waitingForOperationBeforeClose = true;
+            _closingCleanupStarted = true;
+            IsEnabled = false;
+            SetBusyTotalPhases(0);
+            SetBusyPhase(IsChineseUi()
+                ? "正在取消当前操作并等待恢复完成..."
+                : "Canceling the active operation and waiting for recovery to finish...");
+            _logger.Info($"Window close requested during active operation: operation={activeOperationName}");
+            var activeWorkflow = _activeNetworkWorkflow;
+            var completionTasks = new List<Task>();
+            if (activeWorkflow is not null)
+            {
+                activeWorkflow.Cancel();
+                completionTasks.Add(activeWorkflow.Completion);
+            }
+            if (_operationCts is not null)
+            {
+                _operationCts.Cancel();
+                if (_standaloneOperationCompletion is not null)
+                    completionTasks.Add(_standaloneOperationCompletion.Task);
+            }
+            await Task.WhenAll(completionTasks);
+            _logger.Info($"Window close resumed after active operation ended: elapsedMs={closeWaitStopwatch.ElapsedMilliseconds}");
+            _waitingForOperationBeforeClose = false;
+            _closingCleanupStarted = false;
+            IsEnabled = true;
+            await Dispatcher.InvokeAsync(Close, DispatcherPriority.Background);
             return;
         }
 
@@ -210,8 +300,9 @@ public partial class MainWindow : Window
         _updateCts.Cancel();
         _updateDownloadCts.Cancel();
         IsEnabled = false;
-        SetBusy(true, "Cleaning up... / 正在清理工作环境...");
+        SetBusy(true, IsChineseUi() ? "正在保存恢复信息并停止 DHCP..." : "Saving recovery state and stopping DHCP...");
         await CleanupWorkEnvironmentAsync();
+        SetBusy(false);
         _updateService.Dispose();
         _updateCts.Dispose();
         _updateDownloadCts.Dispose();
@@ -287,7 +378,9 @@ public partial class MainWindow : Window
         CurrentRoutesTab.Header = _lang.T("route.current");
         BtnAddFavorite.Content = _lang.T("add.favorite");
         BtnNewFavorite.Content = _lang.T("new.favorite");
+        BtnEditFavorite.Content = _lang.T("edit.favorite");
         BtnTemplateFavorite.Content = _lang.T("template.favorite");
+        BtnRestoreFavoritePresets.Content = _lang.T("restore.favorite.presets");
         BtnImportFavorite.Content = _lang.T("import.favorite");
         BtnExportFavorite.Content = _lang.T("export.favorite");
         BtnFavoriteColumns.Content = _lang.T("favorite.columns");
@@ -314,7 +407,6 @@ public partial class MainWindow : Window
         BtnExportProfile.Content = _lang.T("profile.export");
         BtnDeleteProfile.Content = _lang.T("profile.delete");
         BtnCancelOperation.Content = _lang.T("cancel");
-        AllowWifi.Content = _lang.T("allow.wifi");
         AllowGateway.Content = _lang.T("allow.gateway");
         DetectExistingDhcp.Content = _lang.T("detect.existing.dhcp");
         AllowRestartAnyAdapter.Content = _lang.T("allow.restart.any");
@@ -451,13 +543,12 @@ public partial class MainWindow : Window
             ManualIp.Text = d.ServerIp;
             ManualMask.Text = d.SubnetMask;
             RestoreOnStop.IsChecked = _settings.RestoreIpOnDhcpStop;
-            AllowWifi.IsChecked = _settings.AllowDhcpOnWifi;
             AllowGateway.IsChecked = _settings.AllowDhcpOnAdapterWithGateway;
             DetectExistingDhcp.IsChecked = _settings.DetectExistingDhcpBeforeStart;
             AllowRestartAnyAdapter.IsChecked = _settings.AllowRestartOnAnyAdapter;
             AllowMacChangeAnyAdapter.IsChecked = _settings.AllowMacChangeOnAnyAdapter;
             RedactSupportPackage.IsChecked = _settings.RedactSupportPackage;
-            _safetyOnboardingCompleted = _settings.SafetyOnboardingCompleted;
+            _safetyOnboardingCompleted = _settingsWritable && _settings.SafetyOnboardingCompleted;
             _darkTheme = _settings.DarkTheme;
             ApplyTheme();
             SelectLanguageBox(_settings.Language);
@@ -512,18 +603,51 @@ public partial class MainWindow : Window
         _settings.LogPanelExpanded = LogBox.Visibility == Visibility.Visible;
         _settings.LogAutoScroll = ChkLogAutoScroll.IsChecked != false;
         if (Tabs.SelectedItem is TabItem selected && !string.IsNullOrWhiteSpace(selected.Name)) _settings.LastTab = selected.Name;
-        JsonStore.Save(_paths.SettingsFile, _settings);
+        TrySaveSettings(showFeedback: false);
     }
 
-    private async Task RefreshAdaptersAsync()
+    private bool TrySaveSettings(bool showFeedback = true)
     {
-        if (_adapterRefreshInProgress) return;
-        _adapterRefreshInProgress = true;
-        var previousIndex = SelectedAdapter?.InterfaceIndex;
+        if (!_settingsWritable)
+        {
+            if (showFeedback) ShowStorageWriteBlocked("Settings / 设置");
+            return false;
+        }
         try
         {
-            SetBusy(true, "Loading network adapters... / 正在加载网卡...");
-            var adapters = (await Task.Run(() => _adapterService.GetAdapters()))
+            JsonStore.Save(_paths.SettingsFile, _settings);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _settingsWritable = false;
+            _logger.Error("Save settings failed; existing files were retained", ex);
+            UpdateSettingsStatus();
+            if (showFeedback)
+                ShowActionFeedback("设置保存失败，原文件和备份已保留。", "Settings were not saved; the source and backup files were retained.", error: true);
+            return false;
+        }
+    }
+
+    private async Task RefreshAdaptersAsync(bool allowDuringNetworkWorkflow = false, CancellationToken cancellationToken = default)
+    {
+        if (_adapterRefreshInProgress) return;
+        if (_activeNetworkWorkflow is not null && !allowDuringNetworkWorkflow) return;
+        if (_activeNetworkWorkflow is null && _operationCts is not null) return;
+        _adapterRefreshInProgress = true;
+        var ownsBusyState = _activeNetworkWorkflow is null;
+        var previousIndex = SelectedAdapter?.InterfaceIndex;
+        Task<IReadOnlyList<CurrentStaticRoute>>? currentRoutesReadTask = null;
+        try
+        {
+            if (ownsBusyState) SetBusy(true, "Reading network information... / 正在读取网络信息...", totalPhases: 2);
+            var discoveryStopwatch = Stopwatch.StartNew();
+            var adapterReadTask = Task.Run(() => _adapterService.GetAdapters());
+            currentRoutesReadTask = _routeService.GetCurrentStaticRoutesAsync(
+                ownsBusyState ? OperationToken : cancellationToken);
+            _logger.Info("Parallel network discovery started: adapters and current IPv4/IPv6 routes");
+
+            var adapters = (await adapterReadTask)
                 .OrderBy(x => x.IsVirtual)
                 .ThenBy(x => x.IsWifi)
                 .ThenBy(x => !x.Status.Equals("Up", StringComparison.OrdinalIgnoreCase))
@@ -546,26 +670,42 @@ public partial class MainWindow : Window
             }
             if (Adapters.Count == 0) _logger.Warn("No adapters found for UI");
             RefreshRouteAdapterMetadata();
-            await LoadCurrentStaticRoutesAsync(adapters);
+            var readToken = ownsBusyState ? OperationToken : cancellationToken;
+            if (ownsBusyState) SetBusyPhase("Loading current IPv4/IPv6 routes... / 正在读取当前 IPv4/IPv6 路由...");
+            await LoadCurrentStaticRoutesAsync(adapters, readToken, currentRoutesReadTask);
+            _logger.Info($"Parallel network discovery completed: adapters={adapters.Count} routes={CurrentStaticRoutes.Count} elapsedMs={discoveryStopwatch.ElapsedMilliseconds}");
             _businessConfigurationFingerprint = CaptureBusinessConfigurationFingerprint();
             _logger.Info($"UI adapter list loaded: count={Adapters.Count}, selected={SelectedAdapter?.DisplayName ?? ""}");
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested || OperationToken.IsCancellationRequested)
+        {
+            _logger.Info("Adapter refresh canceled while waiting for an active operation to finish");
         }
         catch (Exception ex)
         {
             _logger.Error("Refresh adapters failed", ex);
-            AppDialog.Show(this, _lang.T("refresh"), ExplainFailure(ex, _lang.T("help.refresh")), danger: true);
+            if (!_closingCleanupStarted)
+                AppDialog.Show(this, _lang.T("refresh"), ExplainFailure(ex, _lang.T("help.refresh")), danger: true);
         }
         finally
         {
+            if (currentRoutesReadTask is not null)
+            {
+                try { await currentRoutesReadTask; }
+                catch { /* The refresh path already reports route-read errors; observe a concurrent failure if adapter enumeration failed first. */ }
+            }
             _adapterRefreshInProgress = false;
-            SetBusy(false);
+            if (ownsBusyState) SetBusy(false);
             UpdateAdapterActionButtons();
             UpdateSessionStatus();
             if (!_closingCleanupStarted) _adapterStatusTimer.Start();
         }
     }
 
-    private async Task LoadCurrentStaticRoutesAsync(IReadOnlyList<NetworkAdapterInfo> adapters, CancellationToken ct = default)
+    private async Task LoadCurrentStaticRoutesAsync(
+        IReadOnlyList<NetworkAdapterInfo> adapters,
+        CancellationToken ct = default,
+        Task<IReadOnlyList<CurrentStaticRoute>>? routesReadTask = null)
     {
         try
         {
@@ -573,7 +713,9 @@ public partial class MainWindow : Window
                 .Where(x => !string.IsNullOrWhiteSpace(x.InterfaceIndex))
                 .ToDictionary(x => x.InterfaceIndex, StringComparer.OrdinalIgnoreCase);
             CurrentStaticRoutes.Clear();
-            var routes = await _routeService.GetCurrentStaticRoutesAsync(ct);
+            var routes = routesReadTask is null
+                ? await _routeService.GetCurrentStaticRoutesAsync(ct)
+                : await routesReadTask;
             foreach (var route in routes)
             {
                 adapterByIndex.TryGetValue(route.InterfaceIndex, out var adapter);
@@ -612,25 +754,72 @@ public partial class MainWindow : Window
 
     private void LoadFavorites()
     {
-        _allFavorites = FavoriteStore.Load(_paths.FavoritesFile, _logger, migrateLegacy: true);
+        var result = FavoriteStore.LoadWithStatus(_paths.FavoritesFile, _logger, migrateLegacy: true);
+        var presetState = FavoritePresetStore.Load(_paths.FavoritePresetStateFile, _logger);
+        _favoritePresetStateWritable = presetState.IsWritable;
+        if (!presetState.IsWritable)
+        {
+            _startupDataWarnings.Add("Favorite preset deletion state is unreadable; preset restore and deletion are disabled.");
+            _logger.Warn($"Favorite preset deletion state is unreadable: {_paths.FavoritePresetStateFile}");
+        }
+        _allFavorites = result.HasData ? result.Favorites : [];
+        _favoritesWritable = result.Status is not DataLoadStatus.Failed and not DataLoadStatus.Missing
+            && result.MigrationError is null;
+        RecordStorageLoad("Favorites / 收藏", result.Status, result.SourcePath, result.Error ?? result.MigrationError);
         FilterFavorites();
     }
 
-    private void SaveFavorites()
+    private bool SaveFavorites()
     {
-        FavoriteStore.Save(_paths.FavoritesFile, _allFavorites, _logger);
+        if (!_favoritesWritable)
+        {
+            ShowStorageWriteBlocked("Favorites / 收藏");
+            return false;
+        }
+        try
+        {
+            FavoriteStore.Save(_paths.FavoritesFile, _allFavorites, _logger);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _favoritesWritable = false;
+            _logger.Error("Save favorites failed; source and backup files were retained", ex);
+            UpdateFavoriteButtons();
+            ShowActionFeedback("收藏保存失败，原文件和备份已保留。", "Favorites were not saved; the source and backup files were retained.", error: true);
+            return false;
+        }
+    }
+
+    private List<FavoriteConfig> SnapshotFavorites() => _allFavorites.Select(FavoriteStore.Clone).ToList();
+
+    private bool SaveFavoritesOrRestore(List<FavoriteConfig> previous)
+    {
+        if (SaveFavorites()) return true;
+        _allFavorites = previous;
+        FilterFavorites();
+        return false;
     }
 
     private void LoadNetworkHistory()
     {
-        foreach (var item in JsonStore.LoadOrDefault(_paths.NetworkHistoryFile, new List<AdapterIpHistoryItem>(), _logger).OrderByDescending(x => x.ChangedAt).Take(5)) AdapterIpHistory.Add(item);
+        var result = JsonStore.Load<List<AdapterIpHistoryItem>>(_paths.NetworkHistoryFile, _logger);
+        RecordStorageLoad("Network history / 网卡历史", result.Status, result.SourcePath, result.Error, missingIsExpected: true);
+        foreach (var item in (result.HasData ? result.Value! : []).OrderByDescending(x => x.ChangedAt).Take(5)) AdapterIpHistory.Add(item);
     }
 
-    private void SaveNetworkHistory() => JsonStore.Save(_paths.NetworkHistoryFile, AdapterIpHistory.ToList());
+    private void SaveNetworkHistory()
+    {
+        try { JsonStore.Save(_paths.NetworkHistoryFile, AdapterIpHistory.ToList()); }
+        catch (Exception ex) { _logger.Error("Save network history failed; existing files were retained", ex); }
+    }
 
     private void LoadMacBackups()
     {
-        _savedMacBackups = JsonStore.LoadOrDefault(_paths.MacBackupsFile, new List<AdapterMacBackup>(), _logger);
+        var result = JsonStore.Load<List<AdapterMacBackup>>(_paths.MacBackupsFile, _logger);
+        _macBackupsWritable = result.Status is not DataLoadStatus.Failed;
+        _savedMacBackups = result.HasData ? result.Value! : [];
+        RecordStorageLoad("MAC recovery records / MAC 恢复记录", result.Status, result.SourcePath, result.Error, missingIsExpected: true);
         _originalAdapterMacs.Clear();
         foreach (var backup in _savedMacBackups.Where(x => !string.IsNullOrWhiteSpace(x.OriginalMacAddress)))
         {
@@ -638,15 +827,216 @@ public partial class MainWindow : Window
         }
     }
 
-    private void SaveMacBackups()
+    private void LoadDhcpFirewallRecoveries()
     {
+        var result = JsonStore.Load<List<DhcpFirewallRuleLease>>(_paths.DhcpFirewallSessionFile, _logger);
+        _dhcpFirewallJournalWritable = result.Status != DataLoadStatus.Failed;
+        if (result.HasData) _dhcpFirewallRecoveries.AddRange(result.Value!.Where(x => x.Rules.Count > 0));
+        RecordStorageLoad("DHCP firewall recovery journal / DHCP 防火墙恢复日志", result.Status, result.SourcePath, result.Error, missingIsExpected: true);
+        if (!_dhcpFirewallJournalWritable)
+            _startupDataWarnings.Add(Ui("firewall.journal.unreadable"));
+    }
+
+    private void LoadDhcpLeaseJournal()
+    {
+        var result = JsonStore.Load<DhcpLeaseJournal>(_paths.DhcpLeaseJournalFile, _logger);
+        _dhcpLeaseJournalWritable = result.Status != DataLoadStatus.Failed;
+        _dhcpLeaseJournal = result.HasData ? result.Value! : new DhcpLeaseJournal();
+        _dhcpLeaseJournal.Scopes ??= [];
+        try
+        {
+            foreach (var scope in _dhcpLeaseJournal.Scopes)
+            {
+                if (scope == null || !Guid.TryParse(scope.AdapterId, out _) || !IPAddress.TryParse(scope.ServerIp, out var serverIp)
+                    || !IPAddress.TryParse(scope.SubnetMask, out var subnetMask)
+                    || serverIp.AddressFamily != AddressFamily.InterNetwork || subnetMask.AddressFamily != AddressFamily.InterNetwork)
+                    throw new InvalidDataException("DHCP lease journal contains an invalid adapter or IPv4 scope.");
+                if (scope.Bindings?.Any(x => x == null) == true || scope.DeclinedAddresses?.Any(x => x == null) == true)
+                    throw new InvalidDataException("DHCP lease journal contains a null lease or conflict record.");
+                scope.Bindings ??= [];
+                scope.DeclinedAddresses ??= [];
+            }
+            var duplicateScope = _dhcpLeaseJournal.Scopes
+                .GroupBy(x => DhcpJournalScopeKey(x.AdapterId, x.ServerIp, x.SubnetMask), StringComparer.OrdinalIgnoreCase)
+                .FirstOrDefault(x => x.Count() > 1);
+            if (duplicateScope != null) throw new InvalidDataException("DHCP lease journal contains duplicate adapter/subnet scopes.");
+        }
+        catch (Exception ex)
+        {
+            _dhcpLeaseJournalWritable = false;
+            _logger.Error("DHCP lease journal scope validation failed; original journal was preserved and DHCP start is locked", ex);
+        }
+        RecordStorageLoad("DHCP lease recovery journal / DHCP 租约恢复日志", result.Status, result.SourcePath, result.Error, missingIsExpected: true);
+        if (!_dhcpLeaseJournalWritable) _startupDataWarnings.Add(Ui("dhcp.lease.journal.unreadable"));
+    }
+
+    private DhcpLeaseScopeState PrepareDhcpLeaseScope(DhcpServerSettings settings)
+    {
+        if (!_dhcpLeaseJournalWritable) throw new InvalidOperationException(Ui("dhcp.lease.journal.unreadable"));
+        var scope = _dhcpLeaseJournal.Scopes.FirstOrDefault(x =>
+            DhcpJournalScopeKey(x.AdapterId, x.ServerIp, x.SubnetMask)
+                .Equals(DhcpJournalScopeKey(settings.AdapterId, settings.ServerIp.ToString(), settings.SubnetMask.ToString()), StringComparison.OrdinalIgnoreCase));
+        (List<DhcpLeaseBinding> Bindings, List<DhcpDeclinedAddress> Declined, string ServerIp, string SubnetMask, string PoolStart, string PoolEnd)? prior = scope == null
+            ? null
+            : (scope.Bindings.ToList(), scope.DeclinedAddresses.ToList(), scope.ServerIp, scope.SubnetMask, scope.PoolStart, scope.PoolEnd);
+        if (scope == null)
+        {
+            scope = new DhcpLeaseScopeState
+            {
+                AdapterId = settings.AdapterId,
+                ServerIp = settings.ServerIp.ToString(),
+                SubnetMask = settings.SubnetMask.ToString(),
+                PoolStart = settings.PoolStart.ToString(),
+                PoolEnd = settings.PoolEnd.ToString()
+            };
+            _dhcpLeaseJournal.Scopes.Add(scope);
+        }
+        scope.ServerIp = settings.ServerIp.ToString();
+        scope.SubnetMask = settings.SubnetMask.ToString();
+        scope.PoolStart = settings.PoolStart.ToString();
+        scope.PoolEnd = settings.PoolEnd.ToString();
+        var now = DateTimeOffset.UtcNow;
+        scope.Bindings = scope.Bindings.Where(x => x.LeaseEnd > now).ToList();
+        scope.DeclinedAddresses = scope.DeclinedAddresses.Where(x => x.ExpiresAt > now).ToList();
+        try
+        {
+            JsonStore.Save(_paths.DhcpLeaseJournalFile, _dhcpLeaseJournal);
+        }
+        catch (Exception ex)
+        {
+            if (prior == null) _dhcpLeaseJournal.Scopes.Remove(scope);
+            else
+            {
+                scope.Bindings = prior.Value.Item1;
+                scope.DeclinedAddresses = prior.Value.Item2;
+                scope.ServerIp = prior.Value.ServerIp;
+                scope.SubnetMask = prior.Value.SubnetMask;
+                scope.PoolStart = prior.Value.PoolStart;
+                scope.PoolEnd = prior.Value.PoolEnd;
+            }
+            _dhcpLeaseJournalWritable = false;
+            _logger.Error("Prepare DHCP lease journal failed; existing files were retained", ex);
+            throw new IOException(Ui("dhcp.lease.journal.unreadable"), ex);
+        }
+        UpdateRecoveryBanner();
+        return scope;
+    }
+
+    private static string DhcpJournalScopeKey(string adapterId, string serverIp, string subnetMask)
+    {
+        if (!Guid.TryParse(adapterId, out var normalizedAdapterId)
+            || !IPAddress.TryParse(serverIp, out var address)
+            || !IPAddress.TryParse(subnetMask, out var mask)
+            || address.AddressFamily != AddressFamily.InterNetwork || mask.AddressFamily != AddressFamily.InterNetwork)
+            throw new InvalidDataException("DHCP lease scope identity is invalid.");
+        var network = IpNetwork.FromUInt32(IpNetwork.ToUInt32(address) & IpNetwork.ToUInt32(mask));
+        return $"{normalizedAdapterId:N}|{network}|{mask}";
+    }
+
+    private void PersistDhcpLeaseTable(DhcpLeaseScopeState scope, DhcpLeaseTableSnapshot snapshot)
+    {
+        if (!_dhcpLeaseJournalWritable) throw new InvalidOperationException(Ui("dhcp.lease.journal.unreadable"));
+        var previousBindings = scope.Bindings;
+        var previousDeclined = scope.DeclinedAddresses;
+        scope.Bindings = snapshot.Bindings.ToList();
+        scope.DeclinedAddresses = snapshot.DeclinedAddresses.ToList();
+        try
+        {
+            JsonStore.Save(_paths.DhcpLeaseJournalFile, _dhcpLeaseJournal);
+        }
+        catch (Exception ex)
+        {
+            scope.Bindings = previousBindings;
+            scope.DeclinedAddresses = previousDeclined;
+            _dhcpLeaseJournalWritable = false;
+            _logger.Error("Save DHCP lease journal failed; existing files were retained and no DHCP acknowledgement will be sent", ex);
+            UpdateRecoveryBanner();
+            throw new IOException(Ui("dhcp.lease.journal.unreadable"), ex);
+        }
+    }
+
+    private void CommitDhcpFirewallLease(DhcpFirewallRuleLease lease)
+    {
+        if (!_dhcpFirewallJournalWritable)
+            throw new InvalidOperationException(Ui("firewall.journal.unreadable"));
+        var index = _dhcpFirewallRecoveries.FindIndex(x => x.LeaseId.Equals(lease.LeaseId, StringComparison.OrdinalIgnoreCase));
+        if (lease.Rules.Count == 0)
+        {
+            if (index >= 0) _dhcpFirewallRecoveries.RemoveAt(index);
+        }
+        else if (index < 0)
+        {
+            _dhcpFirewallRecoveries.Add(lease);
+        }
+        else
+        {
+            _dhcpFirewallRecoveries[index] = lease;
+        }
+        try
+        {
+            JsonStore.Save(_paths.DhcpFirewallSessionFile, _dhcpFirewallRecoveries);
+        }
+        catch (Exception ex)
+        {
+            _dhcpFirewallJournalWritable = false;
+            _logger.Error("Save DHCP firewall recovery journal failed; existing files were retained", ex);
+            UpdateRecoveryBanner();
+            throw new IOException("The DHCP firewall recovery journal could not be updated. Any recorded intent was retained for recovery.", ex);
+        }
+        UpdateRecoveryBanner();
+    }
+
+    private void TrackActiveDhcpFirewallLease(DhcpFirewallRuleLease lease)
+    {
+        _dhcpFirewallRules = lease;
+        CommitDhcpFirewallLease(lease);
+    }
+
+    private bool SaveMacBackups()
+    {
+        if (!_macBackupsWritable)
+        {
+            _logger.Warn("MAC backup save blocked because its source could not be read");
+            return false;
+        }
         _savedMacBackups = _originalAdapterMacs.Values
             .Where(x => x.RestoreOnExit && !string.IsNullOrWhiteSpace(x.OriginalMacAddress))
             .OrderBy(x => x.AdapterName)
             .ToList();
-        JsonStore.Save(_paths.MacBackupsFile, _savedMacBackups);
+        try { JsonStore.Save(_paths.MacBackupsFile, _savedMacBackups); }
+        catch (Exception ex)
+        {
+            _macBackupsWritable = false;
+            _logger.Error("Save MAC recovery records failed; source and backup files were retained", ex);
+            return false;
+        }
         UpdateRecoveryBanner();
+        return true;
     }
+
+    private void RecordStorageLoad(string store, DataLoadStatus status, string? sourcePath, Exception? error, bool missingIsExpected = false)
+    {
+        if (status == DataLoadStatus.Loaded || status == DataLoadStatus.LoadedEmpty || (missingIsExpected && status == DataLoadStatus.Missing)) return;
+        if (status == DataLoadStatus.RestoredFromBackup)
+        {
+            var source = Path.GetFileName(sourcePath ?? "backup");
+            _startupDataWarnings.Add($"{store}: restored from valid backup {source}; the damaged or missing primary was preserved. / {store}：已从有效备份 {source} 恢复；损坏或缺失的主文件已保留。");
+        }
+        else if (status == DataLoadStatus.Missing)
+        {
+            _startupDataWarnings.Add($"{store}: no primary or backup file was found; writes are locked until initialization succeeds. / {store}：未找到主文件或备份；初始化成功前已锁定写入。");
+        }
+        else
+        {
+            _startupDataWarnings.Add($"{store}: primary and backup could not be read; files were preserved and related writes are locked. / {store}：主文件和备份均无法读取；文件已保留，相关写入已锁定。");
+        }
+        if (error is not null) _logger.Warn($"Data-load state for {store}: {status}; {error.Message}");
+    }
+
+    private void ShowStorageWriteBlocked(string store) => ShowActionFeedback(
+        $"{store} 数据未成功读取，当前不能保存。请先恢复或修复原文件。",
+        $"{store} data was not read successfully and cannot be saved. Restore or repair the source file first.",
+        error: true);
 
     private static string MacBackupKey(AdapterMacBackup backup) =>
         !string.IsNullOrWhiteSpace(backup.AdapterId) ? backup.AdapterId : backup.InterfaceIndex;
@@ -676,7 +1066,8 @@ public partial class MainWindow : Window
         };
         _operationHistory.Insert(0, item);
         while (_operationHistory.Count > 500) _operationHistory.RemoveAt(_operationHistory.Count - 1);
-        JsonStore.Save(_paths.OperationHistoryFile, _operationHistory);
+        try { JsonStore.Save(_paths.OperationHistoryFile, _operationHistory); }
+        catch (Exception ex) { _logger.Error("Save operation history failed; existing files were retained", ex); }
         RefreshOperationHistoryView();
         UpdateLastOperationPresentation();
         UpdateRecoveryBanner();
@@ -697,10 +1088,21 @@ public partial class MainWindow : Window
         if (RecoveryBanner == null) return;
         var routeCount = _appliedStaticRoutes.Count;
         var macCount = _originalAdapterMacs.Values.Count(x => x.RestoreOnExit);
-        RecoveryBanner.Visibility = routeCount > 0 || macCount > 0 ? Visibility.Visible : Visibility.Collapsed;
-        TxtRecoveryBanner.Text = routeCount > 0 || macCount > 0
-            ? Ui("recovery.banner", routeCount + macCount, routeCount, macCount)
-            : "";
+        var firewallCount = _dhcpFirewallRecoveries.Sum(x => x.Rules.Count);
+        var routeJournalUnreadable = !_routeJournalWritable;
+        var firewallJournalUnreadable = !_dhcpFirewallJournalWritable;
+        var leaseJournalUnreadable = !_dhcpLeaseJournalWritable;
+        RecoveryBanner.Visibility = routeCount > 0 || macCount > 0 || firewallCount > 0 || routeJournalUnreadable || firewallJournalUnreadable || leaseJournalUnreadable ? Visibility.Visible : Visibility.Collapsed;
+        var journalWarnings = new List<string>();
+        if (routeJournalUnreadable && firewallJournalUnreadable) journalWarnings.Add(Ui("recovery.banner.journals.unreadable"));
+        else if (routeJournalUnreadable) journalWarnings.Add(Ui("recovery.banner.route.journal.unreadable"));
+        else if (firewallJournalUnreadable) journalWarnings.Add(Ui("recovery.banner.firewall.journal.unreadable"));
+        if (leaseJournalUnreadable) journalWarnings.Add(Ui("recovery.banner.lease.journal.unreadable"));
+        TxtRecoveryBanner.Text = journalWarnings.Count > 0
+            ? string.Join(" ", journalWarnings)
+            : routeCount > 0 || macCount > 0 || firewallCount > 0
+                ? Ui("recovery.banner", routeCount + macCount + firewallCount, routeCount, macCount, firewallCount)
+                : "";
         AutomationProperties.SetHelpText(RecoveryBanner, Ui("recovery.summary"));
     }
 
@@ -967,15 +1369,17 @@ public partial class MainWindow : Window
             AppDialog.Show(this, _lang.T("preview.scan"), IsChineseUi() ? "请先选择网卡。" : "Select an adapter first.");
             return false;
         }
-        if (!TryGetNetwork(ManualIp.Text, ManualMask.Text, out var localIp, out var mask))
+        if (!TryGetManualScanPlan(out var scanPlan, out var validation))
         {
-            AppDialog.Show(this, _lang.T("preview.scan"), IsChineseUi() ? "本机 IP 或子网掩码无效。" : "The local IP or subnet mask is invalid.", danger: true);
+            AppDialog.Show(this, _lang.T("preview.scan"), validation, danger: true);
             return false;
         }
-        var targetText = ManualTargetIp.Text.Trim();
-        var scope = $"{localIp}/{IpNetwork.PrefixLength(mask)}";
-        if (string.IsNullOrWhiteSpace(targetText)) scope += IsChineseUi() ? "（扫描整个网段）" : " (whole subnet)";
-        else scope += IsChineseUi() ? $"（仅探测 {targetText}）" : $" (probe only {targetText})";
+        var scope = scanPlan!.IsSingleTarget
+            ? (IsChineseUi() ? $"仅探测 {scanPlan.TargetIp}" : $"probe only {scanPlan.TargetIp}")
+            : (IsChineseUi() ? $"扫描整个网段 {scanPlan.LocalIp}/{scanPlan.PrefixLength}" : $"scan subnet {scanPlan.LocalIp}/{scanPlan.PrefixLength}");
+        scope += IsChineseUi()
+            ? $"，实际目标 {scanPlan.TargetCount} 个（上限 {ScanRangePlan.MaxProbeTargets}）"
+            : $", {scanPlan.TargetCount} actual target(s) (limit {ScanRangePlan.MaxProbeTargets})";
         var current = string.IsNullOrWhiteSpace(adapter.IPv4Address) ? "DHCP / 未配置" : $"{adapter.IPv4Address} / {adapter.SubnetMask}";
         var message = IsChineseUi()
             ? $"操作：应用临时 IP 后扫描\n网卡：{adapter.DisplayName}\n连接：{adapter.ConnectionDisplay}，{adapter.KindDisplay}\n\n当前 IPv4：{current}\n变更为：{ManualIp.Text.Trim()} / {ManualMask.Text.Trim()}\n扫描范围：{scope}\n\n应用前会保存网卡备份；扫描结束后不会自动恢复，仍可使用“恢复网卡”或回滚。"
@@ -985,32 +1389,67 @@ public partial class MainWindow : Window
 
     private async void StartDhcp_Click(object sender, RoutedEventArgs e)
     {
-        if (DhcpConfirm.IsChecked != true)
+        if (!_dhcpFirewallJournalWritable)
         {
-            var message = "请勾选：" + _lang.T("isolated.confirm");
-            _logger.Warn("Isolated network confirmation missing: " + message);
-            AppDialog.Show(this, _lang.T("start.dhcp"), message);
+            AppDialog.Show(this, _lang.T("start.dhcp"), Ui("firewall.journal.unreadable"), danger: true);
             return;
         }
-        if (!EnsureSafetyOnboarding()) return;
+        if (!_dhcpLeaseJournalWritable)
+        {
+            AppDialog.Show(this, _lang.T("start.dhcp"), Ui("dhcp.lease.journal.unreadable"), danger: true);
+            return;
+        }
+        if (_dhcpFirewallRecoveries.Count > 0)
+        {
+            AppDialog.Show(this, _lang.T("start.dhcp"), Ui("firewall.recovery.required"), danger: true);
+            return;
+        }
+        var workflow = TryBeginNetworkWorkflow("DHCP start");
+        if (workflow is null) return;
         var serverStarted = false;
-        var adapterConfigured = false;
-        NetworkAdapterInfo? changedAdapter = null;
+        DhcpSessionRecovery? sessionRecovery = null;
+        DhcpLeaseScopeState? leaseScope = null;
         try
         {
-            SetBusy(true, "Starting DHCP... / 正在启动 DHCP...");
+            if (DhcpConfirm.IsChecked != true)
+            {
+                var message = "请勾选：" + _lang.T("isolated.confirm");
+                _logger.Warn("Isolated network confirmation missing: " + message);
+                AppDialog.Show(this, _lang.T("start.dhcp"), message);
+                return;
+            }
+            if (!EnsureSafetyOnboarding()) return;
+            SetBusy(true,
+                IsChineseUi() ? "正在检查目标网卡和 DHCP 参数..." : "Checking the target adapter and DHCP settings...",
+                totalPhases: 8);
             await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.Render);
             var adapter = SelectedAdapter ?? throw new InvalidOperationException("No adapter selected");
-            changedAdapter = adapter;
-            if (adapter.IsWifi && !_settings.AllowDhcpOnWifi) throw new InvalidOperationException(_lang.T("blocked.wifi"));
+            if (string.IsNullOrWhiteSpace(adapter.Id))
+                throw new InvalidOperationException(_lang.T("dhcp.restore.identity.missing"));
+            await RefreshAdapterByIdentityAsync(adapter, OperationToken);
+            if (adapter.IsWifi) throw new InvalidOperationException(_lang.T("blocked.wifi"));
             if (adapter.HasGateway && !_settings.AllowDhcpOnAdapterWithGateway) throw new InvalidOperationException(_lang.T("blocked.gateway"));
             if (adapter.IsVirtual) throw new InvalidOperationException(_lang.T("blocked.virtual"));
             if (!adapter.Status.Equals("Up", StringComparison.OrdinalIgnoreCase)) throw new InvalidOperationException(_lang.T("blocked.disconnected"));
             if (string.IsNullOrWhiteSpace(adapter.IPv4Address) && string.IsNullOrWhiteSpace(DhcpServerIp.Text)) throw new InvalidOperationException("Adapter has no IPv4 address");
+            var settings = new DhcpServerSettings
+            {
+                AdapterId = adapter.Id,
+                InterfaceIndex = int.Parse(adapter.InterfaceIndex, System.Globalization.CultureInfo.InvariantCulture),
+                ServerIp = IPAddress.Parse(DhcpServerIp.Text.Trim()),
+                SubnetMask = IPAddress.Parse(DhcpMask.Text.Trim()),
+                PoolStart = IPAddress.Parse(DhcpStart.Text.Trim()),
+                PoolEnd = IPAddress.Parse(DhcpEnd.Text.Trim()),
+                Gateway = IPAddress.TryParse(DhcpGateway.Text.Trim(), out var gateway) ? gateway : null,
+                Dns = IPAddress.TryParse(DhcpDns.Text.Trim(), out var dns) ? dns : null,
+                LeaseSeconds = int.Parse(DhcpLeaseSeconds.Text.Trim(), System.Globalization.CultureInfo.InvariantCulture)
+            };
+            _ = new DhcpLeaseManager(settings); // Validate the entire scope before changing adapter or firewall state.
+            SetBusyPhase(IsChineseUi() ? "检查现有 DHCP 服务和 WLAN 状态..." : "Checking existing DHCP and WLAN state...");
             if (_settings.DetectExistingDhcpBeforeStart)
             {
                 var detectIp = IPAddress.Parse(string.IsNullOrWhiteSpace(adapter.IPv4Address) ? DhcpServerIp.Text : adapter.IPv4Address);
-                var existing = await _dhcpDetector.DetectAsync(detectIp, 1500);
+                var existing = await _dhcpDetector.DetectAsync(detectIp, settings.InterfaceIndex, 1500, OperationToken);
                 if (existing.found) throw new InvalidOperationException($"{_lang.T("existing.dhcp")}: {existing.server} offered {existing.offeredIp}");
             }
             var wlanBefore = await _adapterService.LogReadonlyWlanStateAsync("before DHCP start", OperationToken);
@@ -1023,28 +1462,54 @@ public partial class MainWindow : Window
                         ? $"检测到最近 30 分钟内出现过“策略禁止在该接口上自动连接”的 WLAN 事件。请先参考：{docPath}"
                         : $"A WLAN event indicating policy-blocked auto connection was found in the last 30 minutes. Review: {docPath}");
             }
+            SetBusyPhase(IsChineseUi() ? "等待启动确认..." : "Waiting for start confirmation...");
             if (!ShowDhcpPreview(confirm: true)) return;
-            await RememberAdapterConfigAsync(adapter, OperationToken);
-            await _adapterService.ApplyStaticIPv4Async(adapter, DhcpServerIp.Text, DhcpMask.Text, DhcpGateway.Text, DhcpDns.Text, OperationToken);
-            adapterConfigured = true;
-            await VerifyStaticIPv4Async(adapter, DhcpServerIp.Text, DhcpMask.Text, OperationToken);
-            _activeDhcpAdapterIndex = adapter.InterfaceIndex;
+            SetBusyPhase(IsChineseUi() ? "保存网卡恢复快照..." : "Saving the adapter recovery snapshot...");
+            leaseScope = PrepareDhcpLeaseScope(settings);
+            var captured = await RememberAdapterConfigAsync(
+                adapter,
+                OperationToken,
+                forceFreshSnapshot: true,
+                preserveBackupHistory: true,
+                verifyAdapterAfterCapture: true);
+            sessionRecovery = new DhcpSessionRecovery(captured.Backup, captured.Snapshot);
+            await RefreshAdapterByIdentityAsync(adapter, OperationToken);
+            if (!string.Equals(adapter.InterfaceIndex, captured.Backup.InterfaceIndex, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException(Ui("dhcp.start.adapter.changed"));
+            _dhcpSessionRecoveries.Add(sessionRecovery);
+            _activeDhcpSession = sessionRecovery;
+            sessionRecovery.MarkModificationPending();
+            SetBusyPhase(IsChineseUi() ? "配置并验证 DHCP 网卡 IPv4..." : "Applying and verifying the DHCP adapter IPv4 settings...");
+            await _adapterService.RunWithIPv4RecoveryAsync(
+                adapter,
+                captured.Snapshot,
+                async token =>
+                {
+                    await _adapterService.ApplyStaticIPv4Async(adapter, DhcpServerIp.Text, DhcpMask.Text, DhcpGateway.Text, DhcpDns.Text, token);
+                    await VerifyStaticIPv4Async(adapter, DhcpServerIp.Text, DhcpMask.Text, token);
+                },
+                "DHCP host adapter configuration",
+                OperationToken,
+                onRestored: () =>
+                {
+                    sessionRecovery.MarkRestored();
+                    _dhcpSessionRecoveries.Remove(sessionRecovery);
+                });
+            SetBusyPhase(IsChineseUi() ? "读取并核对配置结果..." : "Reading back and verifying the adapter configuration...");
+            var expectedSessionSnapshot = await _adapterService.CaptureIPv4ConfigAsync(adapter, OperationToken);
+            var expectedPrefix = IpNetwork.PrefixLength(IPAddress.Parse(DhcpMask.Text.Trim()));
+            if (!DhcpSessionRestoreCoordinator.MatchesAppliedHostConfiguration(expectedSessionSnapshot, DhcpServerIp.Text.Trim(), expectedPrefix))
+                throw new InvalidOperationException(Ui("verify.static.failed"));
+            sessionRecovery.SetExpectedSessionSnapshot(expectedSessionSnapshot);
             MarkAdapterIp(adapter, DhcpServerIp.Text);
+            SetBusyPhase(IsChineseUi() ? "检查 WLAN 并创建、核对防火墙规则..." : "Checking WLAN and creating/verifying firewall rules...");
             await _adapterService.LogReadonlyWlanStateAsync("after DHCP start", OperationToken);
-            _dhcpFirewallRules = await _adapterService.EnsureDhcpFirewallRulesAsync(OperationToken);
-            var settings = new DhcpServerSettings
-            {
-                ServerIp = IPAddress.Parse(DhcpServerIp.Text),
-                SubnetMask = IPAddress.Parse(DhcpMask.Text),
-                PoolStart = IPAddress.Parse(DhcpStart.Text),
-                PoolEnd = IPAddress.Parse(DhcpEnd.Text),
-                Gateway = IPAddress.TryParse(DhcpGateway.Text.Trim(), out var gateway) ? gateway : null,
-                Dns = IPAddress.TryParse(DhcpDns.Text.Trim(), out var dns) ? dns : null,
-                LeaseSeconds = int.TryParse(DhcpLeaseSeconds.Text, out var lease) ? lease : 3600
-            };
-            await _dhcpServer.StartAsync(settings);
+            _dhcpFirewallRules = await _adapterService.EnsureDhcpFirewallRulesAsync(adapter.Name, TrackActiveDhcpFirewallLease, OperationToken);
+            _activeDhcpUiSessionId = Guid.NewGuid().ToString("N");
+            SetBusyPhase(IsChineseUi() ? "启动 DHCP 服务..." : "Starting the DHCP service...");
+            await _dhcpServer.StartAsync(settings, leaseScope.Bindings, leaseScope.DeclinedAddresses,
+                snapshot => PersistDhcpLeaseTable(leaseScope, snapshot));
             serverStarted = true;
-            _dhcpWasStartedInThisSession = true;
             SetDhcpRunningState(true);
             _leasePingTimer.Start();
             _leaseHintCts?.Cancel();
@@ -1059,82 +1524,155 @@ public partial class MainWindow : Window
             _logger.Warn("Start DHCP canceled by user or timeout");
             if (!serverStarted)
             {
-                await RemoveDhcpFirewallRulesAsync();
-                if (adapterConfigured && changedAdapter != null)
+                _ = await RemoveDhcpFirewallRulesAsync();
+                if (sessionRecovery?.RequiresRestore == true)
                 {
-                    try { await RestoreOriginalAdapterConfigAsync(changedAdapter); } catch (Exception restoreEx) { _logger.Error("DHCP cancellation rollback failed", restoreEx); }
+                    try { await RestoreDhcpSessionAsync(sessionRecovery, CancellationToken.None); }
+                    catch (Exception restoreEx) { _logger.Error("DHCP cancellation rollback failed; recovery remains pending", restoreEx); }
                 }
             }
-            AppDialog.Show(this, _lang.T("start.dhcp"), IsChineseUi() ? "操作已取消，已完成的网卡变更已尝试回滚。" : "The operation was canceled; completed adapter changes were rolled back where possible.");
+            if (!serverStarted)
+            {
+                _activeDhcpSession = null;
+                _activeDhcpUiSessionId = null;
+            }
+            if (!_closingCleanupStarted)
+                AppDialog.Show(this, _lang.T("start.dhcp"), IsChineseUi() ? "操作已取消，已完成的网卡变更已尝试回滚。" : "The operation was canceled; completed adapter changes were rolled back where possible.");
         }
         catch (Exception ex)
         {
             _logger.Error("Start DHCP failed", ex);
             if (!serverStarted)
             {
-                await RemoveDhcpFirewallRulesAsync();
-                if (adapterConfigured && changedAdapter != null)
+                _ = await RemoveDhcpFirewallRulesAsync();
+                if (sessionRecovery?.RequiresRestore == true)
                 {
                     try
                     {
-                        await RestoreOriginalAdapterConfigAsync(changedAdapter);
-                        _activeDhcpAdapterIndex = null;
+                        await RestoreDhcpSessionAsync(sessionRecovery, CancellationToken.None);
                         _logger.Info("DHCP startup rollback restored adapter configuration");
                     }
                     catch (Exception restoreEx)
                     {
-                        _logger.Error("DHCP startup rollback failed", restoreEx);
+                        _logger.Error("DHCP startup rollback failed; recovery remains pending", restoreEx);
                     }
                 }
             }
-            AppDialog.Show(this, _lang.T("start.dhcp"), ExplainFailure(ex, _lang.T("help.start.dhcp")), danger: true);
+            if (!serverStarted)
+            {
+                _activeDhcpSession = null;
+                _activeDhcpUiSessionId = null;
+            }
+            if (!_closingCleanupStarted)
+                AppDialog.Show(this, _lang.T("start.dhcp"), ExplainFailure(ex, _lang.T("help.start.dhcp")), danger: true);
         }
         finally
         {
             SetBusy(false);
+            EndNetworkWorkflow(workflow);
         }
     }
 
     private async void StopDhcp_Click(object sender, RoutedEventArgs e)
     {
+        var workflow = TryBeginNetworkWorkflow("DHCP stop", allowWhileDhcpRunning: true);
+        if (workflow is null) return;
+        var sessionRecovery = _activeDhcpSession;
         try
         {
-            SetBusy(true, "Stopping DHCP... / 正在停止 DHCP...");
+            var restoreAdapter = RestoreOnStop.IsChecked == true && sessionRecovery?.RequiresRestore == true;
+            SetBusy(true,
+                IsChineseUi() ? "停止 DHCP 服务..." : "Stopping the DHCP service...",
+                totalPhases: restoreAdapter ? 4 : 3);
             await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.Render);
             _dhcpServer.Stop();
-            await RemoveDhcpFirewallRulesAsync(OperationToken);
+            MarkLeaseSessionHistorical(_activeDhcpUiSessionId);
+            _activeDhcpUiSessionId = null;
+            BtnCancelOperation.IsEnabled = false;
+            SetBusyPhase(IsChineseUi() ? "清理本工具创建的防火墙规则..." : "Removing firewall rules owned by this app...");
+            var firewallCleanupSucceeded = await RemoveDhcpFirewallRulesAsync(CancellationToken.None);
             _leasePingTimer.Stop();
             _leaseHintCts?.Cancel();
-            if (RestoreOnStop.IsChecked == true)
+            if (restoreAdapter)
             {
-                var restoreAdapter = GetDhcpRestoreAdapter();
-                if (restoreAdapter != null)
+                if (sessionRecovery?.RequiresRestore == true)
                 {
-                    await RestoreOriginalAdapterConfigAsync(restoreAdapter, OperationToken);
+                    SetBusyPhase(IsChineseUi() ? "恢复网卡原始配置..." : "Restoring the adapter configuration...");
+                    await RestoreDhcpSessionAsync(sessionRecovery, CancellationToken.None);
                 }
             }
-            await _adapterService.LogReadonlyWlanStateAsync("after DHCP stop", OperationToken);
-            _activeDhcpAdapterIndex = null;
+            SetBusyPhase(IsChineseUi() ? "检查停止后的 WLAN 状态..." : "Checking WLAN state after stopping DHCP...");
+            await _adapterService.LogReadonlyWlanStateAsync("after DHCP stop", CancellationToken.None);
+            _activeDhcpSession = null;
             SetDhcpRunningState(false);
             UpdateManualScanButtons();
-            AddOperationHistory("DHCP", "", GetDhcpRestoreAdapter()?.MacAddress ?? "", "Stopped / 已停止",
-                "Service stopped and cleanup requested / 服务已停止并执行清理", scope: "DHCP session", rollbackAvailable: false);
-            ShowActionFeedback("DHCP 已停止。", "DHCP stopped.");
+            var stopStatus = firewallCleanupSucceeded ? "Stopped / 已停止" : "Stopped; firewall cleanup pending / 已停止；防火墙清理待处理";
+            AddOperationHistory("DHCP", "", sessionRecovery?.AdapterIdentity.AdapterMac ?? "", stopStatus,
+                firewallCleanupSucceeded
+                    ? "Service stopped and owned firewall rules were verified removed / 服务已停止且已确认删除所属防火墙规则"
+                    : "Service stopped; owned firewall rules remain in Recovery Center / 服务已停止；所属防火墙规则仍保留在恢复中心", scope: "DHCP session", rollbackAvailable: false);
+            ShowActionFeedback(
+                firewallCleanupSucceeded ? "DHCP 已停止。" : "DHCP 已停止，但临时防火墙规则尚未清理，请在恢复中心处理。",
+                firewallCleanupSucceeded ? "DHCP stopped." : "DHCP stopped, but temporary firewall rules remain. Review them in Recovery Center.",
+                error: !firewallCleanupSucceeded);
         }
         catch (OperationCanceledException)
         {
             _logger.Warn("Stop DHCP canceled by user or timeout");
-            AppDialog.Show(this, _lang.T("stop.dhcp"), IsChineseUi() ? "停止操作已取消；请确认 DHCP 和临时网卡配置状态。" : "Stop operation was canceled; verify the DHCP and temporary adapter state.", danger: true);
+            if (!_closingCleanupStarted)
+                AppDialog.Show(this, _lang.T("stop.dhcp"), IsChineseUi() ? "停止操作已取消；请确认 DHCP 和临时网卡配置状态。" : "Stop operation was canceled; verify the DHCP and temporary adapter state.", danger: true);
         }
         catch (Exception ex)
         {
             _logger.Error("Stop DHCP failed", ex);
-            AppDialog.Show(this, _lang.T("stop.dhcp"), ExplainFailure(ex, _lang.T("help.stop.dhcp")), danger: true);
+            if (!_closingCleanupStarted)
+                AppDialog.Show(this, _lang.T("stop.dhcp"), ExplainFailure(ex, _lang.T("help.stop.dhcp")), danger: true);
         }
         finally
         {
             SetBusy(false);
+            EndNetworkWorkflow(workflow);
         }
+    }
+
+    private async Task HandleUnexpectedDhcpStopAsync(string reason)
+    {
+        if (_dhcpServer.IsRunning) return;
+        _logger.Error("DHCP stopped unexpectedly: " + reason);
+        _leasePingTimer.Stop();
+        _leaseHintCts?.Cancel();
+        MarkLeaseSessionHistorical(_activeDhcpUiSessionId);
+        _activeDhcpUiSessionId = null;
+
+        var firewallCleanupSucceeded = await RemoveDhcpFirewallRulesAsync(CancellationToken.None);
+        var adapterRestored = false;
+        var recovery = _activeDhcpSession;
+        if (RestoreOnStop.IsChecked == true && recovery?.RequiresRestore == true)
+        {
+            try
+            {
+                await RestoreDhcpSessionAsync(recovery, CancellationToken.None);
+                adapterRestored = true;
+            }
+            catch (Exception ex)
+            {
+                _logger.Error("Unexpected DHCP stop adapter recovery remains pending", ex);
+            }
+        }
+        if (adapterRestored) _activeDhcpSession = null;
+        SetDhcpRunningState(false);
+        UpdateManualScanButtons();
+        var details = $"{reason}; firewallCleanup={firewallCleanupSucceeded}; adapterRestored={adapterRestored}";
+        AddOperationHistory("DHCP", DhcpServerIp.Text.Trim(), recovery?.AdapterIdentity.AdapterMac ?? "",
+            "Unexpected stop / 意外停止", details, scope: "DHCP session", rollbackAvailable: recovery?.RequiresRestore == true);
+        ShowActionFeedback(
+            firewallCleanupSucceeded
+                ? "DHCP 意外停止；请检查网卡恢复记录。"
+                : "DHCP 意外停止；临时防火墙规则仍待恢复中心清理。",
+            firewallCleanupSucceeded
+                ? "DHCP stopped unexpectedly. Review adapter recovery if needed."
+                : "DHCP stopped unexpectedly; temporary firewall rules remain in Recovery Center.",
+            error: true);
     }
 
     private async void ApplyScan_Click(object sender, RoutedEventArgs e)
@@ -1146,14 +1684,19 @@ public partial class MainWindow : Window
     {
         if (_scanRunning) return;
         if (!EnsureSafetyOnboarding()) return;
+        var workflow = TryBeginNetworkWorkflow("Manual configuration and scan");
+        if (workflow is null) return;
+        NetworkAdapterInfo? operationAdapter = null;
         try
         {
-            var adapter = SelectedAdapter ?? throw new InvalidOperationException("No adapter selected");
+            var adapter = operationAdapter = SelectedAdapter ?? throw new InvalidOperationException("No adapter selected");
+            if (adapter.IsWifi) throw new InvalidOperationException(_lang.T("blocked.wifi"));
             if (!ShowScanPreview(confirm: true)) return;
+            if (!TryGetManualScanPlan(out var scanPlan, out var validation))
+                throw new InvalidOperationException(validation);
             _scanRunning = true;
             UpdateManualScanButtons();
             UpdateFavoriteButtons();
-            _scanCts?.Cancel();
             _scanCts?.Dispose();
             ScanResults.Clear();
             UpdateEmptyStates();
@@ -1166,18 +1709,21 @@ public partial class MainWindow : Window
             _scanCts = CancellationTokenSource.CreateLinkedTokenSource(OperationToken);
             var scanToken = _scanCts.Token;
             await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.Render);
-            await RememberAdapterConfigAsync(adapter, scanToken);
-            await _adapterService.ApplyStaticIPv4Async(adapter, ManualIp.Text, ManualMask.Text, "", "", scanToken);
-            try
-            {
-                await VerifyStaticIPv4Async(adapter, ManualIp.Text, ManualMask.Text, scanToken);
-            }
-            catch
-            {
-                try { await RestoreOriginalAdapterConfigAsync(adapter, CancellationToken.None); }
-                catch (Exception restoreEx) { _logger.Error("Manual scan verification rollback failed", restoreEx); }
-                throw;
-            }
+            var manualRecovery = await RememberAdapterConfigAsync(
+                adapter,
+                scanToken,
+                forceFreshSnapshot: true,
+                verifyAdapterAfterCapture: true);
+            await _adapterService.RunWithIPv4RecoveryAsync(
+                adapter,
+                manualRecovery.Snapshot,
+                async token =>
+                {
+                    await _adapterService.ApplyStaticIPv4Async(adapter, ManualIp.Text, ManualMask.Text, "", "", token);
+                    await VerifyStaticIPv4Async(adapter, ManualIp.Text, ManualMask.Text, token);
+                },
+                "Manual scan adapter configuration",
+                scanToken);
             MarkAdapterIp(adapter, ManualIp.Text);
             SetBusy(false);
             _scanPhase = IsChineseUi() ? "正在扫描" : "Scanning";
@@ -1195,33 +1741,31 @@ public partial class MainWindow : Window
                 UpdateScanTiming(p.done, p.total);
                 UpdateScanSummary();
             });
-            if (IPAddress.TryParse(ManualTargetIp.Text.Trim(), out var targetIp))
+            if (scanPlan!.IsSingleTarget)
             {
-                await ProbeTargetUntilOnlineAsync(targetIp, progress, scanToken);
+                await ProbeTargetUntilOnlineAsync(scanPlan.TargetIp!, progress, scanToken);
             }
             else
             {
-                await _scanner.ScanAsync(IPAddress.Parse(ManualIp.Text), IPAddress.Parse(ManualMask.Text), _settings.PingConcurrency, _settings.PingTimeoutMs, _settings.HttpTimeoutMs, progress, scanToken);
+                await _scanner.ScanPlanAsync(scanPlan, _settings.PingConcurrency, _settings.PingTimeoutMs, _settings.HttpTimeoutMs, progress, scanToken);
             }
             _scanPhase = IsChineseUi() ? "扫描完成" : "Scan complete";
             UpdateScanTiming((int)ScanProgress.Value, (int)ScanProgress.Maximum);
             AddOperationHistory("Scan", ManualTargetIp.Text.Trim(), adapter.MacAddress, "Completed / 已完成",
                 $"{ScanResults.Count} result(s) / {ScanResults.Count} 条结果", scope: adapter.Name,
                 durationMs: _scanStopwatch?.ElapsedMilliseconds ?? 0,
-                rollbackAvailable: _originalAdapterConfigs.ContainsKey(adapter.InterfaceIndex));
+                rollbackAvailable: _originalAdapterConfigs.ContainsKey(AdapterSnapshotKey(adapter)));
             ShowActionFeedback("扫描已完成。", "Scan completed.");
         }
         catch (OperationCanceledException)
         {
-            _logger.Info("Scan canceled by user or timeout");
-            ScanStatus.Text = IsChineseUi() ? "已取消，已保留已收集结果" : "Canceled; collected results were kept";
-            _scanPhase = IsChineseUi() ? "已取消" : "Canceled";
-            UpdateScanTiming((int)ScanProgress.Value, (int)ScanProgress.Maximum);
+            CompleteCanceledScan(operationAdapter);
         }
         catch (Exception ex)
         {
             _logger.Error("Apply and scan failed", ex);
-            AppDialog.Show(this, _lang.T("apply.scan"), ExplainFailure(ex, _lang.T("help.apply.scan")), danger: true);
+            if (!_closingCleanupStarted)
+                AppDialog.Show(this, _lang.T("apply.scan"), ExplainFailure(ex, _lang.T("help.apply.scan")), danger: true);
         }
         finally
         {
@@ -1230,9 +1774,29 @@ public partial class MainWindow : Window
             _scanRunning = false;
             _scanCts?.Dispose();
             _scanCts = null;
+            EndNetworkWorkflow(workflow);
             UpdateManualScanButtons();
             UpdateFavoriteButtons();
         }
+    }
+
+    private void CompleteCanceledScan(NetworkAdapterInfo? adapter)
+    {
+        _logger.Info("Scan canceled by user or timeout");
+        ScanStatus.Text = IsChineseUi() ? "已取消，已保留已收集结果" : "Canceled; collected results were kept";
+        _scanPhase = IsChineseUi() ? "已取消" : "Canceled";
+        UpdateScanTiming((int)ScanProgress.Value, (int)ScanProgress.Maximum);
+        var target = ManualTargetIp.Text.Trim();
+        var resultCount = ScanResults.Count;
+        AddOperationHistory(
+            "Scan",
+            target,
+            adapter?.MacAddress ?? "",
+            IsChineseUi() ? "已取消" : "Canceled",
+            IsChineseUi() ? $"已保留 {resultCount} 条已收集结果" : $"Retained {resultCount} collected result(s)",
+            scope: adapter?.Name,
+            durationMs: _scanStopwatch?.ElapsedMilliseconds ?? 0,
+            rollbackAvailable: adapter is not null && _originalAdapterConfigs.ContainsKey(AdapterSnapshotKey(adapter)));
     }
 
     private void UpdateScanTiming(int done, int total)
@@ -1279,7 +1843,8 @@ public partial class MainWindow : Window
         while (!ct.IsCancellationRequested)
         {
             attempt++;
-            var latency = await PingLatencyAsync(ip);
+            var latency = await PingLatencyAsync(ip, 800, ct);
+            ct.ThrowIfCancellationRequested();
             result.LatencyMs = latency;
             result.PingOk = latency >= 0;
             if (result.PingOk) result.ClearStatusOverride();
@@ -1294,8 +1859,9 @@ public partial class MainWindow : Window
 
             if (result.PingOk)
             {
-                result.Hostname = ResolveHost(ip);
+                result.Hostname = await ResolveHostAsync(ip, ct);
                 var probes = await _probe.ProbeAsync(ip, _settings.HttpTimeoutMs, ct);
+                ct.ThrowIfCancellationRequested();
                 result.HttpOk = probes.http;
                 result.HttpsOk = probes.https;
                 ScanGrid.Items.Refresh();
@@ -1356,34 +1922,83 @@ public partial class MainWindow : Window
             confirm: true,
             danger: true)) return;
 
+        var workflow = TryBeginNetworkWorkflow("Adapter restart");
+        if (workflow is null) return;
+
         _adapterActionInProgress = true;
         UpdateAdapterActionButtons();
+        AdapterConfigBackup? restartRecoveryBackup = null;
         try
         {
-            SetBusy(true, IsChineseUi() ? "正在重启网卡，请稍后..." : "Restarting adapter, please wait...");
+            SetBusy(true,
+                IsChineseUi() ? "保存网卡恢复快照..." : "Saving the adapter recovery snapshot...",
+                totalPhases: 3);
             await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.Render);
-            await _adapterService.RestartAdapterAsync(adapter, _settings.AllowRestartOnAnyAdapter, OperationToken);
-            _logger.Info($"Adapter restart completed: idx={adapter.InterfaceIndex} name={adapter.Name} status={adapter.Status}");
-            await RefreshAdaptersAsync();
-            var refreshed = Adapters.FirstOrDefault(x => x.InterfaceIndex.Equals(adapter.InterfaceIndex, StringComparison.OrdinalIgnoreCase));
-            if (refreshed == null || !refreshed.Status.Equals("Up", StringComparison.OrdinalIgnoreCase))
-                throw new InvalidOperationException(IsChineseUi() ? "重启后校验失败：网卡未恢复为已连接状态。" : "Post-change verification failed: the adapter did not return to the connected state.");
+            var captured = await RememberAdapterConfigAsync(
+                adapter,
+                OperationToken,
+                forceFreshSnapshot: true,
+                preserveBackupHistory: true,
+                verifyAdapterAfterCapture: true);
+            restartRecoveryBackup = captured.Backup;
+            if (!captured.Snapshot.AdapterEnabled.HasValue)
+                throw new InvalidOperationException(IsChineseUi()
+                    ? "无法读取网卡原管理状态，已取消重启。"
+                    : "The adapter's original administrative state could not be read; restart was canceled.");
+            if (await _adapterService.IsAdapterEnabledAsync(adapter, OperationToken) != captured.Snapshot.AdapterEnabled.Value)
+                throw new InvalidOperationException(IsChineseUi()
+                    ? "保存恢复快照期间网卡管理状态发生变化，已取消重启。"
+                    : "The adapter administrative state changed while its recovery snapshot was being saved; restart was canceled.");
+
+            SetBusyPhase(IsChineseUi() ? "重启网卡并核对管理状态..." : "Restarting the adapter and verifying its administrative state...");
+            var restartResult = await _adapterService.RestartAdapterAsync(
+                adapter,
+                _settings.AllowRestartOnAnyAdapter,
+                OperationToken,
+                expectedEnabledBefore: captured.Snapshot.AdapterEnabled);
+            RemoveRestartRecoveryBackup(restartRecoveryBackup);
+            _logger.Info($"Adapter restart completed: idx={adapter.InterfaceIndex} name={adapter.Name} wasDisabled={restartResult.WasDisabledBefore} status={restartResult.FinalStatus}");
+            SetBusyPhase(IsChineseUi() ? "刷新网卡列表并核对原网卡身份..." : "Refreshing the adapter list and verifying its identity...");
+            await RefreshAdaptersAsync(allowDuringNetworkWorkflow: true, cancellationToken: CancellationToken.None);
+            var refreshed = Adapters.FirstOrDefault(x => x.Id.Equals(adapter.Id, StringComparison.OrdinalIgnoreCase));
+            if (refreshed == null || refreshed.Status.Equals("Disabled", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException(IsChineseUi() ? "重启后校验失败：网卡仍处于禁用状态或无法通过原身份找到。" : "Post-change verification failed: the adapter is still disabled or cannot be found by its original identity.");
             AddOperationHistory("Adapter", "", refreshed.MacAddress, "Restarted / 已重启", refreshed.Name, scope: refreshed.Name);
         }
         catch (OperationCanceledException)
         {
             _logger.Warn($"Adapter restart canceled: idx={adapter.InterfaceIndex} name={adapter.Name}");
+            if (restartRecoveryBackup != null) RemoveRestartRecoveryBackup(restartRecoveryBackup);
         }
         catch (Exception ex)
         {
             _logger.Error($"Adapter restart failed: idx={adapter.InterfaceIndex} name={adapter.Name}", ex);
-            AppDialog.Show(this, _lang.T("restart.adapter"), ExplainFailure(ex, _lang.T("help.restart.adapter")), danger: true);
+            if (restartRecoveryBackup != null && ex is not AggregateException)
+                RemoveRestartRecoveryBackup(restartRecoveryBackup);
+            if (!_closingCleanupStarted)
+                AppDialog.Show(this, _lang.T("restart.adapter"), ExplainFailure(ex, _lang.T("help.restart.adapter")), danger: true);
         }
         finally
         {
             _adapterActionInProgress = false;
             UpdateAdapterActionButtons();
             SetBusy(false);
+            EndNetworkWorkflow(workflow);
+        }
+    }
+
+    private void RemoveRestartRecoveryBackup(AdapterConfigBackup backup)
+    {
+        var nextBackups = _adapterBackups.Where(x => !ReferenceEquals(x, backup)).ToList();
+        if (nextBackups.Count == _adapterBackups.Count) return;
+        try
+        {
+            JsonStore.Save(_paths.AdapterBackupsFile, nextBackups);
+            _adapterBackups = nextBackups;
+        }
+        catch (Exception ex)
+        {
+            _logger.Warn("Adapter restart recovery record remains available because its cleanup could not be saved: " + ex.Message);
         }
     }
 
@@ -1401,9 +2016,21 @@ public partial class MainWindow : Window
         var dialog = new MacAddressWindow(adapter) { Owner = this };
         dialog.ApplyOwnerTheme(this);
         if (dialog.ShowDialog() != true) return;
+        try
+        {
+            await RefreshAdapterByIdentityAsync(adapter, CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            _logger.Error("MAC change canceled because the selected adapter could not be refreshed by stable identity", ex);
+            AppDialog.Show(this, _lang.T("change.mac"), ExplainFailure(ex, _lang.T("help.change.mac")), danger: true);
+            return;
+        }
         var requestedMac = dialog.MacAddress;
+        var preOperationMac = adapter.MacAddress;
         var key = AdapterKey(adapter);
         var hadBackup = _originalAdapterMacs.TryGetValue(key, out var existingBackup);
+        var previousRestoreOnExit = existingBackup?.RestoreOnExit ?? false;
         if (!hadBackup)
         {
             if (string.IsNullOrWhiteSpace(adapter.MacAddress))
@@ -1419,47 +2046,117 @@ public partial class MainWindow : Window
                 OriginalMacAddress = adapter.MacAddress,
                 CapturedAt = DateTime.Now
             };
-            _originalAdapterMacs[key] = existingBackup;
         }
-        existingBackup!.RestoreOnExit = dialog.RestoreOnExit;
-        SaveMacBackups();
+
+        var workflow = TryBeginNetworkWorkflow("MAC change");
+        if (workflow is null) return;
 
         _adapterActionInProgress = true;
-        var macChanged = false;
+        var macRecoveryWorkflowStarted = false;
         UpdateAdapterActionButtons();
         try
         {
-            SetBusy(true, IsChineseUi() ? "正在修改 MAC，请稍后..." : "Changing MAC, please wait...");
+            if (!hadBackup) _originalAdapterMacs[key] = existingBackup!;
+            // Persist an in-flight recovery intent before the first MAC write. On success it is
+            // reduced to the user's requested normal-exit preference below.
+            existingBackup!.RestoreOnExit = true;
+            if (!SaveMacBackups())
+            {
+                if (!hadBackup) _originalAdapterMacs.Remove(key);
+                else existingBackup.RestoreOnExit = previousRestoreOnExit;
+                ShowStorageWriteBlocked("MAC recovery records / MAC 恢复记录");
+                return;
+            }
+            SetBusy(true,
+                IsChineseUi() ? "修改 MAC 并核对驱动返回..." : "Changing the MAC address and checking the driver result...",
+                totalPhases: 3);
             await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.Render);
-            await _adapterService.ChangeMacAddressAsync(adapter, requestedMac, _settings.AllowMacChangeOnAnyAdapter, OperationToken);
-            macChanged = true;
+            macRecoveryWorkflowStarted = true;
+            await _adapterService.RunWithMacRecoveryAsync(
+                adapter,
+                preOperationMac,
+                async token =>
+                {
+                    await _adapterService.ChangeMacAddressAsync(adapter, requestedMac, _settings.AllowMacChangeOnAnyAdapter, token);
+                    adapter.MacAddress = requestedMac;
+                    TxtMac.Text = requestedMac;
+                    AdapterBox.Items.Refresh();
+                    _logger.Info($"Adapter MAC change command returned: idx={adapter.InterfaceIndex} name={adapter.Name} old={existingBackup.OriginalMacAddress} requested={requestedMac}");
+                    SetBusyPhase(IsChineseUi() ? "刷新网卡并核对新 MAC..." : "Refreshing the adapter and verifying the new MAC...");
+                    await RefreshAdaptersAsync(allowDuringNetworkWorkflow: true, cancellationToken: CancellationToken.None);
+                    var observed = Adapters.FirstOrDefault(x => x.InterfaceIndex.Equals(adapter.InterfaceIndex, StringComparison.OrdinalIgnoreCase));
+                    var expectedMac = NetworkAdapterService.NormalizeMacAddress(requestedMac);
+                    var actualMac = observed == null ? "" : NetworkAdapterService.NormalizeMacAddress(observed.MacAddress);
+                    if (observed == null || !actualMac.Equals(expectedMac, StringComparison.OrdinalIgnoreCase))
+                        throw new InvalidOperationException(IsChineseUi() ? "修改后校验失败：当前 MAC 与目标值不一致。" : "Post-change verification failed: the current MAC does not match the requested value.");
+                },
+                (original, token) => VerifyMacAddressAsync(existingBackup, original, token),
+                "Adapter MAC change",
+                OperationToken,
+                onRestored: () =>
+                {
+                    adapter.MacAddress = preOperationMac;
+                    TxtMac.Text = preOperationMac;
+                    AdapterBox.Items.Refresh();
+                    if (!hadBackup) _originalAdapterMacs.Remove(key);
+                    else existingBackup.RestoreOnExit = previousRestoreOnExit;
+                    if (!SaveMacBackups())
+                        throw new IOException("MAC was restored, but its recovery record could not be updated; retain the record for retry.");
+                },
+                onRecoveryRequired: recoveryError =>
+                {
+                    existingBackup.RestoreOnExit = true;
+                    _originalAdapterMacs[key] = existingBackup;
+                    if (!SaveMacBackups()) _logger.Error("MAC recovery record remains in memory but could not be saved after compensation failed", recoveryError);
+                });
+
+            SetBusyPhase(IsChineseUi() ? "保存退出时的 MAC 恢复选项..." : "Saving the MAC restoration preference for exit...");
+            existingBackup.RestoreOnExit = dialog.RestoreOnExit;
+            if (!dialog.RestoreOnExit) _originalAdapterMacs.Remove(key);
+            if (!SaveMacBackups())
+            {
+                existingBackup.RestoreOnExit = true;
+                _originalAdapterMacs[key] = existingBackup;
+                _logger.Warn("MAC changed successfully, but the selected normal-exit restoration preference could not be saved; the original MAC remains scheduled for restoration.");
+                if (!_closingCleanupStarted)
+                    AppDialog.Show(this, _lang.T("change.mac"), IsChineseUi()
+                        ? "MAC 已修改，但无法保存退出恢复选项；为保证可恢复，原 MAC 仍会在正常退出时恢复。"
+                        : "The MAC changed, but the exit-restoration preference could not be saved. The original MAC remains scheduled for restoration on normal exit.", danger: true);
+            }
             adapter.MacAddress = requestedMac;
             TxtMac.Text = requestedMac;
             AdapterBox.Items.Refresh();
             _logger.Info($"Adapter MAC changed: idx={adapter.InterfaceIndex} name={adapter.Name} old={existingBackup.OriginalMacAddress} new={requestedMac} restoreOnExit={existingBackup.RestoreOnExit}");
-            await RefreshAdaptersAsync();
-            var observed = Adapters.FirstOrDefault(x => x.InterfaceIndex.Equals(adapter.InterfaceIndex, StringComparison.OrdinalIgnoreCase));
-            var expectedMac = NetworkAdapterService.NormalizeMacAddress(requestedMac);
-            var actualMac = observed == null ? "" : NetworkAdapterService.NormalizeMacAddress(observed.MacAddress);
-            if (observed == null || !actualMac.Equals(expectedMac, StringComparison.OrdinalIgnoreCase))
-                throw new InvalidOperationException(IsChineseUi() ? "修改后校验失败：当前 MAC 与目标值不一致。" : "Post-change verification failed: the current MAC does not match the requested value.");
             AddOperationHistory("MAC", "", requestedMac, "Changed / 已修改", $"{existingBackup.OriginalMacAddress} -> {requestedMac}", scope: adapter.Name, rollbackAvailable: existingBackup.RestoreOnExit);
         }
         catch (OperationCanceledException)
         {
             _logger.Warn($"Adapter MAC change canceled: idx={adapter.InterfaceIndex} name={adapter.Name}");
+            if (!macRecoveryWorkflowStarted)
+            {
+                if (!hadBackup) _originalAdapterMacs.Remove(key);
+                else existingBackup!.RestoreOnExit = previousRestoreOnExit;
+                SaveMacBackups();
+            }
         }
         catch (Exception ex)
         {
             _logger.Error($"Adapter MAC change failed: idx={adapter.InterfaceIndex} name={adapter.Name} requested={requestedMac}", ex);
-            if (!hadBackup && !macChanged) { _originalAdapterMacs.Remove(key); SaveMacBackups(); }
-            AppDialog.Show(this, _lang.T("change.mac"), ExplainFailure(ex, _lang.T("help.change.mac")), danger: true);
+            if (!macRecoveryWorkflowStarted)
+            {
+                if (!hadBackup) _originalAdapterMacs.Remove(key);
+                else existingBackup!.RestoreOnExit = previousRestoreOnExit;
+                SaveMacBackups();
+            }
+            if (!_closingCleanupStarted)
+                AppDialog.Show(this, _lang.T("change.mac"), ExplainFailure(ex, _lang.T("help.change.mac")), danger: true);
         }
         finally
         {
             _adapterActionInProgress = false;
             UpdateAdapterActionButtons();
             SetBusy(false);
+            EndNetworkWorkflow(workflow);
         }
     }
 
@@ -1482,14 +2179,39 @@ public partial class MainWindow : Window
 
     private async Task<IReadOnlyList<StaticRoutePlanItem>?> PreviewRoutesAsync(bool apply)
     {
+        NetworkWorkflowLease? workflow = null;
+        if (apply)
+        {
+            if (!_routeJournalWritable)
+            {
+                ShowStorageWriteBlocked("Static route recovery journal / 静态路由恢复日志");
+                return null;
+            }
+            if (!EnsureSafetyOnboarding()) return null;
+            workflow = TryBeginNetworkWorkflow("Static route apply");
+            if (workflow is null) return null;
+        }
+        else if (_activeNetworkWorkflow is not null || _operationCts is not null || _dhcpServer.IsRunning)
+        {
+            ShowActionFeedback("当前网络操作期间不能刷新路由预览。", "Route preview is unavailable during another network operation.", error: true);
+            return null;
+        }
+
         try
         {
-            if (apply && !EnsureSafetyOnboarding()) return null;
+            var routeAssessment = ProfileValidation.AssessRoutes(StaticRoutes);
+            if (routeAssessment.Status == ProfileSectionStatus.Invalid)
+                throw new InvalidOperationException(FormatProfileSection("Routes", routeAssessment));
             var targets = BuildStaticRouteTargets();
-            SetBusy(true, apply ? "Preparing route changes... / 正在准备路由变更..." : "Preparing route preview... / 正在准备路由预览...");
+            SetBusy(true,
+                apply ? "Preparing route changes... / 正在准备路由变更..." : "Preparing route preview... / 正在准备路由预览...",
+                totalPhases: apply ? 4 : 2);
             await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.Render);
             var plan = await _routeService.PreviewAsync(targets, _appliedStaticRoutes.ToList(), OperationToken);
             var summary = BuildRoutePreviewText(plan, apply);
+            SetBusyPhase(apply
+                ? (IsChineseUi() ? "等待路由应用确认..." : "Waiting for route-application confirmation...")
+                : (IsChineseUi() ? "展示路由预览..." : "Showing the route preview..."));
             if (!AppDialog.Show(this,
                 apply
                     ? (IsChineseUi() ? "确认应用静态路由" : "Confirm Static Routes")
@@ -1502,19 +2224,49 @@ public partial class MainWindow : Window
             }
             if (!apply) return plan;
 
-            if (_appliedStaticRoutes.Count > 0 && !await ClearAppliedRoutesAsync(OperationToken)) return plan;
+            SetBusyPhase(IsChineseUi() ? "清理本工具旧路由并应用新路由..." : "Removing old app-owned routes and applying the new routes...");
+            if (_appliedStaticRoutes.Count > 0)
+            {
+                var cleanupFailures = new List<string>();
+                if (!await ClearAppliedRoutesAsync(OperationToken, cleanupFailures))
+                {
+                    ShowRouteCleanupFailure(IsChineseUi() ? "无法应用新路由" : "Cannot Apply New Routes", cleanupFailures);
+                    return plan;
+                }
+            }
             var results = await _routeService.ApplyAsync(
                 targets,
                 onCreated: applied =>
                 {
+                    var intent = _appliedStaticRoutes.FirstOrDefault(x =>
+                        !x.OwnershipVerified
+                        && x.RuleId.Equals(applied.RuleId, StringComparison.OrdinalIgnoreCase)
+                        && x.InterfaceIndex == applied.InterfaceIndex
+                        && x.DestinationPrefix.Equals(applied.DestinationPrefix, StringComparison.OrdinalIgnoreCase)
+                        && x.NextHop.Equals(applied.NextHop, StringComparison.OrdinalIgnoreCase));
+                    if (intent is not null) _appliedStaticRoutes.Remove(intent);
                     _appliedStaticRoutes.Add(applied);
-                    SaveStaticRouteSession();
+                    if (!SaveStaticRouteSession())
+                        throw new IOException("The applied route could not be saved to the recovery journal.");
                     UpdateRecoveryBanner();
                 },
-                ct: OperationToken);
+                ct: OperationToken,
+                onCreating: intent =>
+                {
+                    _appliedStaticRoutes.Add(intent);
+                    if (!SaveStaticRouteSession())
+                    {
+                        _appliedStaticRoutes.Remove(intent);
+                        throw new IOException("The route creation intent could not be saved to the recovery journal; no route was created.");
+                    }
+                    UpdateRecoveryBanner();
+                },
+                onRemoved: RemoveAppliedRouteRecord);
             foreach (var result in results) result.Rule.Status = result.StatusText;
-            SaveStaticRouteSession();
+            if (!SaveStaticRouteSession())
+                throw new IOException("The applied routes could not be saved to the recovery journal.");
             RouteGrid.Items.Refresh();
+            SetBusyPhase(IsChineseUi() ? "刷新路由表并核对应用结果..." : "Refreshing the route table and verifying the applied routes...");
             await LoadCurrentStaticRoutesAsync(Adapters.ToList(), OperationToken);
             await VerifyAppliedRoutesAsync(results, OperationToken);
             AddOperationHistory("Static Routes", "", "", "Completed / 已完成",
@@ -1528,23 +2280,41 @@ public partial class MainWindow : Window
         catch (OperationCanceledException)
         {
             _logger.Warn("Static route operation canceled by user or timeout");
-            AppDialog.Show(this, _lang.T("apply.routes"), IsChineseUi() ? "路由操作已取消，已完成的路由会按本次运行记录保留，可从历史或清理入口处理。" : "The route operation was canceled; completed routes remain recorded for this run and can be handled from History or Clear Applied.", danger: true);
+            if (!_closingCleanupStarted)
+            {
+                var remaining = _appliedStaticRoutes.Count;
+                var message = IsChineseUi()
+                    ? remaining == 0
+                        ? "路由操作已取消；已创建的路由均已核实回滚。"
+                        : $"路由操作已取消；仍有 {remaining} 条路由恢复记录待处理。未核实归属的记录不会自动删除，请查看恢复中心。"
+                    : remaining == 0
+                        ? "The route operation was canceled; all created routes were verified as rolled back."
+                        : $"The route operation was canceled; {remaining} route recovery record(s) remain. Unverified ownership is never deleted automatically; review Recovery Center.";
+                AppDialog.Show(this, _lang.T("apply.routes"), message, danger: remaining > 0);
+            }
             return null;
         }
         catch (Exception ex)
         {
             if (apply && _appliedStaticRoutes.Count > 0)
             {
-                try { await ClearAppliedRoutesAsync(); }
+                try
+                {
+                    var cleanupFailures = new List<string>();
+                    if (!await ClearAppliedRoutesAsync(failureDetails: cleanupFailures))
+                        _logger.Error($"Route failure cleanup retained {_appliedStaticRoutes.Count} recovery record(s): {string.Join("; ", cleanupFailures)}", ex);
+                }
                 catch (Exception cleanupEx) { _logger.Error("Route failure cleanup failed", cleanupEx); }
             }
             _logger.Error("Static route operation failed", ex);
-            AppDialog.Show(this, _lang.T("apply.routes"), ExplainFailure(ex, _lang.T("help.apply.routes")), danger: true);
+            if (!_closingCleanupStarted)
+                AppDialog.Show(this, _lang.T("apply.routes"), ExplainFailure(ex, _lang.T("help.apply.routes")), danger: true);
             return null;
         }
         finally
         {
             SetBusy(false);
+            if (workflow is not null) EndNetworkWorkflow(workflow);
         }
     }
 
@@ -1568,6 +2338,11 @@ public partial class MainWindow : Window
 
     private async void ClearAppliedRoutes_Click(object sender, RoutedEventArgs e)
     {
+        if (!_routeJournalWritable)
+        {
+            ShowStorageWriteBlocked("Static route recovery journal / 静态路由恢复日志");
+            return;
+        }
         if (_appliedStaticRoutes.Count == 0)
         {
             AppDialog.Show(this,
@@ -1583,17 +2358,17 @@ public partial class MainWindow : Window
                 : $"This will remove {_appliedStaticRoutes.Count} route(s) created by this run. Existing system routes will not change. Continue?",
             confirm: true,
             danger: true)) return;
+        var workflow = TryBeginNetworkWorkflow("Clear applied routes");
+        if (workflow is null) return;
         try
         {
             SetBusy(true, "Clearing routes... / 正在清除路由...");
             await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.Render);
-            var cleared = await ClearAppliedRoutesAsync(OperationToken);
+            var failureDetails = new List<string>();
+            var cleared = await ClearAppliedRoutesAsync(OperationToken, failureDetails);
             if (!cleared)
             {
-                AppDialog.Show(this,
-                    IsChineseUi() ? "清除静态路由" : "Clear Static Routes",
-                    IsChineseUi() ? "部分路由未能清除，详细原因已写入日志。" : "Some routes could not be cleared. See the log for details.",
-                    danger: true);
+                ShowRouteCleanupFailure(IsChineseUi() ? "清除静态路由" : "Clear Static Routes", failureDetails);
             }
             else
             {
@@ -1603,26 +2378,44 @@ public partial class MainWindow : Window
         catch (OperationCanceledException)
         {
             _logger.Warn("Clear static routes canceled by user or timeout");
+            if (!_closingCleanupStarted && _appliedStaticRoutes.Count > 0)
+            {
+                var remaining = _appliedStaticRoutes
+                    .Select(x => $"{x.DestinationPrefix} on {x.AdapterName}: 清理已取消，记录保留 / cleanup canceled; record retained")
+                    .ToList();
+                ShowRouteCleanupFailure(IsChineseUi() ? "清除静态路由已取消" : "Clear Static Routes Canceled", remaining);
+            }
         }
         catch (Exception ex)
         {
             _logger.Error("Clear static routes failed", ex);
-            AppDialog.Show(this, _lang.T("clear.applied.routes"), ExplainFailure(ex, _lang.T("help.clear.applied.routes")), danger: true);
+            if (!_closingCleanupStarted)
+                AppDialog.Show(this, _lang.T("clear.applied.routes"), ExplainFailure(ex, _lang.T("help.clear.applied.routes")), danger: true);
         }
         finally
         {
             SetBusy(false);
+            EndNetworkWorkflow(workflow);
         }
     }
 
     private async void RemoveRoute_Click(object sender, RoutedEventArgs e)
     {
         if (RouteGrid.SelectedItem is not StaticRouteRule rule) { ShowActionFeedbackKey("selection.route"); return; }
+        NetworkWorkflowLease? workflow = null;
+        List<AppliedStaticRoute>? recoverySnapshot = null;
+        var journalCommitted = false;
         try
         {
             var applied = _appliedStaticRoutes.Where(x => x.RuleId.Equals(rule.Id, StringComparison.OrdinalIgnoreCase)).ToList();
             if (applied.Count > 0)
             {
+                recoverySnapshot = _appliedStaticRoutes.ToList();
+                if (!_routeJournalWritable)
+                {
+                    ShowStorageWriteBlocked("Static route recovery journal / 静态路由恢复日志");
+                    return;
+                }
                 if (!EnsureSafetyOnboarding()) return;
                 if (!AppDialog.Show(this,
                     IsChineseUi() ? "删除已应用路由" : "Remove Applied Route",
@@ -1631,6 +2424,8 @@ public partial class MainWindow : Window
                         : $"Destination: {rule.DestinationPrefix}\nAdapter: {rule.AdapterName}\n\nThe system route created by this run will be removed. Continue?",
                     confirm: true,
                     danger: true)) return;
+                workflow = TryBeginNetworkWorkflow("Remove applied route");
+                if (workflow is null) return;
                 SetBusy(true, "Removing route... / 正在删除路由...");
                 await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.Render);
                 foreach (var route in applied)
@@ -1640,7 +2435,9 @@ public partial class MainWindow : Window
                     await _routeService.RemoveAsync(route, adapter, OperationToken);
                     _appliedStaticRoutes.Remove(route);
                 }
-                SaveStaticRouteSession();
+                if (!SaveStaticRouteSession())
+                    throw new IOException("The route recovery journal could not be updated after removal.");
+                journalCommitted = true;
             }
             StaticRoutes.Remove(rule);
             RouteGrid.SelectedItem = null;
@@ -1649,16 +2446,32 @@ public partial class MainWindow : Window
         }
         catch (OperationCanceledException)
         {
+            RestoreUncommittedRouteJournal();
             _logger.Warn("Remove static route canceled by user or timeout");
         }
         catch (Exception ex)
         {
+            RestoreUncommittedRouteJournal();
             _logger.Error("Remove static route failed", ex);
-            AppDialog.Show(this, _lang.T("remove.route"), ExplainFailure(ex, _lang.T("help.remove.route")), danger: true);
+            if (!_closingCleanupStarted)
+                AppDialog.Show(this, _lang.T("remove.route"), ExplainFailure(ex, _lang.T("help.remove.route")), danger: true);
         }
         finally
         {
-            SetBusy(false);
+            if (workflow is not null)
+            {
+                SetBusy(false);
+                EndNetworkWorkflow(workflow);
+            }
+        }
+
+        void RestoreUncommittedRouteJournal()
+        {
+            if (recoverySnapshot is null || journalCommitted) return;
+            _appliedStaticRoutes.Clear();
+            _appliedStaticRoutes.AddRange(recoverySnapshot);
+            UpdateRouteStatuses();
+            UpdateRecoveryBanner();
         }
     }
 
@@ -1739,32 +2552,50 @@ public partial class MainWindow : Window
 
     private async void RestoreScan_Click(object sender, RoutedEventArgs e)
     {
-        if (SelectedAdapter == null) return;
+        var adapter = SelectedAdapter;
+        if (adapter == null) return;
         if (!EnsureSafetyOnboarding()) return;
+        var workflow = TryBeginNetworkWorkflow("Manual adapter restore");
+        if (workflow is null) return;
+        AdapterIpv4Snapshot? preRestoreSnapshot = null;
+        var restoreAttempted = false;
         try
         {
-            SetBusy(true, "Restoring adapter... / 正在恢复网卡...");
+            SetBusy(true,
+                "Capturing the current adapter state... / 正在读取当前网卡状态...",
+                totalPhases: 3);
             await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.Render);
-            await RestoreOriginalAdapterConfigAsync(SelectedAdapter, OperationToken);
-            await RefreshAdaptersAsync();
+            preRestoreSnapshot = await _adapterService.CaptureIPv4ConfigAsync(adapter, OperationToken);
+            restoreAttempted = true;
+            SetBusyPhase("Restoring and verifying the saved adapter configuration... / 正在恢复并核对已保存的网卡配置...");
+            await RestoreOriginalAdapterConfigAsync(adapter, OperationToken);
+            SetBusyPhase("Refreshing the adapter list... / 正在刷新网卡列表...");
+            await RefreshAdaptersAsync(allowDuringNetworkWorkflow: true, cancellationToken: CancellationToken.None);
         }
         catch (OperationCanceledException)
         {
             _logger.Warn("Restore manual adapter canceled by user or timeout");
+            if (restoreAttempted && preRestoreSnapshot is not null)
+                await CompensateAdapterConfigAsync(adapter, preRestoreSnapshot, "Manual adapter restore cancellation");
         }
         catch (Exception ex)
         {
             _logger.Error("Restore manual adapter failed", ex);
-            AppDialog.Show(this, "Restore / 恢复网卡", ExplainFailure(ex, _lang.T("help.restore.scan")), danger: true);
+            if (restoreAttempted && preRestoreSnapshot is not null)
+                await CompensateAdapterConfigAsync(adapter, preRestoreSnapshot, "Manual adapter restore failure");
+            if (!_closingCleanupStarted)
+                AppDialog.Show(this, "Restore / 恢复网卡", ExplainFailure(ex, _lang.T("help.restore.scan")), danger: true);
         }
         finally
         {
             SetBusy(false);
+            EndNetworkWorkflow(workflow);
         }
     }
 
     private void AddFavorite_Click(object sender, RoutedEventArgs e)
     {
+        if (!_favoritesWritable) { ShowStorageWriteBlocked("Favorites / 收藏"); return; }
         var fav = new FavoriteConfig
         {
             Name = string.IsNullOrWhiteSpace(ManualIp.Text) ? "Favorite" : ManualIp.Text,
@@ -1782,8 +2613,9 @@ public partial class MainWindow : Window
         dialog.ApplyOwnerTheme(this);
         if (dialog.ShowDialog() == true)
         {
+            var previous = SnapshotFavorites();
             _allFavorites.Add(fav);
-            SaveFavorites();
+            if (!SaveFavoritesOrRestore(previous)) return;
             FilterFavorites();
             _logger.Info("Favorite added: " + fav.Name);
         }
@@ -1791,6 +2623,7 @@ public partial class MainWindow : Window
 
     private void NewFavorite_Click(object sender, RoutedEventArgs e)
     {
+        if (!_favoritesWritable) { ShowStorageWriteBlocked("Favorites / 收藏"); return; }
         var fav = new FavoriteConfig
         {
             Name = "New Favorite",
@@ -1801,15 +2634,102 @@ public partial class MainWindow : Window
         dialog.ApplyOwnerTheme(this);
         if (dialog.ShowDialog() == true)
         {
+            var previous = SnapshotFavorites();
             _allFavorites.Add(fav);
-            SaveFavorites();
+            if (!SaveFavoritesOrRestore(previous)) return;
             FilterFavorites();
             _logger.Info("Favorite manually added / 手动新增收藏: " + fav.Name);
         }
     }
 
+    private void EditFavorite_Click(object sender, RoutedEventArgs e)
+    {
+        if (!_favoritesWritable) { ShowStorageWriteBlocked("Favorites / 收藏"); return; }
+        if (FavoriteGrid.SelectedItem is not FavoriteConfig original) { ShowActionFeedbackKey("selection.favorite"); return; }
+        var editingCopy = FavoriteStore.Clone(original);
+        var dialog = new FavoriteWindow(editingCopy) { Owner = this };
+        dialog.ApplyOwnerTheme(this);
+        if (dialog.ShowDialog() != true) return;
+
+        editingCopy.Id = original.Id;
+        editingCopy.CreatedAt = original.CreatedAt;
+        editingCopy.LastUsedAt = original.LastUsedAt;
+        var previous = SnapshotFavorites();
+        var index = _allFavorites.FindIndex(x => x.Id.Equals(original.Id, StringComparison.OrdinalIgnoreCase));
+        if (index < 0) return;
+        _allFavorites[index] = editingCopy;
+        if (!SaveFavoritesOrRestore(previous)) return;
+        FilterFavorites();
+        AddOperationHistory("Favorite", "", "", "Updated / 已更新", editingCopy.Name, scope: "Local favorite / 本地收藏夹");
+        _logger.Info("Favorite edited: " + editingCopy.Name);
+    }
+
+    private void RestoreFavoritePresets_Click(object sender, RoutedEventArgs e)
+    {
+        if (!_favoritesWritable) { ShowStorageWriteBlocked("Favorites / 收藏"); return; }
+        var stateLoad = FavoritePresetStore.Load(_paths.FavoritePresetStateFile, _logger);
+        _favoritePresetStateWritable = stateLoad.IsWritable;
+        if (!stateLoad.IsWritable)
+        {
+            UpdateFavoriteButtons();
+            ShowActionFeedback("预设删除记录无法读取，已阻止恢复操作。", "Preset deletion state is unreadable; restoration was blocked.", error: true);
+            return;
+        }
+
+        var defaults = Defaults.DefaultFavorites();
+        var defaultIds = defaults.Select(x => x.Id).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var existingIds = _allFavorites.Select(x => x.Id).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var missing = defaults.Where(x => !existingIds.Contains(x.Id)
+            && !_allFavorites.Any(existing => FavoriteMergePlanner.SameIdentity(existing, x))).ToList();
+        var hasDeletedPresetIntent = stateLoad.State.DeletedPresetIds.Any(defaultIds.Contains);
+        if (missing.Count == 0 && !hasDeletedPresetIntent)
+        {
+            ShowActionFeedback("没有已删除的内置预设需要恢复。", "There are no deleted built-in presets to restore.");
+            return;
+        }
+
+        var prompt = IsChineseUi()
+            ? $"将恢复 {missing.Count} 个缺失的内置预设。现有收藏及其备注、凭据和使用记录会保留。是否继续？"
+            : $"Restore {missing.Count} missing built-in preset(s). Existing favorites, notes, credentials, and usage history will be preserved. Continue?";
+        if (!AppDialog.Show(this, IsChineseUi() ? "恢复内置预设" : "Restore Built-in Presets", prompt, confirm: true)) return;
+
+        var previousFavorites = SnapshotFavorites();
+        var previousState = new FavoritePresetState { DeletedPresetIds = [.. stateLoad.State.DeletedPresetIds] };
+        var nextState = new FavoritePresetState
+        {
+            DeletedPresetIds = stateLoad.State.DeletedPresetIds.Where(x => !defaultIds.Contains(x)).ToList()
+        };
+        try
+        {
+            if (!previousState.DeletedPresetIds.SequenceEqual(nextState.DeletedPresetIds, StringComparer.OrdinalIgnoreCase))
+                FavoritePresetStore.Save(_paths.FavoritePresetStateFile, nextState, _logger);
+            var countBeforeRestore = _allFavorites.Count;
+            FavoritePresetStore.AddMissingPresets(_allFavorites, defaults, nextState);
+            var restoredCount = _allFavorites.Count - countBeforeRestore;
+            if (!SaveFavoritesOrRestore(previousFavorites))
+            {
+                FavoritePresetStore.Save(_paths.FavoritePresetStateFile, previousState, _logger);
+                return;
+            }
+            FilterFavorites();
+            AddOperationHistory("Favorite Presets", "", "", "Restored / 已恢复", $"added={restoredCount}", scope: "Built-in favorites / 内置收藏");
+            ShowActionFeedback($"已恢复 {restoredCount} 个内置预设。", $"Restored {restoredCount} built-in preset(s).");
+        }
+        catch (Exception ex)
+        {
+            _allFavorites = previousFavorites;
+            FilterFavorites();
+            _logger.Error("Restore built-in favorite presets failed", ex);
+            AppDialog.Show(this, IsChineseUi() ? "恢复预设失败" : "Restore Presets Failed", ExplainFailure(ex, _lang.T("help.restore.favorite.presets")), danger: true);
+            try { FavoritePresetStore.Save(_paths.FavoritePresetStateFile, previousState, _logger); }
+            catch (Exception restoreError) { _favoritePresetStateWritable = false; _logger.Error("Restore favorite preset deletion state failed", restoreError); }
+            UpdateFavoriteButtons();
+        }
+    }
+
     private void TemplateFavorite_Click(object sender, RoutedEventArgs e)
     {
+        if (!_favoritesWritable) { ShowStorageWriteBlocked("Favorites / 收藏"); return; }
         var templates = new[]
         {
             new FavoriteConfig { Name = "Dell iDRAC", DeviceNumber = "BMC", LocalIp = ManualIp.Text, SubnetMask = ManualMask.Text, TargetIp = ManualTargetIp.Text, Username = "root", Description = "Dell iDRAC management" },
@@ -1824,8 +2744,9 @@ public partial class MainWindow : Window
         {
             if (list.SelectedItem is not FavoriteConfig template) return;
             template.UpdatedAt = DateTime.Now;
+            var previous = SnapshotFavorites();
             _allFavorites.Add(template);
-            SaveFavorites();
+            if (!SaveFavoritesOrRestore(previous)) return;
             FilterFavorites();
             choice.Close();
         };
@@ -1840,12 +2761,14 @@ public partial class MainWindow : Window
 
     private void LoadFavorite_Click(object sender, RoutedEventArgs e)
     {
+        if (_activeNetworkWorkflow is not null || _dhcpServer.IsRunning || _closingCleanupStarted) return;
         if (FavoriteGrid.SelectedItem is not FavoriteConfig fav) { ShowActionFeedbackKey("selection.favorite"); return; }
         LoadFavorite(fav);
     }
 
     private async void ApplyFavorite_Click(object sender, RoutedEventArgs e)
     {
+        if (_activeNetworkWorkflow is not null || _dhcpServer.IsRunning || _closingCleanupStarted || _scanRunning) return;
         if (FavoriteGrid.SelectedItem is not FavoriteConfig fav) { ShowActionFeedbackKey("selection.favorite"); return; }
         LoadFavorite(fav);
         await ApplyAndScanAsync();
@@ -1853,6 +2776,7 @@ public partial class MainWindow : Window
 
     private void DeleteFavorite_Click(object sender, RoutedEventArgs e)
     {
+        if (!_favoritesWritable) { ShowStorageWriteBlocked("Favorites / 收藏"); return; }
         if (FavoriteGrid.SelectedItem is not FavoriteConfig fav) { ShowActionFeedbackKey("selection.favorite"); return; }
         if (!AppDialog.Show(this,
             IsChineseUi() ? "删除收藏夹" : "Delete Favorite",
@@ -1861,8 +2785,45 @@ public partial class MainWindow : Window
                 : $"Favorite: {fav.Name}\n\nOther saved favorites will not be affected. Delete it?",
             confirm: true,
             danger: true)) return;
+        var isBuiltInPreset = Defaults.DefaultFavorites().Any(x => x.Id.Equals(fav.Id, StringComparison.OrdinalIgnoreCase));
+        var tombstoneAdded = false;
+        if (isBuiltInPreset)
+        {
+            var state = FavoritePresetStore.Load(_paths.FavoritePresetStateFile, _logger);
+            _favoritePresetStateWritable = state.IsWritable;
+            if (!state.IsWritable)
+            {
+                UpdateFavoriteButtons();
+                ShowActionFeedback("预设删除记录无法读取，已阻止删除。", "Preset deletion state is unreadable; deletion was blocked.", error: true);
+                return;
+            }
+            if (!state.State.DeletedPresetIds.Contains(fav.Id, StringComparer.OrdinalIgnoreCase))
+            {
+                try
+                {
+                    FavoritePresetStore.SetDeleted(_paths.FavoritePresetStateFile, fav.Id, deleted: true, logger: _logger);
+                    tombstoneAdded = true;
+                }
+                catch (Exception ex)
+                {
+                    _logger.Error("Save favorite preset deletion intent failed", ex);
+                    AppDialog.Show(this, IsChineseUi() ? "删除失败" : "Delete Failed", ExplainFailure(ex, _lang.T("help.delete.favorite")), danger: true);
+                    return;
+                }
+            }
+        }
+        var previous = SnapshotFavorites();
         _allFavorites.RemoveAll(x => x.Id == fav.Id);
-        SaveFavorites();
+        if (!SaveFavoritesOrRestore(previous))
+        {
+            if (tombstoneAdded)
+            {
+                try { FavoritePresetStore.SetDeleted(_paths.FavoritePresetStateFile, fav.Id, deleted: false, logger: _logger); }
+                catch (Exception ex) { _favoritePresetStateWritable = false; _logger.Error("Rollback favorite preset deletion intent failed", ex); }
+            }
+            UpdateFavoriteButtons();
+            return;
+        }
         FilterFavorites();
         _logger.Info("Favorite deleted: " + fav.Name);
         UpdateSessionStatus();
@@ -1870,6 +2831,7 @@ public partial class MainWindow : Window
 
     private void ImportFavorites_Click(object sender, RoutedEventArgs e)
     {
+        if (!_favoritesWritable) { ShowStorageWriteBlocked("Favorites / 收藏"); return; }
         var dialog = new OpenFileDialog
         {
             Title = "Import Favorites / 导入收藏夹",
@@ -1878,17 +2840,26 @@ public partial class MainWindow : Window
         if (dialog.ShowDialog(this) != true) return;
         try
         {
-            var loaded = FavoriteStore.Load(dialog.FileName, _logger).ToList();
+            var importResult = FavoriteStore.LoadWithStatus(dialog.FileName, _logger);
+            if (!importResult.HasData)
+            {
+                var detail = importResult.Status == DataLoadStatus.Missing ? "The selected file is missing." : importResult.Error?.Message ?? "The selected file and its backup could not be read.";
+                AppDialog.Show(this, IsChineseUi() ? "导入收藏夹失败" : "Import Favorites Failed", detail, danger: true);
+                return;
+            }
+            if (importResult.Status == DataLoadStatus.RestoredFromBackup)
+                _logger.Warn($"Favorites import recovered from backup: {importResult.SourcePath}");
+            var loaded = importResult.Favorites;
             var invalid = loaded.Where(x => !IsValidFavorite(x)).ToList();
-            var imported = loaded.Where(IsValidFavorite).ToList();
+            var imported = loaded.Where(IsValidFavorite).Select(FavoriteStore.PrepareImported).ToList();
             var duplicateImported = 0;
             var distinctImported = new List<FavoriteConfig>();
             foreach (var item in imported)
             {
-                var duplicateIndex = distinctImported.FindIndex(x => SameFavorite(x, item));
+                var duplicateIndex = distinctImported.FindIndex(x => FavoriteMergePlanner.SameIdentity(x, item));
                 if (duplicateIndex >= 0)
                 {
-                    distinctImported[duplicateIndex] = item;
+                    distinctImported[duplicateIndex] = FavoriteMergePlanner.Merge(distinctImported[duplicateIndex], item).Favorite;
                     duplicateImported++;
                 }
                 else
@@ -1901,41 +2872,64 @@ public partial class MainWindow : Window
             {
                 AppDialog.Show(this, IsChineseUi() ? "导入收藏夹" : "Import Favorites",
                     IsChineseUi()
-                        ? $"文件读取 {loaded.Count} 条，但没有可用记录。\n跳过：{invalid.Count} 条（名称、本机 IP 或掩码无效）。"
-                        : $"Read {loaded.Count} record(s), but none are usable.\nSkipped: {invalid.Count} (invalid name, local IP, or mask).",
+                        ? $"文件读取 {loaded.Count} 条，但没有可用记录。\n跳过：{invalid.Count} 条（名称或扫描 IP、掩码、目标范围无效）。"
+                        : $"Read {loaded.Count} record(s), but none are usable.\nSkipped: {invalid.Count} (invalid name, IPv4 scan range, mask, or target).",
                     danger: true);
                 return;
             }
 
-            var addCount = distinctImported.Count(x => _allFavorites.All(existing => !SameFavorite(existing, x)));
+            var plans = distinctImported.Select(item =>
+            {
+                var existing = _allFavorites.FirstOrDefault(local => FavoriteMergePlanner.SameIdentity(local, item));
+                if (existing is null)
+                {
+                    var newFavorite = FavoriteStore.Clone(item);
+                    if (string.IsNullOrWhiteSpace(newFavorite.Id)) newFavorite.Id = Guid.NewGuid().ToString("N");
+                    return (Imported: item, LocalId: (string?)null, Merged: (FavoriteMergeResult?)null, NewFavorite: newFavorite);
+                }
+                var merge = FavoriteMergePlanner.Merge(existing, item);
+                return (Imported: item, LocalId: existing.Id, Merged: (FavoriteMergeResult?)merge, NewFavorite: (FavoriteConfig?)null);
+            }).ToList();
+            var addCount = plans.Count(x => x.LocalId is null);
             var updateCount = distinctImported.Count - addCount;
             var credentialCount = distinctImported.Count(x => x.HasUsablePassword);
+            var credentialReplacementCount = plans.Count(x => x.Merged?.CredentialReplaced == true);
+            var fieldConflicts = plans.Where(x => x.Merged is not null && x.Merged.ReplacedFields.Count > 0)
+                .SelectMany(x => x.Merged!.Changes.Select(change =>
+                    $"{x.Imported.Name}: {FormatFavoriteImportChange(change, IsChineseUi())}"))
+                .Take(8).ToList();
+            var conflictPreview = fieldConflicts.Count == 0
+                ? ""
+                : Environment.NewLine + Environment.NewLine + (IsChineseUi() ? "将覆盖字段及新旧值（凭据和敏感字段值隐藏）：" : "Fields to replace and old/new values (credential and sensitive values are hidden):")
+                  + Environment.NewLine + string.Join(Environment.NewLine, fieldConflicts);
             var preview = IsChineseUi()
-                ? $"文件：{Path.GetFileName(dialog.FileName)}\n读取：{loaded.Count} 条\n可导入：{distinctImported.Count} 条\n新增：{addCount} 条\n覆盖：{updateCount} 条\n跳过无效：{invalid.Count} 条\n文件内重复：{duplicateImported} 条\n包含可用凭据：{credentialCount} 条\n\n确认后才会更新本地收藏夹。密码不会显示。"
-                : $"File: {Path.GetFileName(dialog.FileName)}\nRead: {loaded.Count} record(s)\nUsable: {distinctImported.Count}\nAdd: {addCount}\nReplace: {updateCount}\nInvalid skipped: {invalid.Count}\nDuplicates in file: {duplicateImported}\nUsable credentials included: {credentialCount}\n\nLocal Favorites are updated only after confirmation. Passwords are not shown.";
+                ? $"文件：{Path.GetFileName(dialog.FileName)}\n读取：{loaded.Count} 条\n可导入：{distinctImported.Count} 条\n新增：{addCount} 条\n合并：{updateCount} 条\n跳过无效：{invalid.Count} 条\n文件内重复：{duplicateImported} 条\n包含可用凭据：{credentialCount} 条\n将替换本地凭据：{credentialReplacementCount} 条\n\n空字段保留本地值；自定义字段按字段名合并。密码不会显示。{conflictPreview}"
+                : $"File: {Path.GetFileName(dialog.FileName)}\nRead: {loaded.Count} record(s)\nUsable: {distinctImported.Count}\nAdd: {addCount}\nMerge: {updateCount}\nInvalid skipped: {invalid.Count}\nDuplicates in file: {duplicateImported}\nUsable credentials included: {credentialCount}\nLocal credentials to replace: {credentialReplacementCount}\n\nBlank fields preserve local values; custom fields merge by field name. Passwords are never shown.{conflictPreview}";
             if (!AppDialog.Show(this, IsChineseUi() ? "确认导入收藏夹" : "Review Imported Favorites", preview, confirm: true,
-                danger: updateCount > 0 || credentialCount > 0 || invalid.Count > 0 || duplicateImported > 0)) return;
+                danger: credentialCount > 0 || credentialReplacementCount > 0 || fieldConflicts.Count > 0 || invalid.Count > 0 || duplicateImported > 0)) return;
 
+            var previous = SnapshotFavorites();
+            var nextFavorites = SnapshotFavorites();
             var added = 0;
             var updated = 0;
-            foreach (var item in distinctImported)
+            foreach (var plan in plans)
             {
-                var existing = _allFavorites.FirstOrDefault(x => SameFavorite(x, item));
-                item.UpdatedAt = DateTime.Now;
-                if (existing == null)
+                if (plan.LocalId is null)
                 {
-                    if (string.IsNullOrWhiteSpace(item.Id)) item.Id = Guid.NewGuid().ToString("N");
-                    _allFavorites.Add(item);
+                    plan.NewFavorite!.UpdatedAt = DateTime.Now;
+                    nextFavorites.Add(plan.NewFavorite);
                     added++;
                 }
                 else
                 {
-                    MergeFavorite(existing, item);
+                    var index = nextFavorites.FindIndex(x => x.Id.Equals(plan.LocalId, StringComparison.OrdinalIgnoreCase));
+                    if (index < 0) throw new InvalidOperationException("Local favorite changed while import was being reviewed.");
+                    nextFavorites[index] = plan.Merged!.Favorite;
                     updated++;
                 }
             }
-            SaveFavorites();
-            FilterFavorites();
+            _allFavorites = nextFavorites;
+            if (!SaveFavoritesOrRestore(previous)) return;
             AddOperationHistory("Favorite Import", "", "", "Completed / 已完成", $"added={added} updated={updated} skipped={invalid.Count + duplicateImported}", scope: "Local favorites / 本地收藏夹");
             _logger.Info($"Favorites imported: added={added} updated={updated} invalid={invalid.Count} duplicates={duplicateImported}");
             AppDialog.Show(this, IsChineseUi() ? "导入收藏夹" : "Import Favorites",
@@ -1976,8 +2970,12 @@ public partial class MainWindow : Window
         ManualIp.Text = fav.LocalIp;
         ManualMask.Text = fav.SubnetMask;
         ManualTargetIp.Text = fav.TargetIp;
-        fav.LastUsedAt = DateTime.Now;
-        SaveFavorites();
+        if (_favoritesWritable)
+        {
+            var previousLastUsedAt = fav.LastUsedAt;
+            fav.LastUsedAt = DateTime.Now;
+            if (!SaveFavorites()) fav.LastUsedAt = previousLastUsedAt;
+        }
         _logger.Info("Favorite loaded: " + fav.Name);
         Tabs.SelectedItem = TabScan;
     }
@@ -2129,58 +3127,102 @@ public partial class MainWindow : Window
 
     private bool TryValidateDhcpInputs(out string message)
     {
-        message = "";
-        if (!TryGetIpv4(DhcpServerIp.Text, out var serverIp))
-        {
-            message = IsChineseUi() ? "本机 IP 必须是有效的 IPv4 地址。" : "Local IP must be a valid IPv4 address.";
-            return false;
-        }
-        if (!TryGetValidIpv4Mask(DhcpMask.Text, out var mask))
-        {
-            message = IsChineseUi() ? "子网掩码必须是连续的 IPv4 掩码。" : "Subnet mask must be a contiguous IPv4 mask.";
-            return false;
-        }
-        if (!TryGetIpv4(DhcpStart.Text, out var poolStart) || !TryGetIpv4(DhcpEnd.Text, out var poolEnd))
-        {
-            message = IsChineseUi() ? "地址池起止地址必须是有效的 IPv4 地址。" : "Pool start and end must be valid IPv4 addresses.";
-            return false;
-        }
-        if (!IpNetwork.IsUsableHost(serverIp, serverIp, mask)
-            || !IpNetwork.IsUsableHost(poolStart, serverIp, mask)
-            || !IpNetwork.IsUsableHost(poolEnd, serverIp, mask))
-        {
-            message = IsChineseUi() ? "本机 IP 和地址池必须位于同一网段的可用主机范围内。" : "Local IP and pool addresses must be usable hosts in the same subnet.";
-            return false;
-        }
-        if (IpNetwork.ToUInt32(poolStart) > IpNetwork.ToUInt32(poolEnd))
-        {
-            message = IsChineseUi() ? "地址池起始地址不能大于结束地址。" : "Pool start cannot be greater than pool end.";
-            return false;
-        }
-        if (IpNetwork.ToUInt32(serverIp) >= IpNetwork.ToUInt32(poolStart)
-            && IpNetwork.ToUInt32(serverIp) <= IpNetwork.ToUInt32(poolEnd))
-        {
-            message = IsChineseUi() ? "DHCP 服务端 IP 不能落在地址池内。" : "The DHCP server IP cannot be inside the address pool.";
-            return false;
-        }
-        if (LblDhcpGateway.Visibility == Visibility.Visible && !string.IsNullOrWhiteSpace(DhcpGateway.Text) && !TryGetIpv4(DhcpGateway.Text, out _))
-        {
-            message = IsChineseUi() ? "网关必须是有效的 IPv4 地址。" : "Gateway must be a valid IPv4 address.";
-            return false;
-        }
-        if (LblDhcpDns.Visibility == Visibility.Visible && !string.IsNullOrWhiteSpace(DhcpDns.Text) && !TryGetIpv4(DhcpDns.Text, out _))
-        {
-            message = IsChineseUi() ? "DNS 必须是有效的 IPv4 地址。" : "DNS must be a valid IPv4 address.";
-            return false;
-        }
-        if (!int.TryParse(DhcpLeaseSeconds.Text.Trim(), out var leaseSeconds) || leaseSeconds < 1 || leaseSeconds > 604800)
-        {
-            message = IsChineseUi() ? "租约秒数必须在 1 到 604800 之间。" : "Lease seconds must be between 1 and 604800.";
-            return false;
-        }
+        var assessment = ProfileValidation.AssessDhcp(CaptureDhcpSettingsFromForms());
+        message = FormatProfileSection("DHCP", assessment);
+        return assessment.Status == ProfileSectionStatus.Valid;
+    }
 
-        message = IsChineseUi() ? "参数有效。" : "Parameters are valid.";
-        return true;
+    private DefaultDhcpSettings CaptureDhcpSettingsFromForms() => new()
+    {
+        ServerIp = DhcpServerIp.Text.Trim(),
+        SubnetMask = DhcpMask.Text.Trim(),
+        PoolStart = DhcpStart.Text.Trim(),
+        PoolEnd = DhcpEnd.Text.Trim(),
+        Gateway = DhcpGateway.Text.Trim(),
+        Dns = DhcpDns.Text.Trim(),
+        LeaseSeconds = int.TryParse(DhcpLeaseSeconds.Text.Trim(), System.Globalization.NumberStyles.Integer,
+            System.Globalization.CultureInfo.InvariantCulture, out var leaseSeconds) ? leaseSeconds : 0
+    };
+
+    private string FormatProfileSection(string name, ProfileSectionAssessment assessment)
+    {
+        var chinese = IsChineseUi();
+        var state = assessment.Status switch
+        {
+            ProfileSectionStatus.Valid => chinese ? "有效" : "effective",
+            ProfileSectionStatus.Empty => chinese ? "未配置" : "not configured",
+            ProfileSectionStatus.Draft => chinese ? "草稿" : "draft",
+            _ => chinese ? "无效" : "invalid"
+        };
+        var label = chinese ? name switch
+        {
+            "Manual scan" => "手动扫描",
+            "Routes" => "静态路由",
+            _ => name
+        } : name;
+        var issues = assessment.Issues.Distinct().Select(FormatProfileIssue).ToList();
+        return $"{label}: {state}" + (issues.Count == 0 ? "" : " — " + string.Join(chinese ? "；" : "; ", issues));
+    }
+
+    private string FormatProfileAssessment(NetworkProfile profile)
+    {
+        var assessment = ProfileValidation.Assess(profile);
+        var chinese = IsChineseUi();
+        var state = assessment.OverallStatus switch
+        {
+            ProfileSectionStatus.Valid => chinese ? "有效配置" : "effective configuration",
+            ProfileSectionStatus.Draft => chinese ? "草稿配置" : "draft configuration",
+            _ => chinese ? "无效配置" : "invalid configuration"
+        };
+        return $"{state}: {FormatProfileSection("DHCP", assessment.Dhcp)}; {FormatProfileSection("Manual scan", assessment.ManualScan)}; {FormatProfileSection("Routes", assessment.Routes)}";
+    }
+
+    private string FormatProfileIssue(ProfileIssueCode issue)
+    {
+        if (IsChineseUi()) return issue switch
+        {
+            ProfileIssueCode.DhcpServerIpMissing => "缺少 DHCP 本机 IP",
+            ProfileIssueCode.DhcpMaskMissing => "缺少 DHCP 掩码",
+            ProfileIssueCode.DhcpPoolMissing => "缺少完整 DHCP 地址池",
+            ProfileIssueCode.DhcpServerIpInvalid => "DHCP 本机 IP 无效",
+            ProfileIssueCode.DhcpMaskInvalid => "DHCP 掩码无效",
+            ProfileIssueCode.DhcpPoolInvalid => "DHCP 地址池地址无效",
+            ProfileIssueCode.DhcpPoolOutsideSubnet => "地址池不在本机网段",
+            ProfileIssueCode.DhcpPoolNotUsable => "DHCP 地址池包含不可用主机地址",
+            ProfileIssueCode.DhcpPoolOrderInvalid => "地址池起点大于终点",
+            ProfileIssueCode.DhcpServerInsidePool => "地址池包含 DHCP 本机地址",
+            ProfileIssueCode.DhcpGatewayInvalid => "DHCP 网关无效",
+            ProfileIssueCode.DhcpDnsInvalid => "DHCP DNS 无效",
+            ProfileIssueCode.DhcpLeaseOutOfRange => "租期必须在 1 到 604800 秒之间",
+            ProfileIssueCode.ManualScanIncomplete => "手动扫描字段未填写完整",
+            ProfileIssueCode.ManualScanInvalid => "手动扫描范围无效或超过 T11 的 4096 地址上限",
+            ProfileIssueCode.RouteAdapterMissing => "路由缺少网卡身份",
+            ProfileIssueCode.RouteAddressFamilyMismatch => "路由地址族与目标前缀不一致",
+            ProfileIssueCode.DuplicateRoute => "存在重复路由",
+            _ => "路由无效"
+        };
+        return issue switch
+        {
+            ProfileIssueCode.DhcpServerIpMissing => "DHCP local IP is missing",
+            ProfileIssueCode.DhcpMaskMissing => "DHCP mask is missing",
+            ProfileIssueCode.DhcpPoolMissing => "DHCP pool is incomplete",
+            ProfileIssueCode.DhcpServerIpInvalid => "DHCP local IP is invalid",
+            ProfileIssueCode.DhcpMaskInvalid => "DHCP mask is invalid",
+            ProfileIssueCode.DhcpPoolInvalid => "DHCP pool address is invalid",
+            ProfileIssueCode.DhcpPoolOutsideSubnet => "The pool is outside the server subnet",
+            ProfileIssueCode.DhcpPoolNotUsable => "The pool contains an unusable host address",
+            ProfileIssueCode.DhcpPoolOrderInvalid => "Pool start is greater than pool end",
+            ProfileIssueCode.DhcpServerInsidePool => "The pool contains the DHCP server address",
+            ProfileIssueCode.DhcpGatewayInvalid => "DHCP gateway is invalid",
+            ProfileIssueCode.DhcpDnsInvalid => "DHCP DNS is invalid",
+            ProfileIssueCode.DhcpLeaseOutOfRange => "Lease must be between 1 and 604800 seconds",
+            ProfileIssueCode.ManualScanIncomplete => "Manual scan fields are incomplete",
+            ProfileIssueCode.ManualScanInvalid => "Manual scan is invalid or exceeds T11's 4096 target limit",
+            ProfileIssueCode.RouteAdapterMissing => "Route adapter identity is missing",
+            ProfileIssueCode.RouteAddressFamilyMismatch => "Route address family does not match its prefix",
+            ProfileIssueCode.DuplicateRoute => "Duplicate route",
+            _ => "Invalid route"
+        };
     }
 
     private static bool TryGetIpv4(string text, out IPAddress ip)
@@ -2218,10 +3260,40 @@ public partial class MainWindow : Window
         return ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork && mask.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork;
     }
 
+    private bool TryGetManualScanPlan(out ScanRangePlan? plan, out string message)
+    {
+        if (ScanRangePlan.TryCreate(ManualIp.Text, ManualMask.Text, ManualTargetIp.Text, out plan, out var error))
+        {
+            message = "";
+            return true;
+        }
+
+        message = FormatScanRangeError(error, IsChineseUi());
+        return false;
+    }
+
+    private static string FormatScanRangeError(ScanRangeError error, bool chinese) => error switch
+        {
+            ScanRangeError.InvalidLocalIp => chinese ? "本机 IP 必须是有效的 IPv4 地址。" : "Local IP must be a valid IPv4 address.",
+            ScanRangeError.InvalidSubnetMask => chinese ? "子网掩码必须是连续的 IPv4 掩码。" : "Subnet mask must be a contiguous IPv4 mask.",
+            ScanRangeError.InvalidLocalHost => chinese ? "本机 IP 不能是网络地址或广播地址。" : "Local IP cannot be the network or broadcast address.",
+            ScanRangeError.InvalidTargetIp => chinese ? "目标必须是有效的 IPv4 地址；留空才会扫描网段。" : "Target must be a valid IPv4 address; leave it empty to scan the subnet.",
+            ScanRangeError.TargetOutsideSubnet => chinese ? "目标 IP 必须位于本机同一网段；留空才会扫描网段。" : "Target IP must be in the local subnet; leave it empty to scan the subnet.",
+            ScanRangeError.TargetNotUsableHost => chinese ? "目标 IP 不能是网络地址或广播地址。" : "Target IP cannot be the network or broadcast address.",
+            ScanRangeError.NoSubnetTargets => chinese ? "该网段没有可探测的其他主机；请填写明确的目标 IP。" : "This subnet has no other probe targets; enter an explicit target IP.",
+            ScanRangeError.TooManyTargets => chinese
+                ? $"扫描范围超过 {ScanRangePlan.MaxProbeTargets} 个实际目标；请缩小网段或填写单个目标 IP。"
+                : $"The scan range exceeds {ScanRangePlan.MaxProbeTargets} actual targets; use a smaller subnet or enter one target IP.",
+            _ => chinese ? "扫描范围无效。" : "Invalid scan range."
+        };
+
     private static IPAddress GetNearbyHost(IPAddress ip, IPAddress mask, uint preferredOffset)
     {
         var network = IpNetwork.ToUInt32(ip) & IpNetwork.ToUInt32(mask);
         var broadcast = network | ~IpNetwork.ToUInt32(mask);
+        if (!IpNetwork.TryGetPrefixLength(mask, out var prefix)) return ip;
+        if (prefix == 31) return IpNetwork.FromUInt32(IpNetwork.ToUInt32(ip) == network ? broadcast : network);
+        if (prefix == 32) return ip;
         var candidate = IpNetwork.ToUInt32(ip) + preferredOffset;
         if (candidate >= broadcast || candidate == IpNetwork.ToUInt32(ip)) candidate = network + 1;
         if (candidate == IpNetwork.ToUInt32(ip) && candidate + 1 < broadcast) candidate++;
@@ -2232,32 +3304,29 @@ public partial class MainWindow : Window
     {
         if (!IsInitialized) return;
         var hasAdapter = SelectedAdapter != null;
-        var validIp = TryGetIpv4(ManualIp.Text, out var manualIp);
-        var validMask = TryGetValidIpv4Mask(ManualMask.Text, out var manualMask);
-        var targetText = ManualTargetIp.Text.Trim();
-        var validTarget = string.IsNullOrWhiteSpace(targetText)
-            || (TryGetIpv4(targetText, out var targetIp) && validIp && validMask && IpNetwork.SameSubnet(manualIp, targetIp, manualMask));
-        var canApply = hasAdapter && validIp && validMask && validTarget && !_scanRunning && _safetyOnboardingCompleted;
+        var validRange = TryGetManualScanPlan(out var scanPlan, out var rangeError);
+        var workflowBlocked = _scanRunning || _dhcpServer.IsRunning || _activeNetworkWorkflow is not null || _closingCleanupStarted;
+        var canApply = hasAdapter && validRange && !workflowBlocked && _safetyOnboardingCompleted;
         if (ScanValidation != null)
         {
             ScanValidation.Text = !hasAdapter
                 ? (IsChineseUi() ? "请先选择网卡。" : "Select an adapter first.")
-                : !validIp
-                    ? (IsChineseUi() ? "本机 IP 必须是有效的 IPv4 地址。" : "Local IP must be a valid IPv4 address.")
-                    : !validMask
-                        ? (IsChineseUi() ? "子网掩码必须是连续的 IPv4 掩码。" : "Subnet mask must be a contiguous IPv4 mask.")
-                        : !validTarget
-                            ? (IsChineseUi() ? "目标 IP 必须是同一网段内的有效 IPv4 地址，留空则扫描整个网段。" : "Target IP must be a valid IPv4 address in the same subnet, or leave it empty for a subnet scan.")
-                            : !_safetyOnboardingCompleted
-                                ? (IsChineseUi() ? "请先完成安全引导，网络变更按钮才会解锁。" : "Complete the Safety Guide before network-change actions are unlocked.")
-                            : (IsChineseUi() ? $"将扫描 {manualIp}/{IpNetwork.PrefixLength(manualMask)}。" : $"Scan scope: {manualIp}/{IpNetwork.PrefixLength(manualMask)}.");
+                : !validRange
+                    ? rangeError
+                    : workflowBlocked
+                        ? (IsChineseUi() ? "其他网络操作运行期间，手动配置与扫描已锁定。" : "Manual configuration and scanning are locked while another network operation runs.")
+                        : !_safetyOnboardingCompleted
+                            ? (IsChineseUi() ? "请先完成安全引导，网络变更按钮才会解锁。" : "Complete the Safety Guide before network-change actions are unlocked.")
+                            : IsChineseUi()
+                                ? $"将扫描 {scanPlan!.TargetCount} 个实际目标（上限 {ScanRangePlan.MaxProbeTargets}）。"
+                                : $"Scan {scanPlan!.TargetCount} actual target(s) (limit {ScanRangePlan.MaxProbeTargets}).";
             ScanValidation.Foreground = canApply ? Brushes.ForestGreen : Brushes.Brown;
         }
-        BtnPreviewScan.IsEnabled = hasAdapter && validIp && validMask && validTarget && !_scanRunning;
+        BtnPreviewScan.IsEnabled = hasAdapter && validRange && !workflowBlocked;
         BtnApplyScan.IsEnabled = canApply;
         BtnStopScan.IsEnabled = _scanRunning;
-        BtnRestoreScan.IsEnabled = hasAdapter && SelectedAdapter != null && _originalAdapterConfigs.ContainsKey(SelectedAdapter.InterfaceIndex) && !_scanRunning && _safetyOnboardingCompleted;
-        BtnAddFavorite.IsEnabled = validIp && validMask && !_scanRunning;
+        BtnRestoreScan.IsEnabled = hasAdapter && SelectedAdapter != null && _originalAdapterConfigs.ContainsKey(AdapterSnapshotKey(SelectedAdapter)) && !workflowBlocked && _safetyOnboardingCompleted;
+        BtnAddFavorite.IsEnabled = validRange && !_scanRunning && _activeNetworkWorkflow is null && !_dhcpServer.IsRunning && _favoritesWritable;
         BtnPreviewScan.Background = BtnPreviewScan.IsEnabled ? Brushes.LightBlue : Brushes.LightGray;
         BtnApplyScan.Background = canApply ? Brushes.LightGreen : Brushes.LightGray;
         BtnStopScan.Background = _scanRunning ? Brushes.OrangeRed : Brushes.LightGray;
@@ -2272,11 +3341,11 @@ public partial class MainWindow : Window
     private void UpdateAdapterActionButtons()
     {
         if (!IsInitialized) return;
-        var enabled = SelectedAdapter != null && _safetyOnboardingCompleted && !_adapterActionInProgress && !_closingCleanupStarted && !_dhcpServer.IsRunning;
+        var enabled = SelectedAdapter != null && _safetyOnboardingCompleted && !_adapterActionInProgress && !_closingCleanupStarted && !_dhcpServer.IsRunning && _activeNetworkWorkflow is null;
         BtnRestartAdapter.IsEnabled = enabled;
-        BtnChangeMac.IsEnabled = enabled;
+        BtnChangeMac.IsEnabled = enabled && _macBackupsWritable;
         BtnRestartAdapter.Background = enabled ? Brushes.LightBlue : Brushes.LightGray;
-        BtnChangeMac.Background = enabled ? Brushes.LightBlue : Brushes.LightGray;
+        BtnChangeMac.Background = BtnChangeMac.IsEnabled ? Brushes.LightBlue : Brushes.LightGray;
         RefreshButtonStateColors();
     }
 
@@ -2284,15 +3353,21 @@ public partial class MainWindow : Window
     {
         if (!IsInitialized) return;
         var selected = FavoriteGrid.SelectedItem is FavoriteConfig;
-        BtnNewFavorite.IsEnabled = !_scanRunning;
-        BtnImportFavorite.IsEnabled = !_scanRunning;
+        var workflowBlocked = _activeNetworkWorkflow is not null || _dhcpServer.IsRunning || _closingCleanupStarted;
+        FavoriteGrid.IsEnabled = !workflowBlocked && !_scanRunning;
+        BtnNewFavorite.IsEnabled = !_scanRunning && _favoritesWritable;
+        BtnEditFavorite.IsEnabled = selected && !_scanRunning && _favoritesWritable;
+        BtnRestoreFavoritePresets.IsEnabled = !_scanRunning && _favoritesWritable && _favoritePresetStateWritable;
+        BtnImportFavorite.IsEnabled = !_scanRunning && _favoritesWritable;
         BtnExportFavorite.IsEnabled = !_scanRunning && _allFavorites.Count > 0;
         BtnFavoriteColumns.IsEnabled = !_scanRunning;
-        BtnLoadFavorite.IsEnabled = selected && !_scanRunning;
-        BtnApplyFavorite.IsEnabled = selected && !_scanRunning && SelectedAdapter != null;
-        BtnDeleteFavorite.IsEnabled = selected && !_scanRunning;
+        BtnLoadFavorite.IsEnabled = selected && !_scanRunning && !workflowBlocked;
+        BtnApplyFavorite.IsEnabled = selected && !_scanRunning && !workflowBlocked && SelectedAdapter != null;
+        BtnDeleteFavorite.IsEnabled = selected && !_scanRunning && _favoritesWritable;
         BtnOpenFavorite.IsEnabled = selected && !_scanRunning && FavoriteGrid.SelectedItem is FavoriteConfig openFavorite && IPAddress.TryParse(openFavorite.TargetIp, out _);
         BtnNewFavorite.Background = BtnNewFavorite.IsEnabled ? Brushes.LightBlue : Brushes.LightGray;
+        BtnEditFavorite.Background = BtnEditFavorite.IsEnabled ? Brushes.LightBlue : Brushes.LightGray;
+        BtnRestoreFavoritePresets.Background = BtnRestoreFavoritePresets.IsEnabled ? Brushes.LightBlue : Brushes.LightGray;
         BtnImportFavorite.Background = BtnImportFavorite.IsEnabled ? Brushes.LightBlue : Brushes.LightGray;
         BtnExportFavorite.Background = BtnExportFavorite.IsEnabled ? Brushes.LightBlue : Brushes.LightGray;
         BtnFavoriteColumns.Background = BtnFavoriteColumns.IsEnabled ? Brushes.LightBlue : Brushes.LightGray;
@@ -2307,7 +3382,8 @@ public partial class MainWindow : Window
 
     private NetworkProfile CaptureCurrentProfile(string name, string description)
     {
-        var leaseSeconds = int.TryParse(DhcpLeaseSeconds.Text.Trim(), out var lease) ? lease : 3600;
+        var leaseSeconds = int.TryParse(DhcpLeaseSeconds.Text.Trim(), System.Globalization.NumberStyles.Integer,
+            System.Globalization.CultureInfo.InvariantCulture, out var lease) ? lease : 0;
         return new NetworkProfile
         {
             Name = name,
@@ -2366,18 +3442,46 @@ public partial class MainWindow : Window
         TxtProfileSummary.Text = IsChineseUi() ? $"本地方案 {_allProfiles.Count} 个" : $"{_allProfiles.Count} local profile(s)";
     }
 
+    private bool TrySaveProfiles(List<NetworkProfile> previous)
+    {
+        if (!_profilesWritable)
+        {
+            _allProfiles = previous;
+            RefreshProfilesView();
+            ShowStorageWriteBlocked("Network profiles / 网络方案");
+            return false;
+        }
+        try
+        {
+            ProfileStore.Save(_paths.ProfilesFile, _allProfiles, _logger);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _profilesWritable = false;
+            _allProfiles = previous;
+            RefreshProfilesView();
+            _logger.Error("Save profiles failed; existing files were retained", ex);
+            AppDialog.Show(this, IsChineseUi() ? "保存方案失败" : "Save Profiles Failed", ExplainFailure(ex, _lang.T("help.profile.import")), danger: true);
+            return false;
+        }
+    }
+
+    private List<NetworkProfile> SnapshotProfiles() => _allProfiles.Select(ProfileStore.Clone).ToList();
+
     private void UpdateProfileButtons()
     {
         if (!IsInitialized) return;
         var selected = ProfileGrid.SelectedItem is NetworkProfile;
-        var blocked = _scanRunning || _dhcpServer.IsRunning || _closingCleanupStarted;
-        BtnSaveProfile.IsEnabled = !blocked;
+        var blocked = _scanRunning || _dhcpServer.IsRunning || _activeNetworkWorkflow is not null || _closingCleanupStarted;
+        ProfileGrid.IsEnabled = !blocked;
+        BtnSaveProfile.IsEnabled = !blocked && _profilesWritable;
         BtnLoadProfile.IsEnabled = selected && !blocked;
         BtnCompareProfile.IsEnabled = selected && !blocked;
-        BtnDuplicateProfile.IsEnabled = selected && !blocked;
-        BtnImportProfile.IsEnabled = !blocked;
+        BtnDuplicateProfile.IsEnabled = selected && !blocked && _profilesWritable;
+        BtnImportProfile.IsEnabled = !blocked && _profilesWritable;
         BtnExportProfile.IsEnabled = _allProfiles.Count > 0 && !blocked;
-        BtnDeleteProfile.IsEnabled = selected && !blocked;
+        BtnDeleteProfile.IsEnabled = selected && !blocked && _profilesWritable;
         BtnSaveProfile.Background = BtnSaveProfile.IsEnabled ? Brushes.LightBlue : Brushes.LightGray;
         BtnLoadProfile.Background = BtnLoadProfile.IsEnabled ? Brushes.LightGreen : Brushes.LightGray;
         BtnCompareProfile.Background = BtnCompareProfile.IsEnabled ? Brushes.LightBlue : Brushes.LightGray;
@@ -2418,6 +3522,8 @@ public partial class MainWindow : Window
         BtnRestartAdapter.Background = ThemedActionBrush(BtnRestartAdapter.IsEnabled, "warning");
         BtnChangeMac.Background = ThemedActionBrush(BtnChangeMac.IsEnabled, "warning");
         BtnNewFavorite.Background = ThemedActionBrush(BtnNewFavorite.IsEnabled);
+        BtnEditFavorite.Background = ThemedActionBrush(BtnEditFavorite.IsEnabled);
+        BtnRestoreFavoritePresets.Background = ThemedActionBrush(BtnRestoreFavoritePresets.IsEnabled);
         BtnImportFavorite.Background = ThemedActionBrush(BtnImportFavorite.IsEnabled);
         BtnExportFavorite.Background = ThemedActionBrush(BtnExportFavorite.IsEnabled);
         BtnFavoriteColumns.Background = ThemedActionBrush(BtnFavoriteColumns.IsEnabled);
@@ -2442,6 +3548,7 @@ public partial class MainWindow : Window
 
     private void SaveProfile_Click(object sender, RoutedEventArgs e)
     {
+        if (!_profilesWritable) { ShowStorageWriteBlocked("Network profiles / 网络方案"); return; }
         if (_scanRunning || _dhcpServer.IsRunning) return;
         var dialog = new ProfileEditorWindow(IsChineseUi()) { Owner = this };
         dialog.ApplyOwnerTheme(this);
@@ -2451,6 +3558,7 @@ public partial class MainWindow : Window
             IsChineseUi() ? $"“{dialog.ProfileName}”已存在，是否覆盖？" : $"“{dialog.ProfileName}” already exists. Replace it?",
             confirm: true, danger: true)) return;
 
+        var previous = SnapshotProfiles();
         var profile = CaptureCurrentProfile(dialog.ProfileName, dialog.ProfileDescription);
         if (existing != null)
         {
@@ -2459,13 +3567,19 @@ public partial class MainWindow : Window
             _allProfiles.Remove(existing);
         }
         _allProfiles.Add(profile);
-        ProfileStore.Save(_paths.ProfilesFile, _allProfiles, _logger);
+        if (!TrySaveProfiles(previous)) return;
         RefreshProfilesView(profile);
-        AddOperationHistory("Profile", "", "", "Saved / 已保存", profile.Name, scope: "Local profile / 本地方案");
+        var assessment = ProfileValidation.Assess(profile);
+        var status = assessment.OverallStatus == ProfileSectionStatus.Valid ? "Saved effective / 已保存有效配置" : "Saved draft / 已保存草稿";
+        AddOperationHistory("Profile", "", "", status, FormatProfileAssessment(profile), scope: "Local profile / 本地方案");
+        ShowActionFeedback(
+            $"方案已保存到本地；当前状态：{FormatProfileAssessment(profile)}。保存不会应用网络设置。",
+            $"Profile saved locally; status: {FormatProfileAssessment(profile)}. Saving does not apply network settings.");
     }
 
     private void LoadProfile_Click(object sender, RoutedEventArgs e)
     {
+        if (_activeNetworkWorkflow is not null || _dhcpServer.IsRunning || _closingCleanupStarted) return;
         if (ProfileGrid.SelectedItem is NetworkProfile profile) LoadProfileIntoForms(profile);
         else ShowActionFeedbackKey("selection.profile");
     }
@@ -2480,8 +3594,8 @@ public partial class MainWindow : Window
         DhcpGateway.Text = d.Gateway;
         DhcpDns.Text = d.Dns;
         DhcpLeaseSeconds.Text = d.LeaseSeconds.ToString();
-        if (!string.IsNullOrWhiteSpace(d.Gateway)) LblDhcpGateway.Visibility = Visibility.Visible;
-        if (!string.IsNullOrWhiteSpace(d.Dns)) LblDhcpDns.Visibility = Visibility.Visible;
+        SetDhcpOptionalFieldState(LblDhcpGateway, DhcpGateway, BtnShowDhcpGateway, d.Gateway);
+        SetDhcpOptionalFieldState(LblDhcpDns, DhcpDns, BtnShowDhcpDns, d.Dns);
         ManualIp.Text = profile.ManualIp;
         ManualMask.Text = profile.ManualMask;
         ManualTargetIp.Text = profile.ManualTargetIp;
@@ -2489,8 +3603,17 @@ public partial class MainWindow : Window
         foreach (var source in profile.Routes ?? [])
         {
             var rule = CloneRoute(source);
-            var adapter = Adapters.FirstOrDefault(x => x.Id.Equals(rule.AdapterId, StringComparison.OrdinalIgnoreCase)
-                || (!string.IsNullOrWhiteSpace(rule.AdapterName) && x.Name.Equals(rule.AdapterName, StringComparison.OrdinalIgnoreCase)));
+            var adapter = Adapters.FirstOrDefault(x => !string.IsNullOrWhiteSpace(rule.AdapterId)
+                && x.Id.Equals(rule.AdapterId, StringComparison.OrdinalIgnoreCase));
+            if (adapter is null && !string.IsNullOrWhiteSpace(rule.AdapterMac))
+                adapter = Adapters.FirstOrDefault(x => x.MacAddress.Equals(rule.AdapterMac, StringComparison.OrdinalIgnoreCase));
+            if (adapter is null && !string.IsNullOrWhiteSpace(rule.AdapterName))
+            {
+                var namedAdapters = Adapters.Where(x => x.Name.Equals(rule.AdapterName, StringComparison.OrdinalIgnoreCase)).ToList();
+                adapter = namedAdapters.FirstOrDefault(x => !string.IsNullOrWhiteSpace(rule.AdapterMac)
+                    && x.MacAddress.Equals(rule.AdapterMac, StringComparison.OrdinalIgnoreCase))
+                    ?? (namedAdapters.Count == 1 ? namedAdapters[0] : null);
+            }
             if (adapter != null)
             {
                 rule.AdapterId = adapter.Id;
@@ -2505,45 +3628,98 @@ public partial class MainWindow : Window
         UpdateEmptyStates();
         Tabs.SelectedItem = TabDhcp;
         AddOperationHistory("Profile", "", "", "Loaded / 已加载", profile.Name, scope: "Forms / 表单");
+        var status = FormatProfileAssessment(profile);
+        ShowActionFeedback(
+            $"方案已加载到表单；{status}。加载不会修改网卡、路由或 DHCP 服务。",
+            $"Profile loaded into forms; {status}. Loading does not change adapters, routes, or the DHCP service.");
+    }
+
+    private static void SetDhcpOptionalFieldState(TextBlock label, TextBox input, Button addButton, string? value)
+    {
+        var hasValue = !string.IsNullOrWhiteSpace(value);
+        label.Visibility = hasValue ? Visibility.Visible : Visibility.Collapsed;
+        input.Visibility = hasValue ? Visibility.Visible : Visibility.Collapsed;
+        addButton.Visibility = hasValue ? Visibility.Collapsed : Visibility.Visible;
+    }
+
+    private string ResolveProfileAdapterIdentity(StaticRouteRule route)
+    {
+        var adapter = !string.IsNullOrWhiteSpace(route.AdapterId)
+            ? Adapters.FirstOrDefault(x => x.Id.Equals(route.AdapterId, StringComparison.OrdinalIgnoreCase))
+            : null;
+        if (adapter is null && !string.IsNullOrWhiteSpace(route.AdapterMac))
+            adapter = Adapters.FirstOrDefault(x => x.MacAddress.Equals(route.AdapterMac, StringComparison.OrdinalIgnoreCase));
+        if (adapter is null && !string.IsNullOrWhiteSpace(route.AdapterName))
+        {
+            var namedAdapters = Adapters.Where(x => x.Name.Equals(route.AdapterName, StringComparison.OrdinalIgnoreCase)).ToList();
+            adapter = namedAdapters.FirstOrDefault(x => !string.IsNullOrWhiteSpace(route.AdapterMac)
+                && x.MacAddress.Equals(route.AdapterMac, StringComparison.OrdinalIgnoreCase))
+                ?? (namedAdapters.Count == 1 ? namedAdapters[0] : null);
+        }
+        return adapter is null ? ProfileValidation.AdapterIdentity(route) : "id:" + adapter.Id.Trim().ToUpperInvariant();
+    }
+
+    private string FormatProfileDifferenceField(string field)
+    {
+        if (!IsChineseUi()) return field switch
+        {
+            "Dhcp.ServerIp" => "DHCP local IP",
+            "Dhcp.SubnetMask" => "DHCP mask",
+            "Dhcp.PoolStart" => "DHCP pool start",
+            "Dhcp.PoolEnd" => "DHCP pool end",
+            "Dhcp.Gateway" => "DHCP gateway",
+            "Dhcp.Dns" => "DHCP DNS",
+            "Dhcp.LeaseSeconds" => "DHCP lease seconds",
+            "ManualIp" => "Manual scan local IP",
+            "ManualMask" => "Manual scan mask",
+            "ManualTargetIp" => "Manual scan target",
+            _ => "Route"
+        };
+        return field switch
+        {
+            "Dhcp.ServerIp" => "DHCP 本机 IP",
+            "Dhcp.SubnetMask" => "DHCP 掩码",
+            "Dhcp.PoolStart" => "DHCP 地址池起点",
+            "Dhcp.PoolEnd" => "DHCP 地址池终点",
+            "Dhcp.Gateway" => "DHCP 网关",
+            "Dhcp.Dns" => "DHCP DNS",
+            "Dhcp.LeaseSeconds" => "DHCP 租期秒数",
+            "ManualIp" => "手动扫描本机 IP",
+            "ManualMask" => "手动扫描掩码",
+            "ManualTargetIp" => "手动扫描目标",
+            _ => "静态路由"
+        };
     }
 
     private void CompareProfile_Click(object sender, RoutedEventArgs e)
     {
         if (ProfileGrid.SelectedItem is not NetworkProfile profile) { ShowActionFeedbackKey("selection.profile"); return; }
         var current = CaptureCurrentProfile("current", "");
-        var differences = new List<string>();
-        void Diff(string label, string saved, string actual)
+        var differences = ProfileComparer.Compare(profile, current, ResolveProfileAdapterIdentity);
+        var differenceLines = differences.Select(difference =>
         {
-            if (!string.Equals(saved, actual, StringComparison.OrdinalIgnoreCase))
-                differences.Add(IsChineseUi() ? $"{label}：方案 [{saved}]，当前 [{actual}]" : $"{label}: profile [{saved}], current [{actual}]");
-        }
-
-        Diff(IsChineseUi() ? "DHCP 本机 IP" : "DHCP local IP", profile.Dhcp.ServerIp, current.Dhcp.ServerIp);
-        Diff(IsChineseUi() ? "DHCP 掩码" : "DHCP mask", profile.Dhcp.SubnetMask, current.Dhcp.SubnetMask);
-        Diff(IsChineseUi() ? "DHCP 地址池" : "DHCP pool", $"{profile.Dhcp.PoolStart}-{profile.Dhcp.PoolEnd}", $"{current.Dhcp.PoolStart}-{current.Dhcp.PoolEnd}");
-        Diff(IsChineseUi() ? "手动扫描本机 IP" : "Manual local IP", profile.ManualIp, current.ManualIp);
-        Diff(IsChineseUi() ? "手动扫描掩码" : "Manual mask", profile.ManualMask, current.ManualMask);
-        Diff(IsChineseUi() ? "手动扫描目标" : "Manual target", profile.ManualTargetIp, current.ManualTargetIp);
-        var savedRoutes = new HashSet<string>((profile.Routes ?? []).Select(ProfileRouteKey), StringComparer.OrdinalIgnoreCase);
-        var currentRoutes = new HashSet<string>(current.Routes.Select(ProfileRouteKey), StringComparer.OrdinalIgnoreCase);
-        foreach (var route in savedRoutes.Except(currentRoutes)) differences.Add((IsChineseUi() ? "方案多出的路由：" : "Profile-only route: ") + route);
-        foreach (var route in currentRoutes.Except(savedRoutes)) differences.Add((IsChineseUi() ? "当前多出的路由：" : "Current-only route: ") + route);
-        var message = differences.Count == 0
+            var label = FormatProfileDifferenceField(difference.Field);
+            return IsChineseUi()
+                ? $"{label}：方案 [{difference.SavedValue}]，当前 [{difference.CurrentValue}]"
+                : $"{label}: profile [{difference.SavedValue}], current [{difference.CurrentValue}]";
+        });
+        var differenceText = string.Join(Environment.NewLine, differenceLines);
+        var message = (FormatProfileAssessment(profile) + Environment.NewLine + Environment.NewLine)
+            + (differences.Count == 0
             ? (IsChineseUi() ? "当前表单与方案完全一致，未发现差异。" : "The current forms match the profile; no differences found.")
-            : string.Join(Environment.NewLine, differences);
+            : differenceText);
         AppDialog.Show(this, IsChineseUi() ? $"方案对比：{profile.Name}" : $"Profile comparison: {profile.Name}", message);
     }
 
-    private static string ProfileRouteKey(StaticRouteRule route) =>
-        string.Join("|", route.AddressFamily, route.DestinationPrefix, route.AdapterId, route.AdapterName, route.NextHop, route.RouteMetric);
-
     private void DuplicateProfile_Click(object sender, RoutedEventArgs e)
     {
+        if (!_profilesWritable) { ShowStorageWriteBlocked("Network profiles / 网络方案"); return; }
         if (ProfileGrid.SelectedItem is not NetworkProfile source) { ShowActionFeedbackKey("selection.profile"); return; }
         var defaultName = source.Name + (IsChineseUi() ? "（副本）" : " (Copy)");
         var dialog = new ProfileEditorWindow(IsChineseUi(), defaultName, source.Description) { Owner = this };
         dialog.ApplyOwnerTheme(this);
         if (dialog.ShowDialog() != true) return;
+        var previous = SnapshotProfiles();
         var profile = ProfileStore.Clone(source);
         profile.Id = Guid.NewGuid().ToString("N");
         profile.Name = dialog.ProfileName;
@@ -2551,18 +3727,26 @@ public partial class MainWindow : Window
         profile.CreatedAt = DateTime.Now;
         profile.UpdatedAt = DateTime.Now;
         _allProfiles.Add(profile);
-        ProfileStore.Save(_paths.ProfilesFile, _allProfiles, _logger);
+        if (!TrySaveProfiles(previous)) return;
         RefreshProfilesView(profile);
         AddOperationHistory("Profile", "", "", "Duplicated / 已复制", profile.Name, scope: "Local profile / 本地方案");
     }
 
     private void ImportProfiles_Click(object sender, RoutedEventArgs e)
     {
+        if (!_profilesWritable) { ShowStorageWriteBlocked("Network profiles / 网络方案"); return; }
         var dialog = new OpenFileDialog { Filter = "JSON (*.json)|*.json", Title = IsChineseUi() ? "导入配置方案" : "Import Network Profiles" };
         if (dialog.ShowDialog(this) != true) return;
         try
         {
-            var imported = ProfileStore.Load(dialog.FileName, _logger);
+            var importResult = ProfileStore.LoadWithStatus(dialog.FileName, _logger);
+            if (!importResult.HasData)
+            {
+                var detail = importResult.Status == DataLoadStatus.Missing ? "The selected file is missing." : importResult.Error?.Message ?? "The selected file and its backup could not be read.";
+                AppDialog.Show(this, IsChineseUi() ? "导入方案失败" : "Import Profiles Failed", detail, danger: true);
+                return;
+            }
+            var imported = importResult.Value ?? [];
             if (imported.Count == 0)
             {
                 AppDialog.Show(this, IsChineseUi() ? "导入方案" : "Import Profiles", IsChineseUi() ? "文件中没有可用配置方案。" : "The file contains no usable profiles.", danger: true);
@@ -2582,14 +3766,24 @@ public partial class MainWindow : Window
                 .GroupBy(x => x.Name.Trim(), StringComparer.OrdinalIgnoreCase)
                 .Select(x => x.Last())
                 .ToList();
+            var draftProfiles = validProfiles
+                .Where(x => ProfileValidation.Assess(x).OverallStatus != ProfileSectionStatus.Valid)
+                .ToList();
             var replaceCount = validProfiles.Count(profile => _allProfiles.Any(x => x.Id.Equals(profile.Id, StringComparison.OrdinalIgnoreCase)
                 || x.Name.Equals(profile.Name, StringComparison.OrdinalIgnoreCase)));
             var newCount = validProfiles.Count - replaceCount;
             var preview = IsChineseUi()
-                ? $"文件：{Path.GetFileName(dialog.FileName)}\n读取：{imported.Count} 个方案\n将新增：{newCount} 个\n将覆盖：{replaceCount} 个\n将跳过：{skipped.Count + duplicateImported} 个\n\n"
+                ? $"文件：{Path.GetFileName(dialog.FileName)}\n读取：{imported.Count} 个方案\n将新增：{newCount} 个\n将覆盖：{replaceCount} 个\n有效配置：{validProfiles.Count - draftProfiles.Count} 个\n草稿配置：{draftProfiles.Count} 个\n将跳过：{skipped.Count + duplicateImported} 个\n\n"
                   + (skipped.Count == 0 && duplicateImported == 0 ? "没有发现格式问题。" : "发现问题的方案不会写入：")
-                : $"File: {Path.GetFileName(dialog.FileName)}\nRead: {imported.Count} profile(s)\nNew: {newCount}\nReplace: {replaceCount}\nSkipped: {skipped.Count + duplicateImported}\n\n"
+                : $"File: {Path.GetFileName(dialog.FileName)}\nRead: {imported.Count} profile(s)\nNew: {newCount}\nReplace: {replaceCount}\nEffective: {validProfiles.Count - draftProfiles.Count}\nDraft: {draftProfiles.Count}\nSkipped: {skipped.Count + duplicateImported}\n\n"
                   + (skipped.Count == 0 && duplicateImported == 0 ? "No format problems found." : "Profiles with issues will not be written:");
+            if (draftProfiles.Count > 0)
+            {
+                preview += Environment.NewLine + (IsChineseUi() ? "以下方案将作为草稿保存，执行前仍需补全并通过对应校验：" : "These profiles will be saved as drafts and must pass the relevant validation before execution:");
+                preview += Environment.NewLine + string.Join(Environment.NewLine,
+                    draftProfiles.Take(8).Select(x => $"{x.Name}: {FormatProfileAssessment(x)}"));
+                if (draftProfiles.Count > 8) preview += Environment.NewLine + (IsChineseUi() ? $"……另有 {draftProfiles.Count - 8} 个草稿。" : $"...and {draftProfiles.Count - 8} more draft(s).");
+            }
             if (skipped.Count > 0)
             {
                 preview += Environment.NewLine + string.Join(Environment.NewLine, skipped.Take(8));
@@ -2603,6 +3797,7 @@ public partial class MainWindow : Window
             }
             if (!AppDialog.Show(this, IsChineseUi() ? "确认导入方案" : "Review Imported Profiles", preview, confirm: true, danger: skipped.Count > 0 || duplicateImported > 0)) return;
 
+            var previous = SnapshotProfiles();
             foreach (var profile in validProfiles)
             {
                 var existing = _allProfiles.FirstOrDefault(x => x.Id.Equals(profile.Id, StringComparison.OrdinalIgnoreCase)
@@ -2615,7 +3810,7 @@ public partial class MainWindow : Window
                 }
                 _allProfiles.Add(profile);
             }
-            ProfileStore.Save(_paths.ProfilesFile, _allProfiles, _logger);
+            if (!TrySaveProfiles(previous)) return;
             RefreshProfilesView();
             AddOperationHistory("Profile", "", "", "Imported / 已导入", $"{validProfiles.Count} profile(s); skipped {skipped.Count + duplicateImported}", scope: Path.GetFileName(dialog.FileName));
         }
@@ -2629,6 +3824,11 @@ public partial class MainWindow : Window
     private bool TryValidateImportedProfile(NetworkProfile profile, out string issue)
     {
         issue = "";
+        if (profile is null)
+        {
+            issue = IsChineseUi() ? "方案条目不是对象" : "profile entry is not an object";
+            return false;
+        }
         if (string.IsNullOrWhiteSpace(profile.Name))
         {
             issue = IsChineseUi() ? "缺少方案名称" : "missing profile name";
@@ -2639,46 +3839,24 @@ public partial class MainWindow : Window
             issue = IsChineseUi() ? "方案名称过长" : "profile name is too long";
             return false;
         }
-
-        var dhcp = profile.Dhcp ?? new DefaultDhcpSettings();
-        var validationIssue = "";
-        bool OptionalIp(string value, string label)
+        profile.Dhcp ??= new DefaultDhcpSettings();
+        profile.Routes ??= [];
+        if (string.IsNullOrWhiteSpace(profile.Id)) profile.Id = Guid.NewGuid().ToString("N");
+        var assessment = ProfileValidation.Assess(profile);
+        if (assessment.OverallStatus == ProfileSectionStatus.Invalid)
         {
-            if (string.IsNullOrWhiteSpace(value) || TryGetIpv4(value, out _)) return true;
-            validationIssue = IsChineseUi() ? $"{label} 不是有效 IPv4" : $"{label} is not a valid IPv4";
-            return false;
-        }
-        bool OptionalMask(string value, string label)
-        {
-            if (string.IsNullOrWhiteSpace(value) || TryGetValidIpv4Mask(value, out _)) return true;
-            validationIssue = IsChineseUi() ? $"{label} 不是连续掩码" : $"{label} is not a contiguous mask";
-            return false;
-        }
-
-        if (!OptionalIp(dhcp.ServerIp, "DHCP IP") || !OptionalMask(dhcp.SubnetMask, "DHCP mask")
-            || !OptionalIp(dhcp.PoolStart, "DHCP pool start") || !OptionalIp(dhcp.PoolEnd, "DHCP pool end")
-            || !OptionalIp(dhcp.Gateway, "DHCP gateway") || !OptionalIp(dhcp.Dns, "DHCP DNS")
-            || !OptionalIp(profile.ManualIp, "Manual IP") || !OptionalMask(profile.ManualMask, "Manual mask")
-            || !OptionalIp(profile.ManualTargetIp, "Manual target"))
-        {
-            issue = validationIssue;
-            return false;
-        }
-
-        if (TryGetIpv4(profile.ManualIp, out var manualIp) && TryGetValidIpv4Mask(profile.ManualMask, out var manualMask)
-            && TryGetIpv4(profile.ManualTargetIp, out var targetIp) && !IpNetwork.SameSubnet(manualIp, targetIp, manualMask))
-        {
-            issue = IsChineseUi() ? "手动目标不在本机同一网段" : "manual target is outside the local subnet";
-            return false;
-        }
-        foreach (var route in profile.Routes ?? [])
-        {
-            try { StaticRouteValidator.Normalize(route); }
-            catch (Exception ex)
+            issue = string.Join(IsChineseUi() ? "；" : "; ", new[]
             {
-                issue = IsChineseUi() ? $"路由无效：{ex.Message}" : $"invalid route: {ex.Message}";
-                return false;
-            }
+                FormatProfileSection("DHCP", assessment.Dhcp),
+                FormatProfileSection("Manual scan", assessment.ManualScan),
+                FormatProfileSection("Routes", assessment.Routes)
+            }.Where(x => x.Contains(IsChineseUi() ? "无效" : "invalid", StringComparison.OrdinalIgnoreCase)
+                || x.Contains(IsChineseUi() ? "重复" : "Duplicate", StringComparison.OrdinalIgnoreCase)
+                || x.Contains(IsChineseUi() ? "缺少网卡" : "identity is missing", StringComparison.OrdinalIgnoreCase)
+                || x.Contains(IsChineseUi() ? "族" : "family", StringComparison.OrdinalIgnoreCase)));
+            if (string.IsNullOrWhiteSpace(issue))
+                issue = IsChineseUi() ? "配置校验失败" : "profile validation failed";
+            return false;
         }
         return true;
     }
@@ -2702,12 +3880,14 @@ public partial class MainWindow : Window
 
     private void DeleteProfile_Click(object sender, RoutedEventArgs e)
     {
+        if (!_profilesWritable) { ShowStorageWriteBlocked("Network profiles / 网络方案"); return; }
         if (ProfileGrid.SelectedItem is not NetworkProfile profile) { ShowActionFeedbackKey("selection.profile"); return; }
         if (!AppDialog.Show(this, IsChineseUi() ? "删除配置方案" : "Delete Profile",
             IsChineseUi() ? $"确认删除“{profile.Name}”？不会修改网络配置。" : $"Delete “{profile.Name}”? Network configuration will not be changed.",
             confirm: true, danger: true)) return;
+        var previous = SnapshotProfiles();
         _allProfiles.RemoveAll(x => x.Id.Equals(profile.Id, StringComparison.OrdinalIgnoreCase));
-        ProfileStore.Save(_paths.ProfilesFile, _allProfiles, _logger);
+        if (!TrySaveProfiles(previous)) return;
         RefreshProfilesView();
         AddOperationHistory("Profile", "", "", "Deleted / 已删除", profile.Name, scope: "Local profile / 本地方案");
     }
@@ -2754,8 +3934,18 @@ public partial class MainWindow : Window
         if (!AppDialog.Show(this, IsChineseUi() ? "清空操作历史" : "Clear Operation History",
             IsChineseUi() ? "只清空本地操作历史，不会删除运行日志，也不会撤销网络配置。是否继续？" : "Only local operation history will be cleared. Runtime logs and network configuration will not be changed. Continue?",
             confirm: true, danger: true)) return;
+        var previous = _operationHistory.ToList();
         _operationHistory.Clear();
-        JsonStore.Save(_paths.OperationHistoryFile, _operationHistory);
+        try { JsonStore.Save(_paths.OperationHistoryFile, _operationHistory); }
+        catch (Exception ex)
+        {
+            _operationHistory.AddRange(previous);
+            _logger.Error("Clear operation history failed; existing history was retained", ex);
+            RefreshOperationHistoryView();
+            UpdateLastOperationPresentation();
+            ShowActionFeedback("操作历史未能清空，原文件和记录已保留。", "Operation history was not cleared; the source file and rows were retained.", error: true);
+            return;
+        }
         RefreshOperationHistoryView();
         UpdateLastOperationPresentation();
         ShowActionFeedback("操作历史已清空。", "Operation history cleared.");
@@ -2807,10 +3997,17 @@ public partial class MainWindow : Window
             return;
         }
         if (!AppDialog.Show(this, "Rollback / 回滚", $"{backup.AdapterName}\n{backup.CapturedAt:yyyy-MM-dd HH:mm:ss}\n{(backup.DhcpEnabled ? "DHCP" : backup.IpAddress)}\n\nRestore this backup? / 确认恢复此备份？", confirm: true, danger: true)) return;
+        var workflow = TryBeginNetworkWorkflow("Adapter rollback");
+        if (workflow is null) return;
+        AdapterIpv4Snapshot? preRollbackSnapshot = null;
+        var rollbackAttempted = false;
         try
         {
-            SetBusy(true, "Rolling back adapter... / 正在回滚网卡...");
+            SetBusy(true,
+                "Capturing the current adapter state... / 正在读取当前网卡状态...",
+                totalPhases: 3);
             await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.Render);
+            preRollbackSnapshot = await _adapterService.CaptureIPv4ConfigAsync(adapter, OperationToken);
             var snapshot = new AdapterIpv4Snapshot
             {
                 DhcpEnabled = backup.DhcpEnabled,
@@ -2820,50 +4017,71 @@ public partial class MainWindow : Window
                 PrefixLength = backup.PrefixLength,
                 Gateway = backup.Gateway,
                 Dns = backup.Dns,
+                DnsMode = backup.DnsMode,
+                AdapterEnabled = backup.AdapterEnabled,
                 AutomaticMetric = backup.AutomaticMetric,
                 InterfaceMetric = backup.InterfaceMetric
             };
+            rollbackAttempted = true;
+            SetBusyPhase("Restoring and verifying the saved adapter configuration... / 正在恢复并核对备份配置...");
             await _adapterService.RestoreIPv4ConfigAsync(adapter, snapshot, OperationToken);
             await VerifyRestoredAdapterConfigAsync(adapter, snapshot, OperationToken);
             AddOperationHistory("Rollback", backup.IpAddress, adapter.MacAddress, "Completed / 已完成", $"{(backup.DhcpEnabled ? "DHCP" : "Static")} {backup.IpAddress}/{backup.PrefixLength}", scope: adapter.Name);
-            await RefreshAdaptersAsync();
+            SetBusyPhase("Refreshing the adapter list... / 正在刷新网卡列表...");
+            await RefreshAdaptersAsync(allowDuringNetworkWorkflow: true, cancellationToken: CancellationToken.None);
         }
         catch (OperationCanceledException)
         {
             _logger.Warn("Adapter rollback canceled by user or timeout");
+            if (rollbackAttempted && preRollbackSnapshot is not null)
+                await CompensateAdapterConfigAsync(adapter, preRollbackSnapshot, "Adapter rollback cancellation");
         }
         catch (Exception ex)
         {
             _logger.Error("Adapter rollback failed", ex);
-            AppDialog.Show(this, "Rollback / 回滚", ExplainFailure(ex, _lang.T("help.rollback")), danger: true);
+            if (rollbackAttempted && preRollbackSnapshot is not null)
+                await CompensateAdapterConfigAsync(adapter, preRollbackSnapshot, "Adapter rollback failure");
+            if (!_closingCleanupStarted)
+                AppDialog.Show(this, "Rollback / 回滚", ExplainFailure(ex, _lang.T("help.rollback")), danger: true);
         }
         finally
         {
             SetBusy(false);
+            EndNetworkWorkflow(workflow);
         }
     }
 
     private async void ExportResults_Click(object sender, RoutedEventArgs e)
     {
         var rows = Tabs.SelectedItem == TabDhcp
-            ? Leases.Select(x => new[] { x.Time.ToString(), x.MacAddress, x.IpAddress, x.Hostname, x.Status, x.PingLatencyMs.ToString(), x.Remark })
+            ? Leases.Select(x => new[] { x.Time.ToString(), x.MacAddress, x.IpAddress, x.Hostname, x.LeaseStart.ToString(), x.LeaseEnd.ToString(), x.Status, x.SessionText, x.PingLatencyMs.ToString(), x.Remark })
             : ScanResults.Select(x => new[] { x.LastSeen.ToString(), x.IpAddress, x.MacAddress, x.Hostname, x.StatusText, x.LatencyMs.ToString(), x.Remark });
         var dialog = new SaveFileDialog { Filter = "CSV (*.csv)|*.csv", FileName = $"NetBoot-{DateTime.Now:yyyyMMdd-HHmmss}.csv" };
         if (dialog.ShowDialog(this) != true) return;
+        if (!TryBeginStandaloneOperation("Exporting results... / 正在导出结果...")) return;
         try
         {
-            SetBusy(true, "Exporting results... / 正在导出结果...");
             var header = Tabs.SelectedItem == TabDhcp
-                ? (IsChineseUi() ? new[] { "时间", "MAC", "IP", "主机名", "状态", "Ping毫秒", "备注" } : new[] { "Time", "MAC", "IP", "Hostname", "Status", "PingMs", "Remark" })
+                ? (IsChineseUi() ? new[] { "最后上线", "MAC", "IP", "主机名", "租约开始", "租约结束", "租约状态", "会话", "Ping毫秒", "备注" } : new[] { "LastOnline", "MAC", "IP", "Hostname", "LeaseStart", "LeaseEnd", "LeaseState", "Session", "PingMs", "Remark" })
                 : (IsChineseUi() ? new[] { "最后发现", "IP", "MAC", "主机名", "状态", "Ping毫秒", "备注" } : new[] { "LastSeen", "IP", "MAC", "Hostname", "Status", "PingMs", "Remark" });
-            await Task.Run(() => File.WriteAllLines(dialog.FileName, new[] { Csv(header) }.Concat(rows.Select(Csv)), new UTF8Encoding(true)));
+            var cancellationToken = OperationToken;
+            await Task.Run(() =>
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                File.WriteAllLines(dialog.FileName, new[] { Csv(header) }.Concat(rows.Select(Csv)), new UTF8Encoding(true));
+            }, cancellationToken);
             _logger.Info("Results exported: " + dialog.FileName);
             ShowActionFeedback("结果已导出。", "Results exported.");
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.Info("Results export canceled");
         }
         catch (Exception ex)
         {
             _logger.Error("Export results failed", ex);
-            AppDialog.Show(this, "Export / 导出", ExplainFailure(ex, _lang.T("help.export.results")), danger: true);
+            if (!_closingCleanupStarted)
+                AppDialog.Show(this, "Export / 导出", ExplainFailure(ex, _lang.T("help.export.results")), danger: true);
         }
         finally
         {
@@ -2893,7 +4111,7 @@ public partial class MainWindow : Window
             $"{(TryGetIpv4(adapter.IPv4Address, out _) ? "✅" : "⚠️")} IPv4: {adapter.IPv4Address}",
             $"{(TryGetValidIpv4Mask(adapter.SubnetMask, out _) ? "✅" : "⚠️")} {(IsChineseUi() ? "子网掩码" : "Subnet mask")}: {adapter.SubnetMask}",
             $"{(adapter.HasGateway ? "⚠️" : "✅")} {(IsChineseUi() ? "默认网关" : "Default gateway")}: {(string.IsNullOrWhiteSpace(adapter.Gateway) ? "-" : adapter.Gateway)}",
-            $"{(_originalAdapterConfigs.ContainsKey(adapter.InterfaceIndex) ? "✅" : "ℹ️")} {(IsChineseUi() ? "回滚备份" : "Rollback backup")}: {(_originalAdapterConfigs.ContainsKey(adapter.InterfaceIndex) ? (IsChineseUi() ? "本次运行可用" : "Available this run") : (IsChineseUi() ? "未捕获" : "Not captured"))}"
+            $"{(_originalAdapterConfigs.ContainsKey(AdapterSnapshotKey(adapter)) ? "✅" : "ℹ️")} {(IsChineseUi() ? "回滚备份" : "Rollback backup")}: {(_originalAdapterConfigs.ContainsKey(AdapterSnapshotKey(adapter)) ? (IsChineseUi() ? "本次运行可用" : "Available this run") : (IsChineseUi() ? "未捕获" : "Not captured"))}"
         };
         var next = !admin
             ? (IsChineseUi() ? "使用“以管理员身份运行”重新启动工具。" : "Restart the tool with Run as administrator.")
@@ -2916,6 +4134,12 @@ public partial class MainWindow : Window
 
     private bool ShowSafetyGuide(bool firstRun)
     {
+        if (!_settingsWritable)
+        {
+            ShowStorageWriteBlocked("Settings / 设置");
+            _safetyOnboardingCompleted = false;
+            return false;
+        }
         var title = firstRun
             ? (IsChineseUi() ? "首次运行安全引导" : "First-run Safety Guide")
             : _lang.T("safety.guide");
@@ -2954,7 +4178,16 @@ public partial class MainWindow : Window
         }
         _safetyOnboardingCompleted = true;
         _settings.SafetyOnboardingCompleted = true;
-        JsonStore.Save(_paths.SettingsFile, _settings);
+        if (!TrySaveSettings())
+        {
+            _safetyOnboardingCompleted = false;
+            _settings.SafetyOnboardingCompleted = false;
+            UpdateManualScanButtons();
+            UpdateAdapterActionButtons();
+            SetDhcpRunningState(_dhcpServer.IsRunning);
+            UpdateSessionStatus();
+            return false;
+        }
         _logger.Info("Safety onboarding acknowledged");
         UpdateManualScanButtons();
         UpdateAdapterActionButtons();
@@ -2968,15 +4201,16 @@ public partial class MainWindow : Window
         var dialog = new SaveFileDialog { Filter = "ZIP (*.zip)|*.zip", FileName = $"NetBoot-support-{DateTime.Now:yyyyMMdd-HHmmss}.zip" };
         if (dialog.ShowDialog(this) != true) return;
         var redact = RedactSupportPackage.IsChecked == true;
+        if (!TryBeginStandaloneOperation("Creating support package... / 正在生成支持包...")) return;
         try
         {
-            SetBusy(true, "Creating support package... / 正在生成支持包...");
+            var cancellationToken = OperationToken;
             var manifest = IsChineseUi()
                 ? $"本支持包不包含收藏夹凭据。包含运行日志、设置、网卡备份、配置方案和操作历史。网络地址脱敏：{(redact ? "是" : "否")}。\n"
                 : $"This support package excludes Favorite credentials. It contains runtime logs, settings, adapter backups, profiles, and operation history. Network address redaction: {(redact ? "enabled" : "disabled")}.\n";
             await Task.Run(() =>
             {
-                OperationToken.ThrowIfCancellationRequested();
+                cancellationToken.ThrowIfCancellationRequested();
                 using var archive = ZipFile.Open(dialog.FileName, ZipArchiveMode.Create);
                 foreach (var file in Directory.EnumerateFiles(_paths.LogsDirectory, "*.log")) AddSupportFile(archive, file, Path.Combine("logs", Path.GetFileName(file)), redact);
                 if (File.Exists(_paths.SettingsFile)) AddSupportFile(archive, _paths.SettingsFile, "appsettings.json", redact);
@@ -2986,7 +4220,7 @@ public partial class MainWindow : Window
                 if (File.Exists(_paths.OperationHistoryFile)) AddSupportFile(archive, _paths.OperationHistoryFile, "operation-history.json", redact);
                 using var writer = new StreamWriter(archive.CreateEntry("manifest.txt").Open(), Encoding.UTF8);
                 writer.Write(manifest);
-            }, OperationToken);
+            }, cancellationToken);
             _logger.Info("Support package created: " + dialog.FileName);
             ShowActionFeedback("支持包已生成。", "Support package created.");
             AddOperationHistory("Support", "", "", "Completed / 已完成", Path.GetFileName(dialog.FileName), scope: "Local diagnostics / 本地诊断");
@@ -2998,7 +4232,8 @@ public partial class MainWindow : Window
         catch (Exception ex)
         {
             _logger.Error("Support package failed", ex);
-            AppDialog.Show(this, "Support / 支持包", ExplainFailure(ex, _lang.T("help.package.logs")), danger: true);
+            if (!_closingCleanupStarted)
+                AppDialog.Show(this, "Support / 支持包", ExplainFailure(ex, _lang.T("help.package.logs")), danger: true);
         }
         finally
         {
@@ -3089,9 +4324,15 @@ public partial class MainWindow : Window
 
     private void Theme_Click(object sender, RoutedEventArgs e)
     {
+        var previousTheme = _darkTheme;
         _darkTheme = !_darkTheme;
         _settings.DarkTheme = _darkTheme;
-        JsonStore.Save(_paths.SettingsFile, _settings);
+        if (!TrySaveSettings())
+        {
+            _darkTheme = previousTheme;
+            _settings.DarkTheme = previousTheme;
+            return;
+        }
         ApplyTheme();
     }
 
@@ -3180,7 +4421,12 @@ public partial class MainWindow : Window
     {
         if (!IsLoaded || LanguageBox.SelectedItem is not ComboBoxItem item || item.Tag is not string tag) return;
         _settings.Language = tag;
-        JsonStore.Save(_paths.SettingsFile, _settings);
+        if (!TrySaveSettings())
+        {
+            _settings.Language = _lang.CurrentLanguage;
+            ApplyLanguage();
+            return;
+        }
         _lang.Load(tag);
         ApplyLanguage();
     }
@@ -3195,28 +4441,31 @@ public partial class MainWindow : Window
     private void UpdateSettingsStatus()
     {
         if (TxtSettingsStatus == null || BtnSaveSettings == null) return;
-        TxtSettingsStatus.Text = _settingsDirty
-            ? (IsChineseUi() ? "有未保存更改（Ctrl+S 保存）" : "Unsaved changes (Ctrl+S to save)")
-            : (IsChineseUi() ? "设置已保存" : "Settings saved");
-        TxtSettingsStatus.Foreground = _settingsDirty
-            ? (Resources["WarningBrush"] as Brush ?? Brushes.DarkOrange)
-            : (Resources["MutedTextBrush"] as Brush ?? Brushes.Gray);
-        BtnSaveSettings.IsEnabled = _settingsDirty;
+        TxtSettingsStatus.Text = !_settingsWritable
+            ? (IsChineseUi() ? "设置文件不可写；更改不会保存" : "Settings are read-only; changes cannot be saved")
+            : _settingsDirty
+                ? (IsChineseUi() ? "有未保存更改（Ctrl+S 保存）" : "Unsaved changes (Ctrl+S to save)")
+                : (IsChineseUi() ? "设置已保存" : "Settings saved");
+        TxtSettingsStatus.Foreground = !_settingsWritable
+            ? (Resources["DangerBrush"] as Brush ?? Brushes.Firebrick)
+            : _settingsDirty
+                ? (Resources["WarningBrush"] as Brush ?? Brushes.DarkOrange)
+                : (Resources["MutedTextBrush"] as Brush ?? Brushes.Gray);
+        BtnSaveSettings.IsEnabled = _settingsDirty && _settingsWritable;
         BtnSaveSettings.Background = ThemedActionBrush(BtnSaveSettings.IsEnabled);
     }
 
     private void SaveSettings_Click(object sender, RoutedEventArgs e)
     {
-        _settings.AllowDhcpOnWifi = AllowWifi.IsChecked == true;
         _settings.AllowDhcpOnAdapterWithGateway = AllowGateway.IsChecked == true;
         _settings.DetectExistingDhcpBeforeStart = DetectExistingDhcp.IsChecked == true;
         _settings.AllowRestartOnAnyAdapter = AllowRestartAnyAdapter.IsChecked == true;
         _settings.AllowMacChangeOnAnyAdapter = AllowMacChangeAnyAdapter.IsChecked == true;
         _settings.RestoreIpOnDhcpStop = RestoreOnStop.IsChecked == true;
         _settings.RedactSupportPackage = RedactSupportPackage.IsChecked == true;
-        JsonStore.Save(_paths.SettingsFile, _settings);
+        if (!TrySaveSettings()) return;
         _settingsDirty = false;
-        _logger.Info($"Settings saved: dhcpWifi={_settings.AllowDhcpOnWifi} dhcpGateway={_settings.AllowDhcpOnAdapterWithGateway} detectExistingDhcp={_settings.DetectExistingDhcpBeforeStart} restartAnyAdapter={_settings.AllowRestartOnAnyAdapter} macAnyAdapter={_settings.AllowMacChangeOnAnyAdapter} restoreIp={_settings.RestoreIpOnDhcpStop} redactSupport={_settings.RedactSupportPackage}");
+        _logger.Info($"Settings saved: dhcpGateway={_settings.AllowDhcpOnAdapterWithGateway} detectExistingDhcp={_settings.DetectExistingDhcpBeforeStart} restartAnyAdapter={_settings.AllowRestartOnAnyAdapter} macAnyAdapter={_settings.AllowMacChangeOnAnyAdapter} restoreIp={_settings.RestoreIpOnDhcpStop} redactSupport={_settings.RedactSupportPackage}");
         UpdateSettingsStatus();
         SetDhcpRunningState(_dhcpServer.IsRunning);
         UpdateAdapterActionButtons();
@@ -3241,31 +4490,46 @@ public partial class MainWindow : Window
         await _leaseUpdateGate.WaitAsync();
         try
         {
-            var existing = Leases.FirstOrDefault(x => x.MacAddress.Equals(incoming.MacAddress, StringComparison.OrdinalIgnoreCase));
+            incoming.IsCurrentSession = !string.IsNullOrWhiteSpace(incoming.SessionId)
+                && string.Equals(incoming.SessionId, _activeDhcpUiSessionId, StringComparison.Ordinal);
+            var clientKey = string.IsNullOrWhiteSpace(incoming.ClientKey) ? "MAC:" + incoming.MacAddress : incoming.ClientKey;
+            var existing = Leases.LastOrDefault(x => x.IsActiveLease
+                && x.ClientKey.Equals(clientKey, StringComparison.OrdinalIgnoreCase)
+                && x.SessionId.Equals(incoming.SessionId, StringComparison.Ordinal));
             if (existing == null)
             {
                 existing = incoming;
-                existing.Status = "Assigned";
                 Leases.Add(existing);
                 _logger.Info($"UI lease added: {existing.MacAddress} {existing.IpAddress} {existing.Status}");
             }
             else
             {
+                var addressChanged = !existing.IpAddress.Equals(incoming.IpAddress, StringComparison.OrdinalIgnoreCase);
                 existing.IpAddress = incoming.IpAddress;
                 existing.Hostname = incoming.Hostname;
                 existing.LeaseStart = incoming.LeaseStart;
                 existing.LeaseEnd = incoming.LeaseEnd;
-                if (!existing.Status.Equals("Online", StringComparison.OrdinalIgnoreCase))
-                {
-                    existing.Status = "Assigned";
-                }
+                existing.Status = incoming.Status;
+                existing.IsActiveLease = incoming.IsActiveLease;
+                existing.ClientIdentifier = incoming.ClientIdentifier;
+                if (addressChanged) { existing.Time = DateTime.MinValue; existing.PingLatencyMs = -1; }
                 _logger.Info($"UI lease updated: {existing.MacAddress} {existing.IpAddress} {existing.Status}");
             }
 
-            await ProbeLeaseConnectivityAsync(existing);
-            var probes = await _probe.ProbeAsync(existing.IpAddress, _settings.HttpTimeoutMs);
-            existing.HttpOk = probes.http;
-            existing.HttpsOk = probes.https;
+            if (incoming.Status is "Released" or "Declined" or "Expired")
+            {
+                existing.IsActiveLease = false;
+                existing.PingLatencyMs = -1;
+                existing.HttpOk = false;
+                existing.HttpsOk = false;
+            }
+            if (existing.IsCurrentSession && existing.IsActiveLease && existing.LeaseEnd > DateTime.Now)
+            {
+                await ProbeLeaseConnectivityAsync(existing);
+                var probes = await _probe.ProbeAsync(existing.IpAddress, _settings.HttpTimeoutMs);
+                existing.HttpOk = probes.http;
+                existing.HttpsOk = probes.https;
+            }
             AddOperationHistory("DHCP Lease", existing.IpAddress, existing.MacAddress, existing.Status, existing.Hostname);
             _logger.Info($"UI lease probe: {existing.IpAddress} ping={existing.PingLatencyMs} http={existing.HttpOk} https={existing.HttpsOk}");
             LeaseGrid.Items.Refresh();
@@ -3280,11 +4544,11 @@ public partial class MainWindow : Window
     private async Task RefreshLeasePingAsync()
     {
         if (_leaseProbeInProgress) return;
-        if (Leases.Count == 0) return;
+        if (!Leases.Any(x => x.IsCurrentSession && x.IsActiveLease && x.LeaseEnd > DateTime.Now)) return;
         _leaseProbeInProgress = true;
         try
         {
-            foreach (var lease in Leases.ToList())
+            foreach (var lease in Leases.Where(x => x.IsCurrentSession && x.IsActiveLease && x.LeaseEnd > DateTime.Now).ToList())
             {
                 await ProbeLeaseConnectivityAsync(lease);
             }
@@ -3297,38 +4561,43 @@ public partial class MainWindow : Window
 
     private async Task ProbeLeaseConnectivityAsync(DhcpLease lease)
     {
-        var oldStatus = lease.Status;
+        if (!lease.IsCurrentSession || !lease.IsActiveLease || lease.LeaseEnd <= DateTime.Now) return;
         var latency = await PingLatencyAsync(lease.IpAddress);
+        var wasReachable = lease.PingLatencyMs >= 0;
         lease.PingLatencyMs = latency;
-        lease.Status = latency >= 0 ? "Online" : "Offline";
-        if (latency >= 0 && !oldStatus.Equals("Online", StringComparison.OrdinalIgnoreCase))
-        {
-            lease.Time = DateTime.Now;
-        }
-        if (!oldStatus.Equals(lease.Status, StringComparison.OrdinalIgnoreCase))
-        {
-            _logger.Info($"UI lease status changed: {lease.MacAddress} {lease.IpAddress} {oldStatus}->{lease.Status} ping={latency}");
-        }
+        if (latency >= 0 && !wasReachable) lease.Time = DateTime.Now;
     }
 
-    private static async Task<long> PingLatencyAsync(string ip)
+    private void MarkLeaseSessionHistorical(string? sessionId)
+    {
+        if (string.IsNullOrWhiteSpace(sessionId)) return;
+        foreach (var lease in Leases.Where(x => x.SessionId.Equals(sessionId, StringComparison.Ordinal)))
+            lease.IsCurrentSession = false;
+        LeaseGrid.Items.Refresh();
+    }
+
+    private static async Task<long> PingLatencyAsync(string ip, int timeoutMs = 800, CancellationToken cancellationToken = default)
     {
         try
         {
             using var ping = new Ping();
-            var reply = await ping.SendPingAsync(ip, 800);
+            var reply = await ping.SendPingAsync(IPAddress.Parse(ip), TimeSpan.FromMilliseconds(Math.Max(1, timeoutMs)), new byte[32], new PingOptions(), cancellationToken);
             return reply.Status == IPStatus.Success ? reply.RoundtripTime : -1;
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
         catch
         {
             return -1;
         }
     }
 
-    private static string ResolveHost(string ip)
+    private static async Task<string> ResolveHostAsync(string ip, CancellationToken cancellationToken)
     {
-        try { return Dns.GetHostEntry(ip).HostName; }
-        catch { return ""; }
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(TimeSpan.FromSeconds(1.5));
+        try { return (await Dns.GetHostEntryAsync(ip, AddressFamily.Unspecified, timeout.Token)).HostName; }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested) { return ""; }
+        catch (SocketException) { return ""; }
     }
 
     private async Task ShowLeaseTimeoutHintAsync(CancellationToken ct)
@@ -3348,34 +4617,39 @@ public partial class MainWindow : Window
 
     private void SetDhcpRunningState(bool running)
     {
-        AdapterBox.IsEnabled = !running;
-        BtnRefresh.IsEnabled = !running;
-        DhcpServerIp.IsEnabled = !running;
-        DhcpMask.IsEnabled = !running;
-        DhcpStart.IsEnabled = !running;
-        DhcpEnd.IsEnabled = !running;
-        DhcpGateway.IsEnabled = !running;
-        DhcpDns.IsEnabled = !running;
-        BtnShowDhcpGateway.IsEnabled = !running;
-        BtnShowDhcpDns.IsEnabled = !running;
-        DhcpLeaseSeconds.IsEnabled = !running;
-        DhcpConfirm.IsEnabled = !running;
-        RestoreOnStop.IsEnabled = !running;
-        BtnPreviewDhcp.IsEnabled = !running;
-        BtnRollback.IsEnabled = !running && _safetyOnboardingCompleted;
-        BtnRollbackHistory.IsEnabled = !running && _safetyOnboardingCompleted;
-        BtnStartDhcp.IsEnabled = !running && _safetyOnboardingCompleted;
-        BtnStopDhcp.IsEnabled = running;
+        var workflowActive = _activeNetworkWorkflow is not null;
+        var networkBlocked = running || workflowActive || _closingCleanupStarted;
+        AdapterBox.IsEnabled = !networkBlocked;
+        BtnRefresh.IsEnabled = !networkBlocked && !_adapterRefreshInProgress;
+        ManualIp.IsEnabled = !networkBlocked;
+        ManualMask.IsEnabled = !networkBlocked;
+        ManualTargetIp.IsEnabled = !networkBlocked;
+        DhcpServerIp.IsEnabled = !networkBlocked;
+        DhcpMask.IsEnabled = !networkBlocked;
+        DhcpStart.IsEnabled = !networkBlocked;
+        DhcpEnd.IsEnabled = !networkBlocked;
+        DhcpGateway.IsEnabled = !networkBlocked;
+        DhcpDns.IsEnabled = !networkBlocked;
+        BtnShowDhcpGateway.IsEnabled = !networkBlocked;
+        BtnShowDhcpDns.IsEnabled = !networkBlocked;
+        DhcpLeaseSeconds.IsEnabled = !networkBlocked;
+        DhcpConfirm.IsEnabled = !networkBlocked;
+        RestoreOnStop.IsEnabled = !networkBlocked;
+        BtnPreviewDhcp.IsEnabled = !networkBlocked;
+        BtnRollback.IsEnabled = !networkBlocked && _safetyOnboardingCompleted;
+        BtnRollbackHistory.IsEnabled = !networkBlocked && _safetyOnboardingCompleted;
+        BtnStartDhcp.IsEnabled = !networkBlocked && _safetyOnboardingCompleted;
+        BtnStopDhcp.IsEnabled = running && !workflowActive && !_closingCleanupStarted;
         BtnStartDhcp.Background = running ? Brushes.LightGray : Brushes.LightGreen;
         BtnStopDhcp.Background = running ? Brushes.OrangeRed : Brushes.LightGray;
         BtnStopDhcp.Foreground = running ? Brushes.White : Brushes.Black;
-        RouteGrid.IsEnabled = !running;
-        CurrentRouteGrid.IsEnabled = !running;
-        BtnAddRoute.IsEnabled = !running;
-        BtnRemoveRoute.IsEnabled = !running && _safetyOnboardingCompleted;
-        BtnPreviewRoutes.IsEnabled = !running;
-        BtnApplyRoutes.IsEnabled = !running && _safetyOnboardingCompleted;
-        BtnClearAppliedRoutes.IsEnabled = !running && _safetyOnboardingCompleted;
+        RouteGrid.IsEnabled = !networkBlocked;
+        CurrentRouteGrid.IsEnabled = !networkBlocked;
+        BtnAddRoute.IsEnabled = !networkBlocked;
+        BtnRemoveRoute.IsEnabled = !networkBlocked && _safetyOnboardingCompleted;
+        BtnPreviewRoutes.IsEnabled = !networkBlocked;
+        BtnApplyRoutes.IsEnabled = !networkBlocked && _safetyOnboardingCompleted && _routeJournalWritable;
+        BtnClearAppliedRoutes.IsEnabled = !networkBlocked && _safetyOnboardingCompleted && _routeJournalWritable;
         UpdateAdapterActionButtons();
         UpdateDhcpInputValidation();
         UpdateProfileButtons();
@@ -3386,7 +4660,11 @@ public partial class MainWindow : Window
     {
         _cleanupFailureCount = 0;
         PersistStateBeforeExit();
-        var restoreAdapter = _dhcpWasStartedInThisSession;
+        var pendingDhcpRestores = _dhcpSessionRecoveries
+            .Where(x => x.RequiresRestore)
+            .Reverse()
+            .ToArray();
+        SetBusyTotalPhases(4 + pendingDhcpRestores.Length);
         _leasePingTimer.Stop();
         _leaseHintCts?.Cancel();
         _scanCts?.Cancel();
@@ -3396,36 +4674,29 @@ public partial class MainWindow : Window
             "Cleaning temporary firewall rules... / 正在清理临时防火墙规则...",
             async ct =>
             {
-                await RemoveDhcpFirewallRulesAsync(ct);
-                if (_dhcpFirewallRules != null)
-                {
+                if (!await RemoveDhcpFirewallRulesAsync(ct) || _dhcpFirewallRules != null)
                     throw new InvalidOperationException("Temporary DHCP firewall rules remain.");
-                }
             });
 
         await RunCleanupStepAsync(
             "Removing temporary routes... / 正在清理临时路由...",
             async ct =>
             {
-                if (!await ClearAppliedRoutesAsync(ct))
+                var failures = new List<string>();
+                if (!await ClearAppliedRoutesAsync(ct, failures))
                 {
-                    throw new InvalidOperationException("Some temporary static routes remain.");
+                    throw new InvalidOperationException($"{_appliedStaticRoutes.Count} temporary static route recovery record(s) remain: {string.Join("; ", failures)}");
                 }
             });
 
         StaticRoutes.Clear();
         CurrentStaticRoutes.Clear();
 
-        if (restoreAdapter)
+        foreach (var recovery in pendingDhcpRestores)
         {
             await RunCleanupStepAsync(
-                "Restoring adapter settings... / 正在恢复网卡设置...",
-                async ct =>
-                {
-                    var adapter = GetDhcpRestoreAdapter();
-                    if (adapter == null) throw new InvalidOperationException("The DHCP adapter is unavailable.");
-                    await RestoreOriginalAdapterConfigAsync(adapter, ct);
-                });
+                $"Restoring DHCP adapter {recovery.AdapterIdentity.AdapterName}... / 正在恢复 DHCP 网卡...",
+                ct => RestoreDhcpSessionAsync(recovery, ct));
         }
 
         await RunCleanupStepAsync(
@@ -3438,13 +4709,13 @@ public partial class MainWindow : Window
                 }
             });
 
-        _activeDhcpAdapterIndex = null;
+        _activeDhcpSession = null;
         _logger.Info($"Window closing cleanup completed: failures={_cleanupFailureCount}");
     }
 
     private async Task RunCleanupStepAsync(string text, Func<CancellationToken, Task> action)
     {
-        BusyText.Text = text;
+        SetBusyPhase(text);
         UpdateSessionStatus();
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
         try
@@ -3465,6 +4736,11 @@ public partial class MainWindow : Window
 
     private async Task<bool> RestoreOriginalMacAddressesAsync(CancellationToken ct = default)
     {
+        if (!_macBackupsWritable)
+        {
+            _logger.Error("MAC restoration was not attempted because the recovery records could not be read");
+            return false;
+        }
         var pending = _originalAdapterMacs.Values.Where(x => x.RestoreOnExit).ToList();
         if (pending.Count == 0)
         {
@@ -3500,72 +4776,149 @@ public partial class MainWindow : Window
                 _logger.Error($"Adapter MAC restoration failed: idx={backup.InterfaceIndex} name={backup.AdapterName}", ex);
             }
         }
-        SaveMacBackups();
-        return succeeded;
+        return SaveMacBackups() && succeeded;
     }
 
-    private async Task RemoveDhcpFirewallRulesAsync(CancellationToken ct = default)
+    private async Task<bool> RemoveDhcpFirewallRulesAsync(CancellationToken ct = default)
     {
         var lease = _dhcpFirewallRules;
-        if (lease == null || lease.CreatedRuleNames.Count == 0) return;
+        if (lease == null || lease.Rules.Count == 0)
+        {
+            _dhcpFirewallRules = null;
+            return true;
+        }
+        if (!_dhcpFirewallJournalWritable)
+        {
+            AddOperationHistory("DHCP firewall cleanup", "", "", "Pending / 待处理", "Recovery journal is unreadable; no firewall rule was changed / 恢复日志无法读取，未更改防火墙规则", scope: lease.InterfaceAlias, rollbackAvailable: true);
+            return false;
+        }
         try
         {
-            await _adapterService.RemoveDhcpFirewallRulesAsync(lease, ct);
-            _dhcpFirewallRules = null;
+            await _adapterService.RemoveDhcpFirewallRulesAsync(lease, CommitDhcpFirewallLease, ct);
+            if (lease.Rules.Count == 0) _dhcpFirewallRules = null;
+            return lease.Rules.Count == 0;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
             _logger.Warn("Remove DHCP firewall rules canceled by user or timeout");
-            throw;
+            AddOperationHistory("DHCP firewall cleanup", "", "", "Pending / 待处理", "Cleanup was canceled; ownership records remain / 清理已取消，归属记录仍保留", scope: lease.InterfaceAlias, rollbackAvailable: true);
+            return false;
         }
         catch (Exception ex)
         {
-            _logger.Error("Remove DHCP firewall rules failed", ex);
+            _logger.Error("Remove DHCP firewall rules failed; recovery records were retained", ex);
+            AddOperationHistory("DHCP firewall cleanup", "", "", "Pending / 待处理", ex.Message, scope: lease.InterfaceAlias, rollbackAvailable: true);
+            return false;
         }
     }
 
-    private async Task<bool> ClearAppliedRoutesAsync(CancellationToken ct = default)
+    private async Task<bool> ClearAppliedRoutesAsync(CancellationToken ct = default, List<string>? failureDetails = null)
     {
+        if (!_routeJournalWritable)
+        {
+            _logger.Error("Static route cleanup was not attempted because the recovery journal could not be read");
+            failureDetails?.Add("Static route recovery journal is unreadable / 静态路由恢复日志无法读取");
+            return false;
+        }
         if (_appliedStaticRoutes.Count == 0)
         {
-            SaveStaticRouteSession();
             UpdateRouteStatuses();
             return true;
         }
 
-        var remaining = new List<AppliedStaticRoute>();
-        foreach (var route in _appliedStaticRoutes.ToList())
+        try
         {
-            ct.ThrowIfCancellationRequested();
-            var adapter = ResolveAdapterForRoute(route);
-            if (adapter == null)
+            foreach (var route in _appliedStaticRoutes.ToList())
             {
-                remaining.Add(route);
-                _logger.Warn($"Static route cleanup skipped: adapter unavailable idx={route.InterfaceIndex} destination={route.DestinationPrefix}");
-                continue;
-            }
-            try
-            {
-                await _routeService.RemoveAsync(route, adapter, ct);
-                _logger.Info($"Static route removed: {route.DestinationPrefix} adapter={adapter.Name}");
-            }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                remaining.Add(route);
-                _logger.Error($"Static route cleanup failed: {route.DestinationPrefix} adapter={adapter.Name}", ex);
+                ct.ThrowIfCancellationRequested();
+                if (!route.OwnershipVerified || string.IsNullOrWhiteSpace(route.InstanceId))
+                {
+                    var reason = $"{route.DestinationPrefix} on {route.AdapterName}: ownership is unverified; retained";
+                    failureDetails?.Add(reason);
+                    _logger.Warn($"Static route cleanup skipped: {reason}");
+                    continue;
+                }
+                var adapter = ResolveAdapterForRoute(route);
+                if (adapter == null)
+                {
+                    var reason = $"{route.DestinationPrefix} on {route.AdapterName}: adapter identity unavailable; retained";
+                    failureDetails?.Add(reason);
+                    _logger.Warn($"Static route cleanup skipped: {reason}");
+                    continue;
+                }
+                try
+                {
+                    await _routeService.RemoveAsync(route, adapter, ct);
+                    var index = _appliedStaticRoutes.FindIndex(x => SameAppliedRouteIdentity(x, route));
+                    if (index < 0) throw new InvalidOperationException("The route recovery record changed during cleanup.");
+                    var removedRecord = _appliedStaticRoutes[index];
+                    _appliedStaticRoutes.RemoveAt(index);
+                    if (!SaveStaticRouteSession())
+                    {
+                        _appliedStaticRoutes.Insert(Math.Min(index, _appliedStaticRoutes.Count), removedRecord);
+                        var reason = $"{route.DestinationPrefix} on {adapter.Name}: recovery journal save failed; record retained";
+                        failureDetails?.Add(reason);
+                        _logger.Error($"Static route cleanup stopped because {reason}");
+                        break;
+                    }
+                    _logger.Info($"Static route removed: {route.DestinationPrefix} adapter={adapter.Name}");
+                    UpdateRouteStatuses();
+                    UpdateRecoveryBanner();
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    var reason = $"{route.DestinationPrefix} on {adapter.Name}: {ex.Message}";
+                    failureDetails?.Add(reason);
+                    _logger.Error($"Static route cleanup failed: {reason}", ex);
+                }
             }
         }
+        finally
+        {
+            UpdateRouteStatuses();
+            UpdateRecoveryBanner();
+        }
+        return _appliedStaticRoutes.Count == 0;
+    }
 
-        _appliedStaticRoutes.Clear();
-        _appliedStaticRoutes.AddRange(remaining);
-        SaveStaticRouteSession();
+    private static bool SameAppliedRouteIdentity(AppliedStaticRoute left, AppliedStaticRoute right) =>
+        left.InterfaceIndex == right.InterfaceIndex
+        && string.Equals(left.AdapterId, right.AdapterId, StringComparison.OrdinalIgnoreCase)
+        && string.Equals(left.InstanceId, right.InstanceId, StringComparison.OrdinalIgnoreCase)
+        && string.Equals(left.PolicyStore, right.PolicyStore, StringComparison.OrdinalIgnoreCase);
+
+    private void RemoveAppliedRouteRecord(AppliedStaticRoute route)
+    {
+        if (!_routeJournalWritable)
+            throw new IOException("The static route recovery journal is not writable after route removal.");
+        var index = _appliedStaticRoutes.FindIndex(x => SameAppliedRouteIdentity(x, route));
+        if (index < 0) return;
+        var removedRecord = _appliedStaticRoutes[index];
+        _appliedStaticRoutes.RemoveAt(index);
+        if (!SaveStaticRouteSession())
+        {
+            _appliedStaticRoutes.Insert(Math.Min(index, _appliedStaticRoutes.Count), removedRecord);
+            throw new IOException("The route was removed, but its recovery journal record could not be saved as cleared.");
+        }
         UpdateRouteStatuses();
         UpdateRecoveryBanner();
-        return remaining.Count == 0;
+    }
+
+    private void ShowRouteCleanupFailure(string title, IReadOnlyList<string> failures)
+    {
+        var remaining = _appliedStaticRoutes.Count;
+        var details = failures.Count == 0
+            ? (IsChineseUi() ? "未完成项详见日志。" : "See the log for the item details.")
+            : string.Join(Environment.NewLine, failures.Take(12).Select(x => "• " + x))
+                + (failures.Count > 12 ? Environment.NewLine + (IsChineseUi() ? $"另有 {failures.Count - 12} 项。" : $"And {failures.Count - 12} more item(s).") : "");
+        var message = IsChineseUi()
+            ? $"仍有 {remaining} 条恢复记录未清除：{Environment.NewLine}{details}"
+            : $"{remaining} route recovery record(s) remain:{Environment.NewLine}{details}";
+        AppDialog.Show(this, title, message, danger: true);
     }
 
     private void UpdateRouteStatuses()
@@ -3579,59 +4932,105 @@ public partial class MainWindow : Window
         RouteGrid?.Items.Refresh();
     }
 
-    private void SaveStaticRouteSession()
+    private bool SaveStaticRouteSession()
     {
+        if (!_routeJournalWritable) return false;
         try
         {
-            if (_appliedStaticRoutes.Count == 0)
-            {
-                if (File.Exists(_paths.StaticRouteSessionFile)) File.Delete(_paths.StaticRouteSessionFile);
-                return;
-            }
             JsonStore.Save(_paths.StaticRouteSessionFile, _appliedStaticRoutes);
+            return true;
         }
         catch (Exception ex)
         {
+            _routeJournalWritable = false;
             _logger.Error("Save static route session failed", ex);
+            SetDhcpRunningState(_dhcpServer.IsRunning);
+            return false;
         }
     }
 
     private async Task RecoverStaleRoutesAsync()
     {
-        if (!File.Exists(_paths.StaticRouteSessionFile)) return;
-        var staleRoutes = JsonStore.LoadOrDefault(_paths.StaticRouteSessionFile, new List<AppliedStaticRoute>(), _logger);
-        if (staleRoutes.Count == 0)
+        var load = JsonStore.Load<List<AppliedStaticRoute>>(_paths.StaticRouteSessionFile, _logger);
+        _routeJournalWritable = load.Status != DataLoadStatus.Failed;
+        RecordStorageLoad("Static route recovery journal / 静态路由恢复日志", load.Status, load.SourcePath, load.Error, missingIsExpected: true);
+        if (load.Status == DataLoadStatus.Failed)
         {
-            SaveStaticRouteSession();
+            UpdateRecoveryBanner();
+            SetDhcpRunningState(_dhcpServer.IsRunning);
+            AppDialog.Show(this,
+                IsChineseUi() ? "恢复日志无法读取" : "Recovery Journal Unreadable",
+                IsChineseUi() ? "静态路由恢复日志及其备份均无法读取。为避免漏清理上次创建的路由，路由应用和清理操作已锁定。原文件已保留；请修复或恢复日志后重新启动工具。" : "The static route recovery journal and its backup could not be read. Route apply and cleanup are locked so routes from the previous run are not mistaken for absent. The source files were preserved; repair or restore the journal, then restart the tool.",
+                danger: true);
             return;
         }
+        if (load.Status == DataLoadStatus.RestoredFromBackup)
+        {
+            AppDialog.Show(this,
+                IsChineseUi() ? "已从恢复日志备份恢复" : "Recovery Journal Restored",
+                IsChineseUi() ? $"已从有效备份 {Path.GetFileName(load.SourcePath)} 恢复静态路由记录；损坏的主文件已保留。" : $"Static route records were restored from valid backup {Path.GetFileName(load.SourcePath)}. The damaged primary file was preserved.",
+                danger: true);
+        }
+        if (!load.HasData)
+        {
+            UpdateRecoveryBanner();
+            SetDhcpRunningState(_dhcpServer.IsRunning);
+            return;
+        }
+        var staleRoutes = load.Value ?? [];
+        if (staleRoutes.Count == 0) return;
 
         _appliedStaticRoutes.Clear();
         _appliedStaticRoutes.AddRange(staleRoutes);
         UpdateRecoveryBanner();
-        var summary = string.Join(Environment.NewLine, staleRoutes.Select(x => $"{x.DestinationPrefix} -> {x.AdapterName} ({x.NextHop})"));
+        var pendingOwnership = staleRoutes.Where(x => !x.OwnershipVerified || string.IsNullOrWhiteSpace(x.InstanceId)).ToList();
+        var verifiedRoutes = staleRoutes.Where(x => x.OwnershipVerified && !string.IsNullOrWhiteSpace(x.InstanceId)).ToList();
+        if (pendingOwnership.Count > 0)
+        {
+            AppDialog.Show(this,
+                IsChineseUi() ? "路由归属待核实" : "Route Ownership Needs Review",
+                IsChineseUi()
+                    ? $"有 {pendingOwnership.Count} 条路由创建记录缺少已验证的实例标识。为避免删除其他程序的同路径路由，工具不会自动清理；记录已保留在恢复中心供核查。"
+                    : $"{pendingOwnership.Count} route creation record(s) have no verified instance identity. To avoid removing another program's route with the same path, automatic cleanup was skipped; the records remain in Recovery Center for review.",
+                danger: true);
+        }
+        if (verifiedRoutes.Count == 0) return;
+        var summary = string.Join(Environment.NewLine, verifiedRoutes.Select(x => $"{x.DestinationPrefix} -> {x.AdapterName} ({x.NextHop})"));
         _logger.Warn($"Stale static route session detected: count={staleRoutes.Count}");
+        if (!EnsureSafetyOnboarding()) return;
         if (!AppDialog.Show(this,
             IsChineseUi() ? "发现上次未清理的静态路由" : "Stale Static Routes Found",
             summary + Environment.NewLine + Environment.NewLine + (IsChineseUi() ? "是否立即清理？" : "Clean them up now?"),
             confirm: true,
             danger: true)) return;
+        var workflow = TryBeginNetworkWorkflow("Stale route cleanup");
+        if (workflow is null) return;
 
         try
         {
             SetBusy(true, "Cleaning stale routes... / 正在清理上次残留路由...");
             await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.Render);
-            if (!await ClearAppliedRoutesAsync())
+            var failureDetails = new List<string>();
+            if (!await ClearAppliedRoutesAsync(OperationToken, failureDetails))
             {
-                AppDialog.Show(this,
-                    IsChineseUi() ? "清理残留路由" : "Clean Stale Routes",
-                    IsChineseUi() ? "部分残留路由未能清理，详细原因已写入日志。" : "Some stale routes could not be cleaned. See the log for details.",
-                    danger: true);
+                ShowRouteCleanupFailure(IsChineseUi() ? "清理残留路由" : "Clean Stale Routes", failureDetails);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.Warn("Stale route cleanup canceled");
+            if (!_closingCleanupStarted && _appliedStaticRoutes.Count > 0)
+            {
+                var remaining = _appliedStaticRoutes
+                    .Select(x => $"{x.DestinationPrefix} on {x.AdapterName}: 清理已取消，记录保留 / cleanup canceled; record retained")
+                    .ToList();
+                ShowRouteCleanupFailure(IsChineseUi() ? "清理残留路由已取消" : "Stale Route Cleanup Canceled", remaining);
             }
         }
         finally
         {
             SetBusy(false);
+            EndNetworkWorkflow(workflow);
         }
     }
 
@@ -3716,6 +5115,7 @@ public partial class MainWindow : Window
         catch (OperationCanceledException) when (_updateDownloadCts.IsCancellationRequested)
         {
             _logger.Info("Update background download canceled");
+            TxtUpdateStatus.Text = _lang.T("update.download.canceled");
         }
         catch (Exception ex)
         {
@@ -3798,101 +5198,290 @@ public partial class MainWindow : Window
         }
     }
 
-    private void SetBusy(bool busy, string? text = null)
+    private void SetBusy(bool busy, string? text = null, int? totalPhases = null)
     {
         if (busy)
         {
-            _operationCts?.Cancel();
-            _operationCts?.Dispose();
-            _operationCts = new CancellationTokenSource();
-            _operationStartedTimestamp = Stopwatch.GetTimestamp();
-            _activeOperationText = text;
+            if (_activeNetworkWorkflow is not null)
+            {
+                _activeOperationText = text ?? _activeNetworkWorkflow.Name;
+                if (_operationStartedTimestamp == 0) _operationStartedTimestamp = Stopwatch.GetTimestamp();
+            }
+            else if (_operationCts is null)
+            {
+                _operationCts = new CancellationTokenSource();
+                _standaloneOperationCompletion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                _operationStartedTimestamp = Stopwatch.GetTimestamp();
+                _activeOperationText = text;
+            }
             BtnCancelOperation.IsEnabled = true;
             BtnCancelOperation.Visibility = Visibility.Visible;
+            var phaseText = text ?? "Please wait... / 请稍后...";
+            if (_busyOperationStopwatch is null)
+                StartBusyProgress(phaseText, totalPhases);
+            else
+            {
+                if (!string.IsNullOrWhiteSpace(text)) SetBusyPhase(text);
+                if (totalPhases.HasValue) SetBusyTotalPhases(totalPhases.Value);
+            }
         }
         else
         {
-            _activeOperationText = null;
-            _operationCts?.Dispose();
-            _operationCts = null;
-            _operationStartedTimestamp = 0;
-            BtnCancelOperation.Visibility = Visibility.Collapsed;
+            FinishBusyProgress();
+            if (_activeNetworkWorkflow is null)
+            {
+                _activeOperationText = null;
+                _operationCts?.Dispose();
+                _operationCts = null;
+                _standaloneOperationCompletion?.TrySetResult();
+                _standaloneOperationCompletion = null;
+                _operationStartedTimestamp = 0;
+                BtnCancelOperation.Visibility = Visibility.Collapsed;
+            }
         }
         BusyText.Text = text ?? "Please wait... / 请稍后...";
         BusyOverlay.Visibility = busy ? Visibility.Visible : Visibility.Collapsed;
         UpdateSessionStatus();
     }
 
-    private CancellationToken OperationToken => _operationCts?.Token ?? CancellationToken.None;
+    private void StartBusyProgress(string initialPhase, int? totalPhases)
+    {
+        _busyOperationId = Guid.NewGuid().ToString("N")[..8];
+        _busyOperationStopwatch = Stopwatch.StartNew();
+        _busyPhaseStopwatch = Stopwatch.StartNew();
+        _busyPhaseName = initialPhase;
+        _busyPhaseNumber = 1;
+        _busyCompletedPhaseCount = 0;
+        _busyTotalPhaseCount = totalPhases is > 0 ? totalPhases : null;
+        _logger.Info($"UI operation started: id={_busyOperationId} plannedPhases={_busyTotalPhaseCount?.ToString() ?? "unknown"} phase={initialPhase}");
+        _busyProgressTimer.Start();
+        UpdateBusyProgressDisplay();
+    }
+
+    private void SetBusyTotalPhases(int totalPhases)
+    {
+        _busyTotalPhaseCount = totalPhases > 0 ? totalPhases : null;
+        UpdateBusyProgressDisplay();
+    }
+
+    private void SetBusyPhase(string phase)
+    {
+        if (_busyOperationStopwatch is null || _busyPhaseStopwatch is null)
+        {
+            StartBusyProgress(phase, null);
+        }
+        else if (!string.Equals(_busyPhaseName, phase, StringComparison.Ordinal))
+        {
+            CompleteBusyPhase();
+            _busyPhaseNumber = _busyCompletedPhaseCount + 1;
+            _busyPhaseName = phase;
+            _busyPhaseStopwatch.Restart();
+            if (_activeNetworkWorkflow is not null || _operationCts is not null) _activeOperationText = phase;
+            _logger.Info($"UI operation phase started: id={_busyOperationId} step={FormatBusyStep()} phase={phase}");
+        }
+
+        BusyText.Text = phase;
+        UpdateBusyProgressDisplay();
+        UpdateSessionStatus();
+    }
+
+    private void CompleteBusyPhase()
+    {
+        if (_busyPhaseStopwatch is null || _busyPhaseName is null) return;
+        _busyCompletedPhaseCount++;
+        _logger.Info($"UI operation phase completed: id={_busyOperationId} step={FormatBusyStep(_busyPhaseNumber)} phase={_busyPhaseName} elapsedMs={_busyPhaseStopwatch.ElapsedMilliseconds} operationElapsedMs={_busyOperationStopwatch?.ElapsedMilliseconds ?? 0}");
+        UpdateBusyProgressDisplay();
+    }
+
+    private void FinishBusyProgress()
+    {
+        if (_busyOperationStopwatch is null)
+        {
+            _busyProgressTimer.Stop();
+            return;
+        }
+
+        CompleteBusyPhase();
+        _logger.Info($"UI operation ended: id={_busyOperationId} phasesCompleted={_busyCompletedPhaseCount} totalElapsedMs={_busyOperationStopwatch.ElapsedMilliseconds}");
+        _busyProgressTimer.Stop();
+        _busyOperationStopwatch = null;
+        _busyPhaseStopwatch = null;
+        _busyOperationId = null;
+        _busyPhaseName = null;
+        _busyPhaseNumber = 0;
+        _busyCompletedPhaseCount = 0;
+        _busyTotalPhaseCount = null;
+    }
+
+    private void UpdateBusyElapsedText()
+    {
+        if (_busyOperationStopwatch is null || _busyPhaseStopwatch is null) return;
+        UpdateBusyProgressDisplay();
+    }
+
+    private void UpdateBusyProgressDisplay()
+    {
+        if (BusyStageText is null || BusyElapsedText is null || BusyStageProgress is null) return;
+
+        var operationElapsed = _busyOperationStopwatch?.Elapsed ?? TimeSpan.Zero;
+        var phaseElapsed = _busyPhaseStopwatch?.Elapsed ?? TimeSpan.Zero;
+        BusyStageText.Text = _busyTotalPhaseCount is int total
+            ? (IsChineseUi() ? $"阶段 {_busyPhaseNumber}/{total}" : $"Step {_busyPhaseNumber} of {total}")
+            : (IsChineseUi() ? $"阶段 {_busyPhaseNumber}" : $"Step {_busyPhaseNumber}");
+        BusyElapsedText.Text = IsChineseUi()
+            ? $"本阶段 {FormatBusyDuration(phaseElapsed)} · 总耗时 {FormatBusyDuration(operationElapsed)}"
+            : $"This step {FormatBusyDuration(phaseElapsed)} · Total {FormatBusyDuration(operationElapsed)}";
+        BusyStageProgress.Visibility = _busyTotalPhaseCount.HasValue ? Visibility.Visible : Visibility.Collapsed;
+        BusyStageProgress.Maximum = _busyTotalPhaseCount ?? 1;
+        BusyStageProgress.Value = _busyTotalPhaseCount.HasValue
+            ? Math.Min(_busyCompletedPhaseCount, _busyTotalPhaseCount.Value)
+            : 0;
+    }
+
+    private string FormatBusyStep(int? step = null)
+    {
+        var current = step ?? _busyPhaseNumber;
+        return _busyTotalPhaseCount is int total
+            ? $"{current}/{total}"
+            : current.ToString(System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    private static string FormatBusyDuration(TimeSpan duration) =>
+        $"{(int)duration.TotalHours:00}:{duration.Minutes:00}:{duration.Seconds:00}";
+
+    private CancellationToken OperationToken => _activeNetworkWorkflow?.Token ?? _operationCts?.Token ?? CancellationToken.None;
+
+    private bool TryBeginStandaloneOperation(string text)
+    {
+        if (_closingCleanupStarted || _activeNetworkWorkflow is not null || _operationCts is not null)
+        {
+            ShowActionFeedback(
+                "当前有其他操作正在运行，请等待后重试。",
+                "Another operation is active. Wait and try again.",
+                error: true);
+            return false;
+        }
+        SetBusy(true, text);
+        return _operationCts is not null;
+    }
+
+    private NetworkWorkflowLease? TryBeginNetworkWorkflow(string name, bool allowWhileDhcpRunning = false)
+    {
+        if (_closingCleanupStarted) return null;
+        if (_activeNetworkWorkflow is not null || _operationCts is not null || (_dhcpServer.IsRunning && !allowWhileDhcpRunning))
+        {
+            ShowActionFeedback(
+                "当前有其他操作正在运行，或 DHCP 服务尚未停止。请等待后重试。",
+                "Another operation is active or DHCP is still running. Wait and try again.",
+                error: true);
+            return null;
+        }
+
+        var lease = _networkWorkflows.TryAcquire(name);
+        if (lease is null)
+        {
+            ShowActionFeedback(
+                "另一个网络变更正在运行，请等待其完成或取消。",
+                "Another network change is running. Wait for it to finish or cancel it.",
+                error: true);
+            return null;
+        }
+
+        _activeNetworkWorkflow = lease;
+        _activeOperationText = name;
+        _operationStartedTimestamp = Stopwatch.GetTimestamp();
+        UpdateManualScanButtons();
+        UpdateAdapterActionButtons();
+        UpdateFavoriteButtons();
+        SetDhcpRunningState(_dhcpServer.IsRunning);
+        return lease;
+    }
+
+    private void EndNetworkWorkflow(NetworkWorkflowLease lease)
+    {
+        if (ReferenceEquals(_activeNetworkWorkflow, lease))
+        {
+            _activeNetworkWorkflow = null;
+            lease.Dispose();
+            _activeOperationText = null;
+            _operationStartedTimestamp = 0;
+            if (_operationCts is null) BtnCancelOperation.Visibility = Visibility.Collapsed;
+            SetDhcpRunningState(_dhcpServer.IsRunning);
+        }
+        else
+        {
+            lease.Dispose();
+        }
+    }
 
     private void CancelOperation_Click(object sender, RoutedEventArgs e)
     {
-        if (_operationCts == null) return;
+        if (_activeNetworkWorkflow is null && _operationCts == null) return;
         _logger.Warn("User requested cancellation of the active operation");
-        _operationCts.Cancel();
-        _scanCts?.Cancel();
+        if (_activeNetworkWorkflow is not null) _activeNetworkWorkflow.Cancel();
+        else _operationCts?.Cancel();
         BusyText.Text = IsChineseUi() ? "正在取消，请稍候..." : "Canceling, please wait...";
         BtnCancelOperation.IsEnabled = false;
     }
 
     private void MainWindow_KeyDown(object sender, KeyEventArgs e)
     {
-        if (e.Key == Key.Escape)
+        if (HandleKeyboardCommand(e.Key, Keyboard.Modifiers, sender)) e.Handled = true;
+    }
+
+    internal bool HandleKeyboardCommand(Key key, ModifierKeys modifiers, object sender)
+    {
+        if (key == Key.Escape)
         {
-            _operationCts?.Cancel();
+            if (_activeNetworkWorkflow is not null) _activeNetworkWorkflow.Cancel();
+            else _operationCts?.Cancel();
             _scanCts?.Cancel();
-            e.Handled = true;
-            return;
+            return true;
         }
-        if (e.Key == Key.F5 && Keyboard.Modifiers == ModifierKeys.None && !_adapterRefreshInProgress && !_closingCleanupStarted)
+        if (key == Key.F5 && modifiers == ModifierKeys.None)
         {
-            _ = RefreshAdaptersAsync();
-            e.Handled = true;
-            return;
+            if (!_adapterRefreshInProgress && !_closingCleanupStarted && _activeNetworkWorkflow is null)
+                _ = RefreshAdaptersAsync();
+            return true;
         }
-        if (Keyboard.Modifiers != ModifierKeys.Control) return;
-        if (e.Key == Key.Enter && !_closingCleanupStarted)
+        if (modifiers != ModifierKeys.Control) return false;
+        if (key == Key.Enter && !_closingCleanupStarted)
         {
             var previewTriggered = false;
             if (Tabs.SelectedItem == TabDhcp && BtnPreviewDhcp.IsEnabled)
             {
-                PreviewDhcp_Click(sender, e);
+                PreviewDhcp_Click(sender, new RoutedEventArgs());
                 previewTriggered = true;
             }
             else if (Tabs.SelectedItem == TabScan && BtnPreviewScan.IsEnabled)
             {
-                PreviewScan_Click(sender, e);
+                PreviewScan_Click(sender, new RoutedEventArgs());
                 previewTriggered = true;
             }
             else if (Tabs.SelectedItem == TabRoutes && BtnPreviewRoutes.IsEnabled)
             {
-                PreviewRoutes_Click(sender, e);
+                PreviewRoutes_Click(sender, new RoutedEventArgs());
                 previewTriggered = true;
             }
-            if (previewTriggered)
-            {
-                e.Handled = true;
-                return;
-            }
+            if (previewTriggered) return true;
         }
-        switch (e.Key)
+        switch (key)
         {
-            case Key.R when !_adapterRefreshInProgress && !_closingCleanupStarted:
-                _ = RefreshAdaptersAsync();
-                e.Handled = true;
-                break;
+            case Key.R:
+                if (!_adapterRefreshInProgress && !_closingCleanupStarted && _activeNetworkWorkflow is null)
+                    _ = RefreshAdaptersAsync();
+                return true;
             case Key.L:
                 SetLogPanelExpanded(LogBox.Visibility != Visibility.Visible);
-                e.Handled = true;
-                break;
+                return true;
             case Key.C when HistoryGrid.IsKeyboardFocusWithin:
-                CopyHistory_Click(sender, e);
-                e.Handled = true;
-                break;
+                CopyHistory_Click(sender, new RoutedEventArgs());
+                return true;
             case Key.S when Tabs.SelectedItem == TabSettings && _settingsDirty && !_closingCleanupStarted:
-                SaveSettings_Click(sender, e);
-                e.Handled = true;
-                break;
+                SaveSettings_Click(sender, new RoutedEventArgs());
+                return true;
+            default:
+                return false;
         }
     }
 
@@ -4015,22 +5604,58 @@ public partial class MainWindow : Window
         UpdateLogSummary();
     }
 
-    private async Task RememberAdapterConfigAsync(NetworkAdapterInfo adapter, CancellationToken ct = default)
+    private async Task<(AdapterConfigBackup Backup, AdapterIpv4Snapshot Snapshot)> RememberAdapterConfigAsync(
+        NetworkAdapterInfo adapter,
+        CancellationToken ct = default,
+        bool forceFreshSnapshot = false,
+        bool preserveBackupHistory = false,
+        bool verifyAdapterAfterCapture = false)
     {
-        if (string.IsNullOrWhiteSpace(adapter.InterfaceIndex)) return;
+        if (string.IsNullOrWhiteSpace(adapter.InterfaceIndex))
+            throw new InvalidOperationException("The adapter has no current interface index and cannot be configured.");
+        if (string.IsNullOrWhiteSpace(adapter.Id))
+            throw new InvalidOperationException(IsChineseUi()
+                ? "缺少稳定网卡身份，已取消系统修改。"
+                : "The adapter has no stable identity; no system change was attempted.");
+        if (verifyAdapterAfterCapture)
+            await RefreshAdapterByIdentityAsync(adapter, ct);
+        var snapshotKey = AdapterSnapshotKey(adapter);
         if (!_lastAdapterIps.ContainsKey(adapter.InterfaceIndex))
         {
             _lastAdapterIps[adapter.InterfaceIndex] = adapter.IPv4Address;
         }
-        if (!_originalAdapterConfigs.ContainsKey(adapter.InterfaceIndex))
+        AdapterIpv4Snapshot snapshot;
+        if (forceFreshSnapshot || !_originalAdapterConfigs.ContainsKey(snapshotKey))
         {
-            _originalAdapterConfigs[adapter.InterfaceIndex] = await _adapterService.CaptureIPv4ConfigAsync(adapter, ct);
+            var captureIndex = adapter.InterfaceIndex;
+            snapshot = await _adapterService.CaptureIPv4ConfigAsync(adapter, ct);
+            snapshot.NormalizeLegacyFields();
+            if (snapshot.DnsMode == AdapterDnsMode.Unknown || !snapshot.AdapterEnabled.HasValue)
+                throw new InvalidOperationException(IsChineseUi()
+                    ? "无法完整读取原始 DNS 模式或网卡启用状态，已取消系统修改。"
+                    : "The original DNS mode or adapter enabled state could not be captured completely; no system change was attempted.");
+            if (snapshot.DhcpEnabled && snapshot.Routes.Any(x => string.IsNullOrWhiteSpace(x.Protocol)))
+                throw new InvalidOperationException(IsChineseUi()
+                    ? "无法区分原默认路由是否由 DHCP 分配，已取消系统修改。"
+                    : "The original default routes could not be classified as DHCP or static; no system change was attempted.");
+            if (verifyAdapterAfterCapture)
+            {
+                await RefreshAdapterByIdentityAsync(adapter, ct);
+                if (!string.Equals(adapter.InterfaceIndex, captureIndex, StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidOperationException(IsChineseUi()
+                        ? "保存网卡快照后接口索引发生变化，已取消系统修改。"
+                        : "The interface index changed after saving the adapter snapshot; no system change was attempted.");
+            }
         }
-        var snapshot = _originalAdapterConfigs[adapter.InterfaceIndex];
-        _adapterBackups.RemoveAll(x =>
-            (!string.IsNullOrWhiteSpace(adapter.Id) && x.AdapterId.Equals(adapter.Id, StringComparison.OrdinalIgnoreCase))
-            || (string.IsNullOrWhiteSpace(x.AdapterId) && x.InterfaceIndex == adapter.InterfaceIndex));
-        _adapterBackups.Add(new AdapterConfigBackup
+        else snapshot = _originalAdapterConfigs[snapshotKey];
+        var nextBackups = _adapterBackups.ToList();
+        if (!preserveBackupHistory)
+        {
+            nextBackups.RemoveAll(x =>
+                (!string.IsNullOrWhiteSpace(adapter.Id) && string.Equals(x.AdapterId, adapter.Id, StringComparison.OrdinalIgnoreCase))
+                || (string.IsNullOrWhiteSpace(x.AdapterId) && x.InterfaceIndex == adapter.InterfaceIndex));
+        }
+        var backup = new AdapterConfigBackup
         {
             InterfaceIndex = adapter.InterfaceIndex,
             AdapterId = adapter.Id,
@@ -4042,12 +5667,28 @@ public partial class MainWindow : Window
             PrefixLength = snapshot.PrefixLength,
             Gateway = snapshot.Gateway,
             Dns = snapshot.Dns,
+            DnsMode = snapshot.DnsMode,
+            AdapterEnabled = snapshot.AdapterEnabled,
             Addresses = snapshot.Addresses,
             Routes = snapshot.Routes,
             AutomaticMetric = snapshot.AutomaticMetric,
             InterfaceMetric = snapshot.InterfaceMetric
-        });
-        JsonStore.Save(_paths.AdapterBackupsFile, _adapterBackups);
+        };
+        nextBackups.Add(backup);
+        JsonStore.Save(_paths.AdapterBackupsFile, nextBackups);
+        _adapterBackups = nextBackups;
+        _originalAdapterConfigs[snapshotKey] = snapshot;
+        return (backup, snapshot);
+    }
+
+    private static string AdapterSnapshotKey(NetworkAdapterInfo adapter)
+    {
+        if (!string.IsNullOrWhiteSpace(adapter.Id)) return "id:" + adapter.Id;
+        if (!string.IsNullOrWhiteSpace(adapter.InterfaceIndex)
+            && !string.IsNullOrWhiteSpace(adapter.Name)
+            && !string.IsNullOrWhiteSpace(adapter.MacAddress))
+            return $"legacy:{adapter.InterfaceIndex}|{adapter.Name}|{adapter.MacAddress}";
+        throw new InvalidOperationException("A stable adapter identity is required to keep a recoverable IPv4 snapshot.");
     }
 
     private void MarkAdapterIp(NetworkAdapterInfo adapter, string ip)
@@ -4112,7 +5753,7 @@ public partial class MainWindow : Window
 
     private async void RefreshSelectedAdapterStatus()
     {
-        if (_adapterStatusRefreshInProgress || SelectedAdapter == null) return;
+        if (_adapterStatusRefreshInProgress || SelectedAdapter == null || _activeNetworkWorkflow is not null || _closingCleanupStarted) return;
         _adapterStatusRefreshInProgress = true;
         try
         {
@@ -4153,22 +5794,114 @@ public partial class MainWindow : Window
         }
     }
 
+    private async Task<NetworkAdapterInfo> RefreshAdapterByIdentityAsync(NetworkAdapterInfo adapter, CancellationToken ct)
+    {
+        var identity = new AdapterConfigBackup { AdapterId = adapter.Id };
+        var currentAdapters = await Task.Run(() => _adapterService.GetAdapters(logAdapters: false), ct);
+        var matches = AdapterIdentityMatcher.FindMatches(currentAdapters, identity);
+        if (matches.Count == 0) throw new InvalidOperationException(Ui("dhcp.start.adapter.unavailable"));
+        if (matches.Count > 1) throw new InvalidOperationException(Ui("dhcp.start.adapter.ambiguous"));
+
+        var current = matches[0];
+        adapter.Name = current.Name;
+        adapter.Description = current.Description;
+        adapter.InterfaceIndex = current.InterfaceIndex;
+        adapter.MacAddress = current.MacAddress;
+        adapter.IPv4Address = current.IPv4Address;
+        adapter.SubnetMask = current.SubnetMask;
+        adapter.Gateway = current.Gateway;
+        adapter.Dns = current.Dns;
+        adapter.Status = current.Status;
+        adapter.LinkSpeedMbps = current.LinkSpeedMbps;
+        adapter.IsWifi = current.IsWifi;
+        adapter.IsVirtual = current.IsVirtual;
+        AdapterBox.Items.Refresh();
+        return adapter;
+    }
+
+    private async Task RestoreDhcpSessionAsync(DhcpSessionRecovery recovery, CancellationToken ct)
+    {
+        try
+        {
+            var currentAdapters = await Task.Run(() => _adapterService.GetAdapters(logAdapters: false), ct);
+            await DhcpSessionRestoreCoordinator.RestoreAsync(
+                recovery,
+                currentAdapters,
+                (adapter, token) => _adapterService.CaptureIPv4ConfigAsync(adapter, token),
+                async (adapter, snapshot, token) =>
+                {
+                    await _adapterService.RestoreIPv4ConfigAsync(adapter, snapshot, token);
+                    var restored = await _adapterService.CaptureIPv4ConfigAsync(adapter, token);
+                    if (!AdapterIpv4SnapshotComparer.Equivalent(snapshot, restored))
+                        throw new InvalidOperationException(Ui("verify.restore.failed"));
+
+                    var visibleAdapter = Adapters.FirstOrDefault(x =>
+                        string.Equals(x.Id, recovery.AdapterIdentity.AdapterId, StringComparison.OrdinalIgnoreCase));
+                    if (visibleAdapter != null)
+                    {
+                        visibleAdapter.IPv4Address = snapshot.IpAddress;
+                        UpdateAdapterIpText(visibleAdapter);
+                    }
+                    if (SelectedAdapter?.Id.Equals(recovery.AdapterIdentity.AdapterId, StringComparison.OrdinalIgnoreCase) == true)
+                        TxtManualAdapterIp.Text = BuildAdapterIpDisplay(SelectedAdapter);
+                },
+                ct);
+
+            _logger.Info($"DHCP session adapter restored: id={recovery.AdapterIdentity.AdapterId} idx={recovery.AdapterIdentity.InterfaceIndex} state={recovery.State}");
+            _dhcpSessionRecoveries.Remove(recovery);
+        }
+        catch (DhcpSessionRestoreException ex)
+        {
+            _logger.Warn($"DHCP session adapter restore blocked: id={recovery.AdapterIdentity.AdapterId} reason={ex.Reason}");
+            throw new InvalidOperationException(DhcpSessionRestoreMessage(ex.Reason), ex);
+        }
+        catch (Exception ex)
+        {
+            recovery.MarkRestoreFailed();
+            _logger.Error($"DHCP session adapter restore failed and remains pending: id={recovery.AdapterIdentity.AdapterId}", ex);
+            throw;
+        }
+    }
+
+    private string DhcpSessionRestoreMessage(DhcpSessionRestoreFailure reason) => reason switch
+    {
+        DhcpSessionRestoreFailure.AdapterUnavailable => Ui("dhcp.restore.adapter.unavailable"),
+        DhcpSessionRestoreFailure.AdapterIdentityAmbiguous => Ui("dhcp.restore.adapter.ambiguous"),
+        DhcpSessionRestoreFailure.ExpectedSnapshotUnavailable => Ui("dhcp.restore.snapshot.missing"),
+        DhcpSessionRestoreFailure.ExternalConfigurationChanged => Ui("dhcp.restore.conflict"),
+        _ => Ui("verify.restore.failed")
+    };
+
     private async Task RestoreOriginalAdapterConfigAsync(NetworkAdapterInfo adapter, CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(adapter.InterfaceIndex)) return;
-        if (_originalAdapterConfigs.TryGetValue(adapter.InterfaceIndex, out var snapshot))
+        var snapshotKey = AdapterSnapshotKey(adapter);
+        if (!_originalAdapterConfigs.TryGetValue(snapshotKey, out var snapshot))
+            throw new InvalidOperationException(Ui("adapter.restore.snapshot.missing"));
+
+        await _adapterService.RestoreIPv4ConfigAsync(adapter, snapshot, ct);
+        await VerifyRestoredAdapterConfigAsync(adapter, snapshot, ct);
+        adapter.IPv4Address = snapshot.IpAddress;
+        UpdateAdapterIpText(adapter);
+        TxtManualAdapterIp.Text = BuildAdapterIpDisplay(adapter);
+        _logger.Info($"Adapter restored to original config: id={adapter.Id} idx={adapter.InterfaceIndex} {snapshot.DisplayText}");
+    }
+
+    private async Task CompensateAdapterConfigAsync(NetworkAdapterInfo adapter, AdapterIpv4Snapshot snapshot, string operation)
+    {
+        try
         {
-            await _adapterService.RestoreIPv4ConfigAsync(adapter, snapshot, ct);
-            await VerifyRestoredAdapterConfigAsync(adapter, snapshot, ct);
+            await _adapterService.RestoreIPv4ConfigAsync(adapter, snapshot, CancellationToken.None);
+            await VerifyRestoredAdapterConfigAsync(adapter, snapshot, CancellationToken.None);
             adapter.IPv4Address = snapshot.IpAddress;
             UpdateAdapterIpText(adapter);
-            TxtManualAdapterIp.Text = BuildAdapterIpDisplay(adapter);
-            _logger.Info($"Adapter restored to original config: idx={adapter.InterfaceIndex} {snapshot.DisplayText}");
-            return;
+            if (ReferenceEquals(SelectedAdapter, adapter)) TxtManualAdapterIp.Text = BuildAdapterIpDisplay(adapter);
+            _logger.Info($"{operation} compensated: idx={adapter.InterfaceIndex} {snapshot.DisplayText}");
         }
-        await _adapterService.RestoreDhcpAsync(adapter, ct);
-        var restored = await _adapterService.CaptureIPv4ConfigAsync(adapter, ct);
-        if (!restored.DhcpEnabled) throw new InvalidOperationException(Ui("verify.restore.failed"));
+        catch (Exception ex)
+        {
+            _logger.Error($"{operation} compensation failed; captured recovery data remains available", ex);
+        }
     }
 
     private async Task VerifyStaticIPv4Async(NetworkAdapterInfo adapter, string expectedIp, string expectedMask, CancellationToken ct)
@@ -4176,8 +5909,17 @@ public partial class MainWindow : Window
         var expectedAddress = IPAddress.Parse(expectedIp.Trim()).ToString();
         var expectedPrefix = IpNetwork.PrefixLength(IPAddress.Parse(expectedMask.Trim()));
         var actual = await _adapterService.CaptureIPv4ConfigAsync(adapter, ct);
-        var matched = !actual.DhcpEnabled && actual.Addresses.Any(x =>
-            x.IpAddress.Equals(expectedAddress, StringComparison.OrdinalIgnoreCase) && x.PrefixLength == expectedPrefix);
+        var hasOriginal = _originalAdapterConfigs.TryGetValue(AdapterSnapshotKey(adapter), out var original);
+        var matched = hasOriginal
+            && !actual.DhcpEnabled
+            && actual.Addresses.Count == 1
+            && actual.Addresses[0].IpAddress.Equals(expectedAddress, StringComparison.OrdinalIgnoreCase)
+            && actual.Addresses[0].PrefixLength == expectedPrefix
+            && actual.Routes.Count == 0
+            && actual.DnsMode == AdapterDnsMode.Automatic
+            && !actual.AutomaticMetric
+            && actual.InterfaceMetric == NetworkAdapterService.DhcpHostAdapterMetric
+            && actual.AdapterEnabled == original!.AdapterEnabled;
         _logger.Info($"Post-change adapter verification: idx={adapter.InterfaceIndex} expected={expectedAddress}/{expectedPrefix} actual={actual.DisplayText} matched={matched}");
         if (!matched) throw new InvalidOperationException(Ui("verify.static.failed"));
     }
@@ -4186,14 +5928,7 @@ public partial class MainWindow : Window
     {
         expected.NormalizeLegacyFields();
         var actual = await _adapterService.CaptureIPv4ConfigAsync(adapter, ct);
-        var expectedAddresses = expected.DhcpEnabled
-            ? Array.Empty<string>()
-            : expected.Addresses.Select(x => $"{x.IpAddress}/{x.PrefixLength}").OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToArray();
-        var actualAddresses = actual.DhcpEnabled
-            ? Array.Empty<string>()
-            : actual.Addresses.Select(x => $"{x.IpAddress}/{x.PrefixLength}").OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToArray();
-        var matched = expected.DhcpEnabled == actual.DhcpEnabled
-            && expectedAddresses.SequenceEqual(actualAddresses, StringComparer.OrdinalIgnoreCase);
+        var matched = AdapterIpv4SnapshotComparer.Equivalent(expected, actual);
         _logger.Info($"Post-restore adapter verification: idx={adapter.InterfaceIndex} expected={expected.DisplayText} actual={actual.DisplayText} matched={matched}");
         if (!matched) throw new InvalidOperationException(Ui("verify.restore.failed"));
     }
@@ -4222,12 +5957,6 @@ public partial class MainWindow : Window
         var matched = observed != null && actual.Equals(expected, StringComparison.OrdinalIgnoreCase);
         _logger.Info($"Post-change MAC verification: idx={backup.InterfaceIndex} expected={expected} actual={actual} matched={matched}");
         if (!matched) throw new InvalidOperationException(IsChineseUi() ? "恢复后校验失败：MAC 与目标值不一致。" : "Post-change verification failed: the MAC does not match the target value.");
-    }
-
-    private NetworkAdapterInfo? GetDhcpRestoreAdapter()
-    {
-        if (string.IsNullOrWhiteSpace(_activeDhcpAdapterIndex)) return SelectedAdapter;
-        return Adapters.FirstOrDefault(x => x.InterfaceIndex == _activeDhcpAdapterIndex) ?? SelectedAdapter;
     }
 
     private void ShowFavoriteFieldsDialog(FavoriteConfig fav)
@@ -4407,8 +6136,8 @@ public partial class MainWindow : Window
     {
         var zh = IsChineseUi();
         SetHeaders(LeaseGrid.Columns, zh,
-            ["最后上线", "MAC", "IP", "主机名", "开始", "结束", "状态", "延迟(ms)", "备注"],
-            ["Last Online", "MAC", "IP", "Hostname", "Start", "End", "Status", "Ping ms", "Remark"]);
+            ["最后上线", "MAC", "IP", "主机名", "开始", "结束", "状态", "会话", "延迟(ms)", "备注"],
+            ["Last Online", "MAC", "IP", "Hostname", "Start", "End", "Lease state", "Session", "Ping ms", "Remark"]);
         SetHeaders(ScanGrid.Columns, zh,
             ["IP", "连通", "延迟(ms)", "状态", "网页", "本机IP", "MAC", "主机名", "最后发现", "备注"],
             ["IP", "Ping", "ms", "Status", "Web", "Local IP", "MAC", "Hostname", "Last Seen", "Remark"]);
@@ -4443,38 +6172,51 @@ public partial class MainWindow : Window
     private static bool IsValidFavorite(FavoriteConfig item)
     {
         return !string.IsNullOrWhiteSpace(item.Name)
-            && IPAddress.TryParse(item.LocalIp, out _)
-            && IPAddress.TryParse(item.SubnetMask, out _);
+            && ScanRangePlan.TryCreate(item.LocalIp, item.SubnetMask, item.TargetIp, out _, out _);
     }
 
-    private static bool SameFavorite(FavoriteConfig a, FavoriteConfig b)
+    private static string FormatFavoriteImportField(string field, bool chinese)
     {
-        if (!string.IsNullOrWhiteSpace(a.Id) && a.Id.Equals(b.Id, StringComparison.OrdinalIgnoreCase)) return true;
-        return string.Equals(a.Name, b.Name, StringComparison.OrdinalIgnoreCase)
-            && string.Equals(a.LocalIp, b.LocalIp, StringComparison.OrdinalIgnoreCase)
-            && string.Equals(a.TargetIp, b.TargetIp, StringComparison.OrdinalIgnoreCase);
+        if (field.StartsWith("Custom:", StringComparison.OrdinalIgnoreCase))
+            return chinese ? $"自定义字段 {field[7..]}" : $"Custom field {field[7..]}";
+        return field switch
+        {
+            nameof(FavoriteConfig.Name) => chinese ? "名称" : "Name",
+            nameof(FavoriteConfig.DeviceNumber) => chinese ? "设备号" : "Device number",
+            nameof(FavoriteConfig.SerialNumber) => chinese ? "序列号" : "Serial number",
+            nameof(FavoriteConfig.RemarkName) => chinese ? "备注" : "Remark",
+            nameof(FavoriteConfig.Description) or nameof(FavoriteConfig.MemoryText) => chinese ? "说明/记忆" : "Description/memory",
+            nameof(FavoriteConfig.Username) => chinese ? "账号" : "Username",
+            nameof(FavoriteConfig.AdapterName) or nameof(FavoriteConfig.AdapterMac) => chinese ? "网卡标识" : "Adapter identity",
+            nameof(FavoriteConfig.LocalIp) => chinese ? "本机 IP" : "Local IP",
+            nameof(FavoriteConfig.SubnetMask) => chinese ? "掩码" : "Subnet mask",
+            nameof(FavoriteConfig.Gateway) => chinese ? "网关" : "Gateway",
+            nameof(FavoriteConfig.Dns) => chinese ? "DNS" : "DNS",
+            nameof(FavoriteConfig.TargetIp) => chinese ? "目标 IP" : "Target IP",
+            nameof(FavoriteConfig.PreferHttps) => chinese ? "HTTPS 偏好" : "HTTPS preference",
+            "Credentials" => chinese ? "凭据" : "Credentials",
+            _ => field
+        };
     }
 
-    private static void MergeFavorite(FavoriteConfig target, FavoriteConfig source)
+    private static string FormatFavoriteImportChange(FavoriteFieldChange change, bool chinese)
     {
-        target.Name = source.Name;
-        target.DeviceNumber = source.DeviceNumber;
-        target.SerialNumber = source.SerialNumber;
-        target.RemarkName = source.RemarkName;
-        target.Description = source.Description;
-        target.Username = source.Username;
-        target.PublicPassword = source.PublicPassword;
-        target.Password = source.Password;
-        target.ProtectedPassword = source.ProtectedPassword;
-        target.IsPublicDefault = source.IsPublicDefault;
-        target.PasswordUnavailable = source.PasswordUnavailable;
-        target.PreferHttps = source.PreferHttps;
-        target.MemoryText = source.MemoryText;
-        target.LocalIp = source.LocalIp;
-        target.SubnetMask = source.SubnetMask;
-        target.TargetIp = source.TargetIp;
-        target.CustomFields = source.CustomFields;
-        target.UpdatedAt = DateTime.Now;
+        var label = FormatFavoriteImportField(change.Field, chinese);
+        if (change.IsCredential || IsSensitiveFavoriteField(change.Field))
+            return chinese ? $"{label}：将替换（值不显示）" : $"{label}: replacement (value hidden)";
+        var oldValue = SummarizeImportValue(change.ExistingValue);
+        var newValue = SummarizeImportValue(change.ImportedValue);
+        return chinese ? $"{label}：{oldValue} → {newValue}" : $"{label}: {oldValue} → {newValue}";
+    }
+
+    private static bool IsSensitiveFavoriteField(string field) =>
+        new[] { "password", "passwd", "credential", "secret", "token", "privatekey" }
+            .Any(sensitive => field.Contains(sensitive, StringComparison.OrdinalIgnoreCase));
+
+    private static string SummarizeImportValue(string value)
+    {
+        var safe = new string(value.Where(ch => !char.IsControl(ch)).ToArray()).Trim();
+        return safe.Length <= 60 ? safe : safe[..57] + "...";
     }
 
     private void SelectLanguageBox(string language)

@@ -29,6 +29,8 @@ public sealed class AppPathsMigrationTests
             Environment.SetEnvironmentVariable("NETBOOT_DATA_DIRECTORY", dataDirectory);
 
             var paths = new AppPaths(appDirectory);
+            Assert.IsFalse(File.Exists(paths.FavoritesFile), "Path construction must not migrate data before an instance owns the directory.");
+            paths.Ensure();
 
             Assert.IsTrue(File.Exists(paths.FavoritesFile), "A failed settings migration must not stop later config copies.");
             Assert.IsTrue(File.Exists(Path.Combine(paths.LogsDirectory, "copied.log")), "A failed log migration must not stop later log copies.");

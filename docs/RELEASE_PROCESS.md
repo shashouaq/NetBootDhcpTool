@@ -9,7 +9,7 @@ For day-to-day maintenance, required change-log practice, GitHub synchronization
 - The application version is defined in `src/NetBootDhcpTool.App/NetBootDhcpTool.App.csproj`.
 - `build/publish.ps1` reads that version and must not use a separate hard-coded version.
 - Release tags must use `v<version>`, for example `v1.0.12`.
-- The repository pins the .NET 10 SDK in `global.json`; the resolver selects a matching local or system SDK and bootstraps it when neither is available.
+- The repository targets .NET 10 and pins SDK `10.0.401` in `global.json`. Use `build/resolve-dotnet.ps1` so local builds honor that pin; it bootstraps the pinned SDK when needed.
 
 ## Required Checks
 
@@ -17,22 +17,36 @@ Run these checks before publishing:
 
 ```powershell
 $dotnet = .\build\resolve-dotnet.ps1
+& $dotnet restore .\NetBootDhcpTool.sln
+& .\build\verify-maintenance.ps1
 & $dotnet build .\NetBootDhcpTool.sln -c Release --no-restore
 & $dotnet test .\src\NetBootDhcpTool.UnitTests\NetBootDhcpTool.UnitTests.csproj -c Release --no-build --minimum-expected-tests 1
-& $dotnet run --project .\src\NetBootDhcpTool.Tests\NetBootDhcpTool.Tests.csproj -c Release
-& .\build\verify-maintenance.ps1
+& $dotnet run --project .\src\NetBootDhcpTool.Tests\NetBootDhcpTool.Tests.csproj -c Release --no-build
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$principal = [Security.Principal.WindowsPrincipal]::new($identity)
+if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Host 'UI smoke skipped: run from a standard-user Windows session.'
+} else {
+    & .\build\ui-automation-smoke.ps1
+}
+git diff --check
 ```
 
-If only documentation changed, a lightweight Markdown/content review is acceptable, but the change must still be recorded in `docs/FEATURE_CHANGELOG.md`.
+`NetBootDhcpTool.UnitTests` is the MSTest suite; `NetBootDhcpTool.Tests` is a console smoke and must be invoked with `dotnet run`. The UI smoke runs only from a standard-user Windows session; the command block records a skip when elevated, matching CI. Run each check separately and stop at the first failure.
+
+For static-route-specific acceptance, follow the [maintenance guide](MAINTENANCE_GUIDE.md#standard-change-workflow); it defines the isolated Hyper-V route smoke and evidence required.
+
+For documentation-only checks and change-log requirements, follow the [maintenance guide](MAINTENANCE_GUIDE.md#verification-evidence). A full build is not required unless the documentation changes packaging or release behavior.
 
 ## Packaging
 
-Stop test processes and publish from the repository root:
+Publish from the repository root after completing the required checks:
 
 ```powershell
-.\build\stop-test-processes.ps1
 .\build\publish.ps1 -GitHubRepository owner/repo
 ```
+
+The publish script invokes `stop-test-processes.ps1`. That helper resolves actual executable paths and quoted `dotnet` entry points, stops only test runners proven to be under this repository's test-project output trees, and rechecks PID identity before stopping. It refuses to package while any NetBootDhcpTool GUI is running or its executable path is unreadable; no GUI is force-terminated. Close the app normally and retry. It leaves machine-wide PktMon captures and filters untouched.
 
 When `-GitHubRepository` is supplied, `release\latest.json` includes GitHub download URLs for the versioned archive. If the repository is not known yet, omit the parameter and rerun the publish command before uploading a GitHub release.
 
@@ -45,12 +59,31 @@ Expected outputs:
 - `release\NetBootDhcpTool-v<version>.7z.sha256`
 - `release\latest.json`
 
-The publish script must test the `.7z` archive before the release is considered valid.
-For static route changes, run `build\route-smoke.ps1` as administrator when Hyper-V is available; the script owns and removes only its uniquely named test switches.
+The publish script tests the `.7z` archive and writes its SHA-256 sidecar and `latest.json` manifest. Before uploading, verify that the local manifest and checksum sidecar both match the archive:
+
+```powershell
+$version = "<version>"
+$archive = ".\release\NetBootDhcpTool-v$version.7z"
+$hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+$sidecarHash = (Get-Content -Raw "$archive.sha256").Trim().Split(' ')[0].ToLowerInvariant()
+$manifest = Get-Content -Raw .\release\latest.json | ConvertFrom-Json
+if ($sidecarHash -ne $hash -or $manifest.version -ne $version -or $manifest.archiveSha256 -ne $hash) {
+    throw "Local release assets are inconsistent for v$version"
+}
+```
 
 ## GitHub Release Standard
 
-Local source changes are not committed/pushed or published unless the user explicitly says `发布` or `release`. A normal feature change stops after local validation and source-preview startup. When publication is explicitly authorized, verify the remote commit, tag, release, and assets before claiming GitHub publication.
+Local source changes are not committed/pushed or published unless the user explicitly says `发布` or `release`. Normal feature-change validation and source-preview rules are owned by the [maintenance guide](MAINTENANCE_GUIDE.md#standard-change-workflow). When publication is explicitly authorized, publish the source commit and matching `v<version>` tag, create/update the GitHub Release from that tag, then verify the remote commit, tag, release, and assets before claiming GitHub publication. Keep the release change-log entry and notes aligned; `publish.ps1` prefers the current version section and falls back to `Unreleased` when that version section does not exist.
+
+Before creating the GitHub Release, confirm the Windows CI workflow succeeded for the exact commit and verify that the pushed tag resolves to that commit. The workflow is defined in `.github/workflows/windows-ci.yml`; it runs restore, maintenance checks, Release build, unit tests, console smoke, and non-admin UI smoke when the runner is not elevated.
+
+Compare the local release commit with the remote branch and tag (for annotated tags, compare the peeled `^{}` tag ref):
+
+```powershell
+git rev-parse HEAD
+git ls-remote origin main "refs/tags/v<version>" "refs/tags/v<version>^{}"
+```
 
 Create a GitHub Release with:
 
@@ -63,12 +96,36 @@ Create a GitHub Release with:
 
 Release notes must be extracted and polished from `docs/FEATURE_CHANGELOG.md`. Do not write release notes without a matching change log entry.
 
-After creating or updating a release, verify:
+After creating or updating a release, verify the GitHub Release assets and the latest manifest:
 
 ```powershell
 & "C:\Program Files\GitHub CLI\gh.exe" release view v<version> --repo shashouaq/NetBootDhcpTool
-$r = Invoke-WebRequest -Uri "https://github.com/shashouaq/NetBootDhcpTool/releases/latest/download/latest.json" -UseBasicParsing
-[System.Text.Encoding]::UTF8.GetString($r.Content)
+$manifest = Invoke-RestMethod -Uri "https://github.com/shashouaq/NetBootDhcpTool/releases/latest/download/latest.json"
+if ($manifest.version -ne "<version>") { throw "Latest manifest version mismatch: $($manifest.version)" }
+```
+
+Download the remote archive and compare its hash with the local archive and published sidecar before closing the release:
+
+```powershell
+$version = "<version>"
+$archiveName = "NetBootDhcpTool-v$version.7z"
+$localArchive = Join-Path (Get-Location) "release\$archiveName"
+$localSidecar = "$localArchive.sha256"
+$verifyDir = Join-Path $env:TEMP ("netboot-release-verify-" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Force -Path $verifyDir | Out-Null
+& "C:\Program Files\GitHub CLI\gh.exe" release download "v$version" --repo shashouaq/NetBootDhcpTool --dir $verifyDir
+if ($LASTEXITCODE -ne 0) { throw "Could not download release assets for v$version" }
+$expectedHash = (Get-Content -Raw $localSidecar).Trim().Split(' ')[0].ToLowerInvariant()
+$localHash = (Get-FileHash -LiteralPath $localArchive -Algorithm SHA256).Hash.ToLowerInvariant()
+$remoteArchive = Join-Path $verifyDir $archiveName
+$remoteSidecar = "$remoteArchive.sha256"
+$remoteExpectedHash = (Get-Content -Raw $remoteSidecar).Trim().Split(' ')[0].ToLowerInvariant()
+$remoteHash = (Get-FileHash -LiteralPath $remoteArchive -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($localHash -ne $expectedHash -or $remoteHash -ne $expectedHash -or $remoteHash -ne $remoteExpectedHash) { throw "Release archive SHA-256 mismatch" }
+$manifest = Invoke-RestMethod -Uri "https://github.com/shashouaq/NetBootDhcpTool/releases/latest/download/latest.json"
+if ($manifest.version -ne $version -or $manifest.archiveName -ne $archiveName -or $manifest.archiveSha256 -ne $expectedHash) { throw "Published manifest does not match v$version archive" }
+& "C:\Program Files\7-Zip\7z.exe" t $remoteArchive
+if ($LASTEXITCODE -ne 0) { throw "Downloaded release archive failed 7-Zip testing" }
 ```
 
 ## Upgrade Detection

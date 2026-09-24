@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Net;
+using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Text;
 using NetBootDhcpTool.Core;
@@ -39,7 +40,7 @@ if (virtualRouteSmokeIndex >= 0)
 
 var mask = IPAddress.Parse("255.255.255.0");
 var hosts = IpNetwork.Hosts(IPAddress.Parse("192.168.1.10"), mask);
-Assert(hosts.Count == 254, "host count");
+Assert(hosts.Count() == 254, "host count");
 Assert(IpNetwork.SameSubnet(IPAddress.Parse("192.168.1.1"), IPAddress.Parse("192.168.1.200"), mask), "same subnet");
 Assert(IpNetwork.BroadcastAddress(IPAddress.Parse("192.168.100.1"), mask).ToString() == "192.168.100.255", "broadcast address");
 Assert(IpNetwork.ParseCidr("192.168.10.42/24") == "192.168.10.0/24", "cidr canonicalization");
@@ -66,24 +67,33 @@ snapshot.NormalizeLegacyFields();
 Assert(snapshot.Addresses.Count == 1 && snapshot.Routes.Count == 1, "legacy adapter snapshot normalization");
 var settings = new DhcpServerSettings();
 var leases = new DhcpLeaseManager(settings);
-var l1 = leases.Allocate("AA-BB-CC-DD-EE-FF", "dev");
-var l2 = leases.Allocate("AA-BB-CC-DD-EE-FF", "dev");
-Assert(l1.IpAddress == l2.IpAddress, "stable lease");
-var smallPool = new DhcpLeaseManager(new DhcpServerSettings
+var testMac = new byte[] { 0x02, 0x11, 0x22, 0x33, 0x44, 0x55 };
+var offered = leases.Process(CreateDhcpPacket(DhcpMessageType.Discover, testMac));
+var repeatedOffer = leases.Process(CreateDhcpPacket(DhcpMessageType.Discover, testMac));
+Assert(offered.ResponseType == DhcpMessageType.Offer && offered.Address?.Equals(repeatedOffer.Address) == true && leases.Leases.Count == 0,
+    $"stable uncommitted offer ({offered.ResponseType}:{offered.Address}; {repeatedOffer.ResponseType}:{repeatedOffer.Address}; leases={leases.Leases.Count})");
+var ackDecision = leases.Process(CreateDhcpPacket(DhcpMessageType.Request, testMac, offered.Address, settings.ServerIp));
+Assert(ackDecision.ResponseType == DhcpMessageType.Ack && leases.Leases.Count == 1, "DORA request commits a lease");
+var wrongServer = leases.Process(CreateDhcpPacket(DhcpMessageType.Request, testMac, offered.Address, IPAddress.Parse("192.168.100.9")));
+Assert(wrongServer.ResponseType == null && leases.Leases.Count == 1, "selecting another server receives no acknowledgement");
+var smallPoolSettings = new DhcpServerSettings
 {
     ServerIp = IPAddress.Parse("192.168.50.1"),
     SubnetMask = mask,
     PoolStart = IPAddress.Parse("192.168.50.2"),
     PoolEnd = IPAddress.Parse("192.168.50.3"),
     LeaseSeconds = 60
-});
-smallPool.Allocate("00-00-00-00-00-01", "one");
-smallPool.Allocate("00-00-00-00-00-02", "two");
-AssertThrowsAny(() => smallPool.Allocate("00-00-00-00-00-03", "three"), "lease pool exhaustion");
+};
+var smallPool = new DhcpLeaseManager(smallPoolSettings);
+var poolOffer1 = smallPool.Process(CreateDhcpPacket(DhcpMessageType.Discover, [0x02, 0, 0, 0, 0, 1]));
+var poolOffer2 = smallPool.Process(CreateDhcpPacket(DhcpMessageType.Discover, [0x02, 0, 0, 0, 0, 2]));
+var poolOffer3 = smallPool.Process(CreateDhcpPacket(DhcpMessageType.Discover, [0x02, 0, 0, 0, 0, 3]));
+Assert(poolOffer1.Address != null && poolOffer2.Address != null && !poolOffer1.Address.Equals(poolOffer2.Address) && poolOffer3.ResponseType == null, "offer pool exhaustion");
 TestVersionUpdates();
 TestSupportDataRedaction();
 TestFavoriteStorage();
 TestProfileStorage();
+TestJsonRecovery();
 await TestHttpProbeInputBoundaryAsync();
 var publicPresets = Defaults.DefaultFavorites();
 Assert(publicPresets.Count >= 10 && publicPresets.All(x => x.IsPublicDefault && !string.IsNullOrWhiteSpace(x.Password)), "public BMC presets");
@@ -196,22 +206,36 @@ static void TestFavoriteStorage()
         Assert(loaded[0].PasswordDisplay == "••••••", "favorite password masked by default");
         var persisted = File.ReadAllText(path);
         Assert(!persisted.Contains("\"Password\":", StringComparison.Ordinal) && persisted.Contains("\"ProtectedPassword\":", StringComparison.Ordinal), "favorite password migration");
-        Assert(!File.Exists(path + ".bak"), "legacy favorite backup removed");
+        var protectedBackup = File.ReadAllText(path + ".bak");
+        Assert(!protectedBackup.Contains("dpapi-test-value", StringComparison.Ordinal)
+            && !protectedBackup.Contains("\"Password\":", StringComparison.Ordinal)
+            && protectedBackup.Contains("\"ProtectedPassword\":", StringComparison.Ordinal), "legacy favorite backup contains only DPAPI-protected credentials");
         FavoriteStore.SaveCredentialFreeExport(exportPath, loaded);
         var exported = File.ReadAllText(exportPath);
         Assert(!exported.Contains("dpapi-test-value", StringComparison.Ordinal) && !exported.Contains("\"Password\":", StringComparison.Ordinal), "credential-free favorite export");
+        var exportedBackup = File.ReadAllText(exportPath + ".bak");
+        Assert(!exportedBackup.Contains("dpapi-test-value", StringComparison.Ordinal) && !exportedBackup.Contains("\"Password\":", StringComparison.Ordinal), "credential-free favorite export backup");
 
         var publicPath = path + ".public.json";
-        var publicFavorite = new FavoriteConfig { Id = "public", Name = "Public preset", IsPublicDefault = true, Password = "PUBLIC_DEFAULT" };
+        var publicFavorite = Defaults.DefaultFavorites().First(x => x.IsPublicDefault);
         FavoriteStore.Save(publicPath, [publicFavorite]);
         var publicJson = File.ReadAllText(publicPath);
-        Assert(publicJson.Contains("PUBLIC_DEFAULT", StringComparison.Ordinal) && publicJson.Contains("\"PublicPassword\"", StringComparison.Ordinal), "public favorite plaintext credential");
+        Assert(publicJson.Contains(publicFavorite.Password, StringComparison.Ordinal) && publicJson.Contains("\"PublicPassword\"", StringComparison.Ordinal), "shipped public favorite plaintext credential");
         var publicLoaded = FavoriteStore.Load(publicPath);
-        Assert(publicLoaded.Count == 1 && publicLoaded[0].Password == "PUBLIC_DEFAULT" && publicLoaded[0].PasswordDisplay == "••••••", "public favorite load and mask");
+        Assert(publicLoaded.Count == 1 && publicLoaded[0].Password == publicFavorite.Password && publicLoaded[0].PasswordDisplay == "••••••", "public favorite load and mask");
+
+        var forgedPath = path + ".forged-public.json";
+        const string forgedSecret = "SYNTHETIC_FORGED_PUBLIC_SECRET";
+        FavoriteStore.Save(forgedPath,
+        [new FavoriteConfig { Id = "not-a-shipped-id", Name = "Forged public marker", IsPublicDefault = true, Password = forgedSecret }]);
+        var forgedJson = File.ReadAllText(forgedPath);
+        Assert(!forgedJson.Contains(forgedSecret, StringComparison.Ordinal)
+            && forgedJson.Contains("\"ProtectedPassword\"", StringComparison.Ordinal)
+            && !FavoriteStore.Load(forgedPath)[0].IsPublicDefault, "untrusted public marker remains a protected personal credential");
     }
     finally
     {
-        foreach (var file in new[] { path, path + ".bak", path + ".tmp", exportPath, exportPath + ".bak", exportPath + ".tmp", path + ".public.json", path + ".public.json.bak", path + ".public.json.tmp" })
+        foreach (var file in new[] { path, path + ".bak", path + ".tmp", exportPath, exportPath + ".bak", exportPath + ".tmp", path + ".public.json", path + ".public.json.bak", path + ".public.json.tmp", path + ".forged-public.json", path + ".forged-public.json.bak", path + ".forged-public.json.tmp" })
         {
             if (File.Exists(file)) File.Delete(file);
         }
@@ -247,6 +271,36 @@ static void TestProfileStorage()
     }
 }
 
+static void TestJsonRecovery()
+{
+    var directory = Path.Combine(Path.GetTempPath(), "netboot-recovery-smoke-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(directory);
+    var path = Path.Combine(directory, "settings.json");
+    try
+    {
+        Assert(JsonStore.Load<List<string>>(path).Status == DataLoadStatus.Missing, "missing JSON status");
+        File.WriteAllText(path, "[]");
+        Assert(JsonStore.Load<List<string>>(path).Status == DataLoadStatus.LoadedEmpty, "valid empty JSON status");
+        File.Delete(path);
+        JsonStore.Save(path, new AppSettings { Language = "en-US" });
+        JsonStore.Save(path, new AppSettings { Language = "zh-CN" });
+        File.WriteAllText(path, "damaged primary");
+        var damaged = File.ReadAllText(path);
+        var restored = JsonStore.Load<AppSettings>(path);
+        Assert(restored.Status == DataLoadStatus.RestoredFromBackup && restored.Value!.Language == "en-US", "restore from valid backup");
+        Assert(File.ReadAllText(path) == damaged, "corrupt primary preserved");
+        File.WriteAllText(path + ".bak", "damaged backup");
+        Assert(JsonStore.Load<AppSettings>(path).Status == DataLoadStatus.Failed, "both corrupt status");
+        try { JsonStore.Save(path, new AppSettings()); throw new Exception("corrupt JSON save should fail"); }
+        catch (InvalidDataException) { }
+        Assert(File.ReadAllText(path) == damaged, "failed save retained corrupt primary");
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
 static async Task TestHttpProbeInputBoundaryAsync()
 {
     var result = await new HttpProbeService().ProbeAsync("127.0.0.1;Get-Process", 50);
@@ -258,26 +312,54 @@ static async Task TestDhcpServerAsync()
     var logger = new TestLogger();
     using var client = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
     var clientPort = ((IPEndPoint)client.Client.LocalEndPoint!).Port;
+    var loopback = NetworkInterface.GetAllNetworkInterfaces().Single(x => x.NetworkInterfaceType == NetworkInterfaceType.Loopback);
+    var loopbackIndex = loopback.GetIPProperties().GetIPv4Properties()?.Index ?? throw new InvalidOperationException("Loopback IPv4 interface index unavailable.");
     using var server = new DhcpServer(logger, listenPort: 0, clientPort: clientPort, replyAddress: IPAddress.Loopback);
     var settings = new DhcpServerSettings
     {
-        ServerIp = IPAddress.Parse("192.168.60.1"),
-        SubnetMask = IPAddress.Parse("255.255.255.0"),
-        PoolStart = IPAddress.Parse("192.168.60.100"),
-        PoolEnd = IPAddress.Parse("192.168.60.101"),
+        AdapterId = loopback.Id,
+        InterfaceIndex = loopbackIndex,
+        ServerIp = IPAddress.Loopback,
+        SubnetMask = IPAddress.Parse("255.0.0.0"),
+        PoolStart = IPAddress.Parse("127.0.0.100"),
+        PoolEnd = IPAddress.Parse("127.0.0.101"),
         LeaseSeconds = 60
     };
-    await server.StartAsync(settings);
+    var persistedBindings = new List<DhcpLeaseBinding>();
+    await server.StartAsync(settings, persistLeaseTable: snapshot => persistedBindings = snapshot.Bindings);
     Assert(server.IsRunning && server.ListenPort > 0, "DHCP server started on test port");
     var mac = new byte[] { 0x02, 0x11, 0x22, 0x33, 0x44, 0x55 };
     var discover = BuildDhcpClientPacket(0x01020304, mac, DhcpMessageType.Discover);
+    var malformedDiscover = (byte[])discover.Clone();
+    malformedDiscover[239] = 0;
+    await client.SendAsync(malformedDiscover, new IPEndPoint(IPAddress.Loopback, server.ListenPort));
+    Assert(!await HasDhcpPacketAsync(client, 100), "malformed packet gets no DHCP response");
     await client.SendAsync(discover, new IPEndPoint(IPAddress.Loopback, server.ListenPort));
     var offer = DhcpPacketParser.Parse((await ReceiveWithTimeoutAsync(client)).Buffer);
-    Assert(offer.MessageType == DhcpMessageType.Offer && offer.YiAddr.ToString() == "192.168.60.100", "DHCP discover offer");
-    var request = BuildDhcpClientPacket(0x01020304, mac, DhcpMessageType.Request, offer.YiAddr);
+    Assert(offer.MessageType == DhcpMessageType.Offer && offer.YiAddr.ToString() == "127.0.0.100", "DHCP discover offer scoped to the selected loopback test interface");
+    Assert(persistedBindings.Count == 0, "DHCP offer not yet persisted as a committed lease");
+    await client.SendAsync(discover, new IPEndPoint(IPAddress.Loopback, server.ListenPort));
+    var repeatedOffer = DhcpPacketParser.Parse((await ReceiveWithTimeoutAsync(client)).Buffer);
+    Assert(repeatedOffer.YiAddr.Equals(offer.YiAddr), "repeat discover retains the pending offer");
+    var wrongServerRequest = BuildDhcpClientPacket(0x01020304, mac, DhcpMessageType.Request, offer.YiAddr, IPAddress.Parse("127.0.0.2"));
+    await client.SendAsync(wrongServerRequest, new IPEndPoint(IPAddress.Loopback, server.ListenPort));
+    Assert(!await HasDhcpPacketAsync(client, 200), "request selecting another DHCP server is ignored");
+    await client.SendAsync(discover, new IPEndPoint(IPAddress.Loopback, server.ListenPort));
+    offer = DhcpPacketParser.Parse((await ReceiveWithTimeoutAsync(client)).Buffer);
+    var request = BuildDhcpClientPacket(0x01020304, mac, DhcpMessageType.Request, offer.YiAddr, settings.ServerIp);
     await client.SendAsync(request, new IPEndPoint(IPAddress.Loopback, server.ListenPort));
     var ack = DhcpPacketParser.Parse((await ReceiveWithTimeoutAsync(client)).Buffer);
     Assert(ack.MessageType == DhcpMessageType.Ack && ack.YiAddr.Equals(offer.YiAddr), "DHCP request ack");
+    Assert(persistedBindings.Count == 1 && persistedBindings[0].IpAddress == offer.YiAddr.ToString(), "lease is journaled before ACK");
+    var invalidRequest = BuildDhcpClientPacket(0x01020304, mac, DhcpMessageType.Request, IPAddress.Parse("127.0.0.102"), settings.ServerIp);
+    await client.SendAsync(invalidRequest, new IPEndPoint(IPAddress.Loopback, server.ListenPort));
+    var nak = DhcpPacketParser.Parse((await ReceiveWithTimeoutAsync(client)).Buffer);
+    Assert(nak.MessageType == DhcpMessageType.Nak && nak.YiAddr.Equals(IPAddress.Any), "invalid requested address receives addressless NAK");
+    var release = BuildDhcpClientPacket(0x01020304, mac, DhcpMessageType.Release, serverIdentifier: settings.ServerIp, ciAddr: offer.YiAddr);
+    await client.SendAsync(release, new IPEndPoint(IPAddress.Loopback, server.ListenPort));
+    var releaseDeadline = Stopwatch.StartNew();
+    while (persistedBindings.Count != 0 && releaseDeadline.Elapsed < TimeSpan.FromSeconds(2)) await Task.Delay(20);
+    Assert(persistedBindings.Count == 0, "owner release clears the committed binding journal");
     server.Stop();
     Assert(!server.IsRunning, "DHCP server stopped cleanly");
 }
@@ -287,15 +369,15 @@ static void TestDhcpServerStartFailureRecovery()
     var logger = new TestLogger();
     using var occupied = new UdpClient(AddressFamily.InterNetwork);
     occupied.Client.ExclusiveAddressUse = true;
-    occupied.Client.Bind(new IPEndPoint(IPAddress.Any, 0));
+    occupied.Client.Bind(new IPEndPoint(IPAddress.Loopback, 0));
     var occupiedPort = ((IPEndPoint)occupied.Client.LocalEndPoint!).Port;
-    using var server = new DhcpServer(logger, listenPort: occupiedPort);
-    var settings = new DhcpServerSettings();
+    using var server = new DhcpServer(logger, listenPort: occupiedPort, allowUnscopedTestBinding: true);
+    var settings = new DhcpServerSettings { ServerIp = IPAddress.Loopback };
     AssertThrowsAny(() => server.StartAsync(settings).GetAwaiter().GetResult(), "DHCP bind failure surfaced");
     Assert(!server.IsRunning, "DHCP failed start leaves stopped state");
 }
 
-static byte[] BuildDhcpClientPacket(uint xid, byte[] mac, DhcpMessageType type, IPAddress? requestedIp = null)
+static byte[] BuildDhcpClientPacket(uint xid, byte[] mac, DhcpMessageType type, IPAddress? requestedIp = null, IPAddress? serverIdentifier = null, IPAddress? ciAddr = null)
 {
     var data = new byte[260];
     data[0] = 1;
@@ -303,6 +385,7 @@ static byte[] BuildDhcpClientPacket(uint xid, byte[] mac, DhcpMessageType type, 
     data[2] = 6;
     BinaryPrimitives.WriteUInt32BigEndian(data.AsSpan(4, 4), xid);
     BinaryPrimitives.WriteUInt16BigEndian(data.AsSpan(10, 2), 0x8000);
+    if (ciAddr != null) ciAddr.GetAddressBytes().CopyTo(data, 12);
     Array.Copy(mac, 0, data, 28, Math.Min(16, mac.Length));
     data[236] = 99;
     data[237] = 130;
@@ -319,15 +402,42 @@ static byte[] BuildDhcpClientPacket(uint xid, byte[] mac, DhcpMessageType type, 
         requestedIp.GetAddressBytes().CopyTo(data, index);
         index += 4;
     }
+    if (serverIdentifier != null)
+    {
+        data[index++] = 54;
+        data[index++] = 4;
+        serverIdentifier.GetAddressBytes().CopyTo(data, index);
+        index += 4;
+    }
     data[index++] = 255;
     Array.Resize(ref data, index);
     return data;
 }
 
+static DhcpPacket CreateDhcpPacket(DhcpMessageType type, byte[] mac, IPAddress? requestedIp = null, IPAddress? serverIdentifier = null) => new()
+{
+    Op = 1,
+    HType = 1,
+    HLen = 6,
+    Xid = 0x01020304,
+    ChAddr = mac.Concat(new byte[10]).ToArray(),
+    MessageType = type,
+    RequestedIp = requestedIp,
+    ServerIdentifier = serverIdentifier,
+    Hostname = "smoke-client"
+};
+
 static async Task<UdpReceiveResult> ReceiveWithTimeoutAsync(UdpClient client)
 {
     using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
     return await client.ReceiveAsync(timeout.Token);
+}
+
+static async Task<bool> HasDhcpPacketAsync(UdpClient client, int timeoutMs)
+{
+    using var timeout = new CancellationTokenSource(timeoutMs);
+    try { _ = await client.ReceiveAsync(timeout.Token); return true; }
+    catch (OperationCanceledException) when (timeout.IsCancellationRequested) { return false; }
 }
 
 static async Task RunRouteSmokeAsync(string firstIndex, string secondIndex)
@@ -349,7 +459,13 @@ static async Task RunRouteSmokeAsync(string firstIndex, string secondIndex)
     var samePrefixRuleB = new StaticRouteRule { Id = "route-smoke-rule-same-b", DestinationPrefix = "10.250.40.0/24", AdapterId = adapterB.Id };
     var ipv6Rule = new StaticRouteRule { Id = "route-smoke-rule-ipv6", DestinationPrefix = "fd12:250:252::/64", AdapterId = adapterA.Id, RouteMetric = 10 };
     const string conflictDestination = "10.250.30.0/24";
-    await RunPowerShellCommandAsync($"New-NetRoute -DestinationPrefix '{conflictDestination}' -InterfaceIndex {second} -AddressFamily IPv4 -NextHop '0.0.0.0' -RouteMetric 200 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null");
+    const string conflictNextHop = "198.18.251.254";
+    await RunPowerShellCommandAsync($"New-NetRoute -DestinationPrefix '{conflictDestination}' -InterfaceIndex {second} -AddressFamily IPv4 -NextHop '{conflictNextHop}' -RouteMetric 200 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null");
+    var conflictRoutes = (await service.GetCurrentStaticRoutesAsync())
+        .Where(route => route.DestinationPrefix.StartsWith("10.250.30.", StringComparison.OrdinalIgnoreCase))
+        .ToList();
+    foreach (var route in conflictRoutes)
+        Console.WriteLine($"ROUTE_SMOKE_SETUP prefix={route.DestinationPrefix} interface={route.InterfaceIndex} nextHop={route.NextHop} routeMetric={route.RouteMetric} interfaceMetric={route.InterfaceMetric} store={route.PolicyStore}");
     var targets = new List<StaticRouteTarget>
     {
         new(ruleA, adapterA, StaticRouteValidator.Normalize(ruleA)),
@@ -376,7 +492,7 @@ static async Task RunRouteSmokeAsync(string firstIndex, string secondIndex)
     }
     finally
     {
-        await RunPowerShellCommandAsync($"Get-NetRoute -InterfaceIndex {second} -AddressFamily IPv4 -DestinationPrefix '{conflictDestination}' -NextHop '0.0.0.0' -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue");
+        await RunPowerShellCommandAsync($"Get-NetRoute -InterfaceIndex {second} -AddressFamily IPv4 -DestinationPrefix '{conflictDestination}' -NextHop '{conflictNextHop}' -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue");
     }
 }
 

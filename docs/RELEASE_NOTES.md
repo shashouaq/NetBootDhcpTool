@@ -1,5 +1,21 @@
 # Release Notes
 
+## v1.0.13
+
+NetBoot DHCP Tool v1.0.13 bundles the approved maintenance work through T17. Startup and refresh now read network adapters and current IPv4/IPv6 routes concurrently, reducing the measured network-discovery wait while preserving the full current route list and fresh checks before route changes.
+
+### Changes
+
+- Added visible operation phases and elapsed timing for startup discovery, network actions, cancellation waits, and normal exit recovery.
+- Strengthened DHCP session/interface ownership, lease persistence and client identity handling, firewall cleanup, adapter restoration, and recovery records.
+- Improved input/range validation, configuration/favorites persistence and comparison, and final download verification.
+- Kept current route reads uncached; both parallel startup reads must finish before the existing UI snapshot is populated.
+
+### Validation
+
+- Release solution build: 0 warnings/errors; MSTest 140/140; console smoke `OK`; non-admin WPF UI smoke `UI_SMOKE_OK`; maintenance checks passed.
+- On the connected Linux client, real DORA, same-address renewal after application process restart, DHCPRELEASE, address reuse under a temporary second MAC, lease UI isolation, and normal adapter/firewall restoration passed. Startup discovery samples were 2.75 and 3.29 seconds versus the T16 single-run serial baseline of 4.44 seconds; timings vary with system load.
+
 ## v1.0.12
 
 NetBoot DHCP Tool v1.0.12 moves the project to .NET 10, adds repeatable Windows CI and focused regression tests, and makes recovery safer to inspect and apply item by item.

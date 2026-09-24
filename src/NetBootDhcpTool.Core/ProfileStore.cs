@@ -1,28 +1,25 @@
-using System.Text.Json;
-
 namespace NetBootDhcpTool.Core;
 
 public static class ProfileStore
 {
-    public static List<NetworkProfile> Load(string path, ILogger? logger = null)
+    public static DataLoadResult<List<NetworkProfile>> LoadWithStatus(string path, ILogger? logger = null)
     {
-        if (!File.Exists(path)) return [];
-        try
+        var result = JsonStore.Load<List<NetworkProfile>>(path, logger);
+        if (!result.HasData) return result with { Value = [] };
+
+        var profiles = result.Value ?? [];
+        foreach (var profile in profiles)
         {
-            var profiles = JsonSerializer.Deserialize<List<NetworkProfile>>(File.ReadAllText(path), JsonStore.Options) ?? [];
-            foreach (var profile in profiles)
-            {
-                profile.Dhcp ??= new DefaultDhcpSettings();
-                profile.Routes ??= [];
-            }
-            return profiles;
+            profile.Dhcp ??= new DefaultDhcpSettings();
+            profile.Routes ??= [];
         }
-        catch (Exception ex)
-        {
-            logger?.Error($"Load profiles failed: {path}", ex);
-            return [];
-        }
+        var status = result.Status == DataLoadStatus.Loaded && profiles.Count == 0
+            ? DataLoadStatus.LoadedEmpty
+            : result.Status;
+        return result with { Status = status, Value = profiles };
     }
+
+    public static List<NetworkProfile> Load(string path, ILogger? logger = null) => LoadWithStatus(path, logger).Value ?? [];
 
     public static void Save(string path, IEnumerable<NetworkProfile> profiles, ILogger? logger = null)
     {

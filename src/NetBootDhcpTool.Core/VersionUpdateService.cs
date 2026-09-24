@@ -52,12 +52,12 @@ public sealed class VersionUpdateService : IDisposable
     private readonly HttpClient _httpClient;
     private readonly bool _ownsHttpClient;
     private readonly Uri _manifestUri;
+    private readonly SemaphoreSlim _downloadGate = new(1, 1);
 
     public VersionUpdateService(HttpClient? httpClient = null, string? manifestUrl = null)
     {
-        _httpClient = httpClient ?? new HttpClient();
+        _httpClient = httpClient ?? new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
         _ownsHttpClient = httpClient == null;
-        _httpClient.Timeout = TimeSpan.FromSeconds(8);
         _manifestUri = new Uri(manifestUrl ?? DefaultManifestUrl, UriKind.Absolute);
     }
 
@@ -65,11 +65,13 @@ public sealed class VersionUpdateService : IDisposable
     {
         try
         {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+            using var linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(ct, timeout.Token);
             using var request = new HttpRequestMessage(HttpMethod.Get, _manifestUri);
             request.Headers.UserAgent.ParseAdd("NetBootDhcpTool-VersionCheck/1.0");
-            using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct);
+            using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, linkedCancellation.Token);
             response.EnsureSuccessStatusCode();
-            var json = await response.Content.ReadAsStringAsync(ct);
+            var json = await response.Content.ReadAsStringAsync(linkedCancellation.Token);
             return Evaluate(json, currentVersion);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -119,78 +121,101 @@ public sealed class VersionUpdateService : IDisposable
             throw new InvalidDataException("Update download URL is invalid");
         if (!IsSha256(update.ArchiveSha256)) throw new InvalidDataException("Update archive checksum is invalid");
 
-        var directory = Path.GetDirectoryName(destinationPath);
-        if (string.IsNullOrWhiteSpace(directory)) throw new ArgumentException("Download destination directory is missing", nameof(destinationPath));
-        Directory.CreateDirectory(directory);
-        var tempPath = destinationPath + ".download";
-        var completed = false;
+        if (!await _downloadGate.WaitAsync(0, ct))
+            throw new InvalidOperationException("An update download is already in progress.");
+
         try
         {
-            using var client = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
-            client.DefaultRequestHeaders.UserAgent.ParseAdd("NetBootDhcpTool-UpdateDownload/1.0");
-            using var response = await client.GetAsync(update.DownloadUrl, HttpCompletionOption.ResponseHeadersRead, ct);
-            response.EnsureSuccessStatusCode();
-            var totalBytes = response.Content.Headers.ContentLength;
-            await using var input = await response.Content.ReadAsStreamAsync(ct);
-            await using (var output = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None, 64 * 1024, useAsync: true))
+            var fullDestinationPath = Path.GetFullPath(destinationPath);
+            var directory = Path.GetDirectoryName(fullDestinationPath);
+            if (string.IsNullOrWhiteSpace(directory)) throw new ArgumentException("Download destination directory is missing", nameof(destinationPath));
+            Directory.CreateDirectory(directory);
+            var tempPath = fullDestinationPath + "." + Guid.NewGuid().ToString("N") + ".download";
+            var ownsTempFile = false;
+
+            try
             {
-                var buffer = new byte[64 * 1024];
-                long received = 0;
-                long sampledBytes = 0;
-                var stopwatch = Stopwatch.StartNew();
-                var sampledAt = stopwatch.Elapsed;
-                var lowSpeedDuration = TimeSpan.Zero;
-                int read;
-                while ((read = await input.ReadAsync(buffer.AsMemory(), ct)) > 0)
+                using var request = new HttpRequestMessage(HttpMethod.Get, update.DownloadUrl);
+                request.Headers.UserAgent.ParseAdd("NetBootDhcpTool-UpdateDownload/1.0");
+                using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct);
+                response.EnsureSuccessStatusCode();
+                var totalBytes = response.Content.Headers.ContentLength;
+                await using var input = await response.Content.ReadAsStreamAsync(ct);
+                await using (var output = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 64 * 1024, useAsync: true))
                 {
-                    await output.WriteAsync(buffer.AsMemory(0, read), ct);
-                    received += read;
-                    var now = stopwatch.Elapsed;
-                    var sampleElapsed = now - sampledAt;
-                    if (sampleElapsed >= TimeSpan.FromSeconds(1))
+                    ownsTempFile = true;
+                    var buffer = new byte[64 * 1024];
+                    long received = 0;
+                    long sampledBytes = 0;
+                    var stopwatch = Stopwatch.StartNew();
+                    var sampledAt = stopwatch.Elapsed;
+                    var lowSpeedDuration = TimeSpan.Zero;
+                    int read;
+                    while ((read = await input.ReadAsync(buffer.AsMemory(), ct)) > 0)
                     {
-                        var bytesPerSecond = (received - sampledBytes) / sampleElapsed.TotalSeconds;
-                        if (bytesPerSecond < 3 * 1024) lowSpeedDuration += sampleElapsed;
-                        else lowSpeedDuration = TimeSpan.Zero;
+                        await output.WriteAsync(buffer.AsMemory(0, read), ct);
+                        received += read;
+                        var now = stopwatch.Elapsed;
+                        var sampleElapsed = now - sampledAt;
+                        if (sampleElapsed >= TimeSpan.FromSeconds(1))
+                        {
+                            var bytesPerSecond = (received - sampledBytes) / sampleElapsed.TotalSeconds;
+                            if (bytesPerSecond < 3 * 1024) lowSpeedDuration += sampleElapsed;
+                            else lowSpeedDuration = TimeSpan.Zero;
+                            progress?.Report(new UpdateDownloadProgress
+                            {
+                                BytesReceived = received,
+                                TotalBytes = totalBytes,
+                                BytesPerSecond = bytesPerSecond,
+                                LowSpeedDuration = lowSpeedDuration
+                            });
+                            sampledBytes = received;
+                            sampledAt = now;
+                        }
+                    }
+                    var finalElapsed = stopwatch.Elapsed - sampledAt;
+                    if (finalElapsed > TimeSpan.Zero)
+                    {
                         progress?.Report(new UpdateDownloadProgress
                         {
                             BytesReceived = received,
                             TotalBytes = totalBytes,
-                            BytesPerSecond = bytesPerSecond,
+                            BytesPerSecond = finalElapsed.TotalSeconds <= 0 ? 0 : (received - sampledBytes) / finalElapsed.TotalSeconds,
                             LowSpeedDuration = lowSpeedDuration
                         });
-                        sampledBytes = received;
-                        sampledAt = now;
+                    }
+                    await output.FlushAsync(ct);
+                    output.Flush(flushToDisk: true);
+                }
+
+                string hash;
+                await using (var hashInput = new FileStream(tempPath, FileMode.Open, FileAccess.Read, FileShare.Read, 64 * 1024, useAsync: true))
+                {
+                    hash = Convert.ToHexString(await SHA256.HashDataAsync(hashInput, ct)).ToLowerInvariant();
+                }
+                if (!hash.Equals(update.ArchiveSha256, StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidDataException($"Downloaded update checksum mismatch: expected {update.ArchiveSha256}, actual {hash}");
+
+                File.Move(tempPath, fullDestinationPath, overwrite: true);
+                ownsTempFile = false;
+                return new UpdateDownloadResult { FilePath = fullDestinationPath, Sha256 = hash };
+            }
+            catch (Exception downloadFailure)
+            {
+                if (ownsTempFile)
+                {
+                    try { File.Delete(tempPath); }
+                    catch (Exception cleanupFailure)
+                    {
+                        throw new AggregateException("Update download failed and its temporary file could not be removed.", downloadFailure, cleanupFailure);
                     }
                 }
-                var finalElapsed = stopwatch.Elapsed - sampledAt;
-                if (finalElapsed > TimeSpan.Zero)
-                {
-                    progress?.Report(new UpdateDownloadProgress
-                    {
-                        BytesReceived = received,
-                        TotalBytes = totalBytes,
-                        BytesPerSecond = finalElapsed.TotalSeconds <= 0 ? 0 : (received - sampledBytes) / finalElapsed.TotalSeconds,
-                        LowSpeedDuration = lowSpeedDuration
-                    });
-                }
+                throw;
             }
-
-            await using var hashInput = new FileStream(tempPath, FileMode.Open, FileAccess.Read, FileShare.Read, 64 * 1024, useAsync: true);
-            var hash = Convert.ToHexString(await SHA256.HashDataAsync(hashInput, ct)).ToLowerInvariant();
-            if (!hash.Equals(update.ArchiveSha256, StringComparison.OrdinalIgnoreCase))
-                throw new InvalidDataException($"Downloaded update checksum mismatch: expected {update.ArchiveSha256}, actual {hash}");
-            File.Move(tempPath, destinationPath, overwrite: true);
-            completed = true;
-            return new UpdateDownloadResult { FilePath = destinationPath, Sha256 = hash };
         }
         finally
         {
-            if (!completed)
-            {
-                try { if (File.Exists(tempPath)) File.Delete(tempPath); }
-                catch { }
-            }
+            _downloadGate.Release();
         }
     }
 

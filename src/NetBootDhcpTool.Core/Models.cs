@@ -8,7 +8,6 @@ public sealed class AppSettings
     public int PingConcurrency { get; set; } = 64;
     public int PingTimeoutMs { get; set; } = 800;
     public int HttpTimeoutMs { get; set; } = 1000;
-    public bool AllowDhcpOnWifi { get; set; }
     public bool AllowDhcpOnAdapterWithGateway { get; set; }
     public bool AllowRestartOnAnyAdapter { get; set; } = true;
     public bool AllowMacChangeOnAnyAdapter { get; set; } = true;
@@ -108,16 +107,26 @@ public sealed class AdapterConfigBackup
     public int PrefixLength { get; set; } = 24;
     public string Gateway { get; set; } = "";
     public List<string> Dns { get; set; } = [];
+    public AdapterDnsMode DnsMode { get; set; }
+    public bool? AdapterEnabled { get; set; }
     public List<AdapterIpv4AddressSnapshot> Addresses { get; set; } = [];
     public List<AdapterRouteSnapshot> Routes { get; set; } = [];
     public bool AutomaticMetric { get; set; } = true;
     public int InterfaceMetric { get; set; }
 }
 
+public enum AdapterDnsMode
+{
+    Unknown,
+    Automatic,
+    Static
+}
+
 public sealed class AdapterIpv4AddressSnapshot
 {
     public string IpAddress { get; set; } = "";
     public int PrefixLength { get; set; } = 24;
+    public bool SkipAsSource { get; set; }
 }
 
 public sealed class AdapterRouteSnapshot
@@ -126,6 +135,7 @@ public sealed class AdapterRouteSnapshot
     public string NextHop { get; set; } = "0.0.0.0";
     public int RouteMetric { get; set; } = 0;
     public string PolicyStore { get; set; } = "ActiveStore";
+    public string Protocol { get; set; } = "";
 }
 
 public sealed class StaticRouteRule
@@ -143,7 +153,11 @@ public sealed class StaticRouteRule
     [JsonIgnore] public string NextHopDisplay => string.IsNullOrWhiteSpace(NextHop) ? "Direct / 直连" : NextHop;
     [JsonIgnore] public string AddressFamilyDisplay => string.IsNullOrWhiteSpace(AddressFamily)
         ? (DestinationPrefix.Contains(':') ? "IPv6" : "IPv4")
-        : AddressFamily;
+        : AddressFamily.Equals("InterNetwork", StringComparison.OrdinalIgnoreCase) || AddressFamily.Equals("IPv4", StringComparison.OrdinalIgnoreCase)
+            ? "IPv4"
+            : AddressFamily.Equals("InterNetworkV6", StringComparison.OrdinalIgnoreCase) || AddressFamily.Equals("IPv6", StringComparison.OrdinalIgnoreCase)
+                ? "IPv6"
+                : AddressFamily;
     [JsonIgnore] public string PriorityDisplay => RouteMetric <= 1 ? "Auto / 自动" : RouteMetric.ToString();
     [JsonIgnore] public string EffectiveMetricDisplay => InterfaceMetric > 0 ? $"{RouteMetric} + {InterfaceMetric} = {RouteMetric + InterfaceMetric}" : RouteMetric.ToString();
 }
@@ -161,6 +175,8 @@ public sealed class AppliedStaticRoute
     public int RouteMetric { get; set; }
     public string PolicyStore { get; set; } = "ActiveStore";
     public string InstanceId { get; set; } = "";
+    // Missing in pre-intent journal formats defaults to verified ownership for compatibility.
+    public bool OwnershipVerified { get; set; } = true;
 }
 
 public sealed class OperationHistoryItem

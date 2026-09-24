@@ -4,7 +4,8 @@ public enum RecoveryEntryKind
 {
     AdapterConfiguration,
     MacAddress,
-    StaticRoute
+    StaticRoute,
+    DhcpFirewall
 }
 
 public sealed class RecoveryEntryViewModel
