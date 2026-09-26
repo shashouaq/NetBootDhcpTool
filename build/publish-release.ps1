@@ -168,6 +168,20 @@ function Get-GiteeHeaders {
     return @{ Authorization = "Bearer $env:GITEE_TOKEN"; Accept = 'application/json' }
 }
 
+function Get-GiteeResponseErrorSummary([object]$Response) {
+    $body = [string]$Response.Content
+    if ([string]::IsNullOrWhiteSpace($body)) { return '' }
+
+    foreach ($secretValue in @([string]$env:GITEE_TOKEN, [uri]::EscapeDataString([string]$env:GITEE_TOKEN))) {
+        if (-not [string]::IsNullOrEmpty($secretValue)) {
+            $body = $body.Replace($secretValue, '[redacted]')
+        }
+    }
+    $body = ($body -replace '\s+', ' ').Trim()
+    if ($body.Length -gt 512) { $body = $body.Substring(0, 512) + '…' }
+    return "; response: $body"
+}
+
 function Get-GiteeReleaseByTag {
     $encodedTag = [uri]::EscapeDataString($Tag)
     $uri = "https://gitee.com/api/v5/repos/$GiteeOwner/$GiteeRepository/releases/tags/$encodedTag"
@@ -199,7 +213,10 @@ function Ensure-GiteeRelease {
         try {
             $created = Invoke-WebRequest -Uri "https://gitee.com/api/v5/repos/$GiteeOwner/$GiteeRepository/releases" -Method Post -Form $form -Headers (Get-GiteeHeaders) -SkipHttpErrorCheck -TimeoutSec 30
         } catch { throw 'Gitee Release creation failed; rerunning this tag is safe.' }
-        if ($created.StatusCode -notin @(200, 201)) { throw "Gitee Release creation returned HTTP $($created.StatusCode)." }
+        if ($created.StatusCode -notin @(200, 201)) {
+            $errorSummary = Get-GiteeResponseErrorSummary $created
+            throw "Gitee Release creation returned HTTP $($created.StatusCode)$errorSummary."
+        }
         try { $release = $created.Content | ConvertFrom-Json -AsHashtable -ErrorAction Stop }
         catch { throw 'Gitee Release creation returned invalid JSON.' }
         $createdByPipeline = $true

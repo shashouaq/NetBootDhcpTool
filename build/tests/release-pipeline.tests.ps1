@@ -89,6 +89,18 @@ try {
     if ($formalWorkflow -notmatch '(?ms)  verify-ci:.*?runs-on: windows-latest') { throw 'Exact-commit validation must remain on a GitHub-hosted runner.' }
     if ($formalWorkflow -notmatch '(?ms)  publish:.*?runs-on: \[self-hosted, windows, x64, netboot-release\]') { throw 'Release publication must use the dedicated Windows x64 release runner.' }
     if ($formalWorkflow -notmatch 'git cat-file -e "\$\{releaseCommit\}:\$requiredTagFile"') { throw 'The CI gate must reject legacy tags that do not contain the publisher used by the release job.' }
+    $publisherSourceSetup = $formalWorkflow.IndexOf('Load release tooling from the workflow commit', [System.StringComparison]::Ordinal)
+    $publisherInvocation = $formalWorkflow.IndexOf('.\build\publish-release.ps1', [System.StringComparison]::Ordinal)
+    if ($publisherSourceSetup -lt 0 -or $publisherInvocation -lt $publisherSourceSetup -or
+        $formalWorkflow -notmatch 'PUBLISHER_COMMIT: \$\{\{ github\.sha \}\}' -or
+        $formalWorkflow -notmatch 'application sources remain at the requested release tag') {
+        throw 'Release coordination must use CI-verified tooling while building and publishing the requested tag source.'
+    }
+    foreach ($toolPath in @('build/publish-release.ps1', 'build/release-pipeline/ReleaseState.psm1', 'build/publish.ps1')) {
+        if (-not $formalWorkflow.Contains($toolPath)) {
+            throw "The release job must load $toolPath from its CI-verified workflow commit."
+        }
+    }
     $sdkPathSetup = $formalWorkflow.IndexOf('DOTNET_INSTALL_DIR=$sdkRoot', [System.StringComparison]::Ordinal)
     $dotnetAction = $formalWorkflow.IndexOf('uses: actions/setup-dotnet@v5', [System.StringComparison]::Ordinal)
     if ($sdkPathSetup -lt 0 -or $dotnetAction -lt $sdkPathSetup -or

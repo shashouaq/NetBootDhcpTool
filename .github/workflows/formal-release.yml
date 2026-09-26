@@ -78,6 +78,25 @@ jobs:
           ref: ${{ inputs.release_tag }}
           fetch-depth: 0
 
+      - name: Load release tooling from the workflow commit
+        shell: pwsh
+        env:
+          PUBLISHER_COMMIT: ${{ github.sha }}
+        run: |
+          if ($env:PUBLISHER_COMMIT -notmatch '^[a-fA-F0-9]{40}$') { throw 'Workflow publisher commit is not a full Git SHA.' }
+          git fetch origin $env:PUBLISHER_COMMIT --no-tags
+          if ($LASTEXITCODE -ne 0) { throw 'Could not fetch the CI-verified workflow commit for release tooling.' }
+          $releaseToolFiles = @('build/publish-release.ps1', 'build/release-pipeline/ReleaseState.psm1', 'build/publish.ps1')
+          foreach ($toolPath in $releaseToolFiles) {
+            git cat-file -e "${env:PUBLISHER_COMMIT}:$toolPath"
+            if ($LASTEXITCODE -ne 0) { throw "The workflow commit does not contain release tool $toolPath." }
+            $toolContent = git show "${env:PUBLISHER_COMMIT}:$toolPath"
+            if ($LASTEXITCODE -ne 0) { throw "Could not read release tool $toolPath from the workflow commit." }
+            $destinationPath = Join-Path $env:GITHUB_WORKSPACE $toolPath
+            [System.IO.File]::WriteAllText($destinationPath, ($toolContent -join "`n") + "`n", [System.Text.UTF8Encoding]::new($false))
+          }
+          Write-Host "Loaded release tooling from CI-verified workflow commit $($env:PUBLISHER_COMMIT); application sources remain at the requested release tag."
+
       - name: Set user-writable .NET SDK install path
         shell: pwsh
         run: |
