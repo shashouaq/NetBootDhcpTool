@@ -167,7 +167,7 @@ function Add-GiteeAttachment([string]$Path) {
         $responseContent = (& $curlPath @curlArguments 2> $curlErrorPath | Out-String).Trim()
         $curlExitCode = $LASTEXITCODE
         if (Test-Path -LiteralPath $curlErrorPath -PathType Leaf) {
-            $curlError = (Get-Content -LiteralPath $curlErrorPath -Raw).Trim()
+            $curlError = [System.IO.File]::ReadAllText($curlErrorPath).Trim()
         }
     } catch {
         $assetTimer.Stop()
