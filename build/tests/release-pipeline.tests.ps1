@@ -121,8 +121,13 @@ try {
     }
     if ($windowsWorkflow -notmatch '(?m)^    runs-on: windows-latest') { throw 'Day-to-day CI must remain on GitHub-hosted Windows.' }
     $publisher = Get-Content -Raw -LiteralPath (Join-Path $repoRoot 'build\publish-release.ps1')
+    if ($publisher -notmatch '(?s)function Invoke-GiteeJsonRequest.*?-ContentType ''application/json; charset=utf-8''.*?-Body \$jsonBody' -or
+        $publisher -notmatch 'Invoke-GiteeJsonRequest -Uri .*?/releases" -Method Post') {
+        throw 'Gitee Release create/update calls must send a JSON request body so the API receives its required fields.'
+    }
     if ($publisher -notmatch "'--draft'") { throw 'GitHub Release must remain draft until final verification.' }
-    if ($publisher -notmatch "prerelease = 'true'") { throw 'Gitee Release must remain prerelease until final verification.' }
+    if ($publisher -notmatch 'prerelease\s*=\s*\$true') { throw 'Gitee Release must remain prerelease until final verification.' }
+    if ($publisher -notmatch 'prerelease\s*=\s*\$false') { throw 'Gitee Release must be promoted only after final verification.' }
     $archivesReady = $publisher.IndexOf('Ensure-GiteeAsset -LocalPath $bundle.ArchivePath', [System.StringComparison]::Ordinal)
     $manifestPublished = $publisher.IndexOf("Ensure-GiteeAsset -LocalPath `$finalManifestPath", [System.StringComparison]::Ordinal)
     $releasePromoted = $publisher.IndexOf('$giteeRelease = Publish-GiteeRelease', [System.StringComparison]::Ordinal)

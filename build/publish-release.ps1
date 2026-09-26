@@ -182,6 +182,18 @@ function Get-GiteeResponseErrorSummary([object]$Response) {
     return "; response: $body"
 }
 
+function Invoke-GiteeJsonRequest {
+    param(
+        [Parameter(Mandatory)][string]$Uri,
+        [Parameter(Mandatory)][ValidateSet('Post', 'Patch')][string]$Method,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Payload
+    )
+
+    $jsonBody = ConvertTo-Json -InputObject $Payload -Depth 8 -Compress
+    return Invoke-WebRequest -Uri (Assert-SafeGiteeDownloadUrl $Uri) -Method $Method -Headers (Get-GiteeHeaders) `
+        -ContentType 'application/json; charset=utf-8' -Body $jsonBody -SkipHttpErrorCheck -TimeoutSec 30
+}
+
 function Get-GiteeReleaseByTag {
     $encodedTag = [uri]::EscapeDataString($Tag)
     $uri = "https://gitee.com/api/v5/repos/$GiteeOwner/$GiteeRepository/releases/tags/$encodedTag"
@@ -202,16 +214,15 @@ function Ensure-GiteeRelease {
     $createdByPipeline = $false
     if ($null -eq $release) {
         $mainCommit = (Invoke-GitChecked -Arguments @('rev-parse', 'refs/remotes/origin/main')).Trim()
-        $form = @{
-            access_token = $env:GITEE_TOKEN
+        $payload = [ordered]@{
             tag_name = $Tag
             name = "NetBoot DHCP Tool $Tag"
             body = [string]$BaseManifest.releaseNotes
             target_commitish = $mainCommit
-            prerelease = 'true'
+            prerelease = $true
         }
         try {
-            $created = Invoke-WebRequest -Uri "https://gitee.com/api/v5/repos/$GiteeOwner/$GiteeRepository/releases" -Method Post -Form $form -Headers (Get-GiteeHeaders) -SkipHttpErrorCheck -TimeoutSec 30
+            $created = Invoke-GiteeJsonRequest -Uri "https://gitee.com/api/v5/repos/$GiteeOwner/$GiteeRepository/releases" -Method Post -Payload $payload
         } catch { throw 'Gitee Release creation failed; rerunning this tag is safe.' }
         if ($created.StatusCode -notin @(200, 201)) {
             $errorSummary = Get-GiteeResponseErrorSummary $created
@@ -239,11 +250,14 @@ function Ensure-GiteeRelease {
     $normalizedCurrentBody = ([string]$release.body -replace "`r`n?", "`n").TrimEnd()
     $normalizedExpectedBody = ($expectedBody -replace "`r`n?", "`n").TrimEnd()
     if ([string]$release.name -cne $expectedName -or $normalizedCurrentBody -cne $normalizedExpectedBody) {
-        $form = @{ access_token = $env:GITEE_TOKEN; tag_name = $Tag; name = $expectedName; body = $expectedBody }
+        $payload = [ordered]@{ tag_name = $Tag; name = $expectedName; body = $expectedBody }
         try {
-            $update = Invoke-WebRequest -Uri "https://gitee.com/api/v5/repos/$GiteeOwner/$GiteeRepository/releases/$releaseId" -Method Patch -Form $form -Headers (Get-GiteeHeaders) -SkipHttpErrorCheck -TimeoutSec 30
+            $update = Invoke-GiteeJsonRequest -Uri "https://gitee.com/api/v5/repos/$GiteeOwner/$GiteeRepository/releases/$releaseId" -Method Patch -Payload $payload
         } catch { throw 'Gitee Release metadata update failed; no existing assets were removed.' }
-        if ($update.StatusCode -notin @(200, 201)) { throw "Gitee Release metadata update returned HTTP $($update.StatusCode)." }
+        if ($update.StatusCode -notin @(200, 201)) {
+            $errorSummary = Get-GiteeResponseErrorSummary $update
+            throw "Gitee Release metadata update returned HTTP $($update.StatusCode)$errorSummary."
+        }
         $release = Get-GiteeReleaseByTag
         if ($null -eq $release -or [long]$release.id -ne $releaseId) { throw 'Gitee Release metadata readback did not resolve to the same Release ID.' }
     }
@@ -556,17 +570,19 @@ function Get-OrCreateGitHubRelease {
 function Publish-GiteeRelease([System.Collections.IDictionary]$Release) {
     if (-not [bool]$Release.prerelease) { return $Release }
     $releaseId = [long]$Release.id
-    $form = @{
-        access_token = $env:GITEE_TOKEN
+    $payload = [ordered]@{
         tag_name = $Tag
         name = [string]$Release.name
         body = [string]$Release.body
-        prerelease = 'false'
+        prerelease = $false
     }
     try {
-        $response = Invoke-WebRequest -Uri "https://gitee.com/api/v5/repos/$GiteeOwner/$GiteeRepository/releases/$releaseId" -Method Patch -Form $form -Headers (Get-GiteeHeaders) -SkipHttpErrorCheck -TimeoutSec 30
+        $response = Invoke-GiteeJsonRequest -Uri "https://gitee.com/api/v5/repos/$GiteeOwner/$GiteeRepository/releases/$releaseId" -Method Patch -Payload $payload
     } catch { throw 'Could not mark the fully verified Gitee Release as stable.' }
-    if ($response.StatusCode -notin @(200, 201)) { throw "Gitee stable-release update returned HTTP $($response.StatusCode)." }
+    if ($response.StatusCode -notin @(200, 201)) {
+        $errorSummary = Get-GiteeResponseErrorSummary $response
+        throw "Gitee stable-release update returned HTTP $($response.StatusCode)$errorSummary."
+    }
     $verified = Get-GiteeReleaseByTag
     if ($null -eq $verified -or [long]$verified.id -ne $releaseId -or [bool]$verified.prerelease) {
         throw 'Gitee Release stable-state readback failed.'
