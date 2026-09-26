@@ -142,59 +142,67 @@ foreach ($attachment in $existingAttachments | Where-Object { $_.name -in $wante
 function Add-GiteeAttachment([string]$Path) {
     $asset = Get-Item -LiteralPath $Path
     $assetTimer = [System.Diagnostics.Stopwatch]::StartNew()
-    Write-Host "[Gitee] Uploading Release asset '$($asset.Name)' ($($asset.Length) bytes over HTTP/1.1; timeout 900s)."
-    $uploadClient = $null
-    $uploadHandler = $null
-    $uploadRequest = $null
-    $uploadResponse = $null
-    $uploadCancellation = $null
+    Write-Host "[Gitee] Uploading Release asset '$($asset.Name)' ($($asset.Length) bytes via curl.exe over HTTP/1.1; up to 1800s per attempt)."
+    $curlPath = (Get-Command curl.exe -ErrorAction Stop).Source
+    $curlConfigPath = Join-Path $AssetsDirectory ("gitee-curl-{0}.conf" -f [guid]::NewGuid().ToString('N'))
+    $curlErrorPath = Join-Path $AssetsDirectory ("gitee-curl-{0}.stderr" -f [guid]::NewGuid().ToString('N'))
+    if ($token -match '[\r\n]') { throw 'GITEE_TOKEN contains a line break and cannot be passed to curl safely.' }
+    $escapedToken = $token.Replace('\', '\\').Replace('"', '\"')
     $responseContent = ''
+    $curlError = ''
+    $curlExitCode = -1
     try {
-        $uploadHandler = [System.Net.Http.HttpClientHandler]::new()
-        $uploadClient = [System.Net.Http.HttpClient]::new($uploadHandler)
-        $uploadClient.Timeout = [System.Threading.Timeout]::InfiniteTimeSpan
-        $uploadCancellation = [System.Threading.CancellationTokenSource]::new([TimeSpan]::FromSeconds(900))
-        $uploadRequest = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Post, "$giteeApiRepository/releases/$releaseId/attach_files")
-        $uploadRequest.Version = [Version]::new(1, 1)
-        $uploadRequest.VersionPolicy = [System.Net.Http.HttpVersionPolicy]::RequestVersionExact
-        $uploadRequest.Headers.Authorization = [System.Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer', $token)
-        $uploadRequest.Headers.Accept.ParseAdd('application/json')
-        $multipart = [System.Net.Http.MultipartFormDataContent]::new()
-        $multipart.Add([System.Net.Http.StringContent]::new($token), 'access_token')
-        $fileStream = [System.IO.File]::OpenRead($asset.FullName)
-        $fileContent = [System.Net.Http.StreamContent]::new($fileStream, 1024 * 1024)
-        $fileContent.Headers.ContentType = [System.Net.Http.Headers.MediaTypeHeaderValue]::new('application/octet-stream')
-        $multipart.Add($fileContent, 'file', $asset.Name)
-        $uploadRequest.Content = $multipart
-        $uploadResponse = $uploadClient.SendAsync($uploadRequest, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead, $uploadCancellation.Token).GetAwaiter().GetResult()
-        $responseContent = $uploadResponse.Content.ReadAsStringAsync($uploadCancellation.Token).GetAwaiter().GetResult()
+        # Keep the token out of curl's process arguments and logs. The file is
+        # short-lived and removed in finally; curl builds the multipart boundary.
+        Set-Content -LiteralPath $curlConfigPath -Value ('form = "access_token={0}"' -f $escapedToken) -Encoding ascii
+        $curlArguments = @(
+            '--config', $curlConfigPath,
+            '--silent', '--show-error', '--http1.1',
+            '--connect-timeout', '20', '--max-time', '1800',
+            '--retry', '5', '--retry-delay', '5', '--retry-all-errors',
+            '--fail-with-body', '--request', 'POST',
+            '--form', "file=@$($asset.FullName);filename=$($asset.Name)",
+            "$giteeApiRepository/releases/$releaseId/attach_files"
+        )
+        $responseContent = (& $curlPath @curlArguments 2> $curlErrorPath | Out-String).Trim()
+        $curlExitCode = $LASTEXITCODE
+        if (Test-Path -LiteralPath $curlErrorPath -PathType Leaf) {
+            $curlError = (Get-Content -LiteralPath $curlErrorPath -Raw).Trim()
+        }
     } catch {
         $assetTimer.Stop()
-        $messages = [System.Collections.Generic.List[string]]::new()
-        $uploadError = $_.Exception
-        while ($null -ne $uploadError) {
-            $message = $uploadError.Message
-            if (-not [string]::IsNullOrWhiteSpace($token)) { $message = $message.Replace($token, '[REDACTED]') }
-            if (-not [string]::IsNullOrWhiteSpace($message)) { $messages.Add($message) }
-            $uploadError = $uploadError.InnerException
-        }
-        throw "Gitee Release asset upload transport failed after $([int]$assetTimer.Elapsed.TotalSeconds)s for '$($asset.Name)' ($($asset.Length) bytes): $([string]::Join(' -> ', $messages)) Check the Gitee Release attachment list before retrying."
+        $message = $_.Exception.Message
+        if (-not [string]::IsNullOrWhiteSpace($token)) { $message = $message.Replace($token, '[REDACTED]') }
+        throw "Gitee curl upload could not start for '$($asset.Name)': $message"
     } finally {
-        if ($null -ne $uploadResponse) { $uploadResponse.Dispose() }
-        if ($null -ne $uploadRequest) { $uploadRequest.Dispose() }
-        if ($null -ne $uploadCancellation) { $uploadCancellation.Dispose() }
-        if ($null -ne $uploadClient) { $uploadClient.Dispose() }
-        if ($null -ne $uploadHandler) { $uploadHandler.Dispose() }
+        Remove-Item -LiteralPath $curlConfigPath, $curlErrorPath -Force -ErrorAction SilentlyContinue
     }
     $assetTimer.Stop()
-    if ([int]$uploadResponse.StatusCode -notin @(200, 201)) {
+    if ($curlExitCode -ne 0) {
+        # A connection can be lost after Gitee has stored the file. Check the
+        # attachment list before failing or asking the workflow to retry.
+        try {
+            $readback = @(Invoke-RestMethod -Uri $attachmentsUri -Method Get -TimeoutSec 30)
+            $storedAsset = $readback |
+                Where-Object { $_.name -eq $asset.Name -and [long]$_.size -eq [long]$asset.Length -and -not [string]::IsNullOrWhiteSpace($_.browser_download_url) } |
+                Sort-Object { [long]$_.id } -Descending |
+                Select-Object -First 1
+            if ($null -ne $storedAsset) {
+                Write-Host "[Gitee] Upload response was interrupted, but attachment readback found '$($asset.Name)' ($($asset.Length) bytes) after $([int]$assetTimer.Elapsed.TotalSeconds)s."
+                return $storedAsset
+            }
+        } catch {
+            Write-Host '[Gitee] Attachment readback after the curl error was unavailable.'
+        }
         $errorBody = $responseContent
         if (-not [string]::IsNullOrWhiteSpace($token)) { $errorBody = $errorBody.Replace($token, '[REDACTED]') }
         if ($errorBody.Length -gt 400) { $errorBody = $errorBody.Substring(0, 400) }
-        throw "Gitee Release asset upload returned HTTP $([int]$uploadResponse.StatusCode) for '$($asset.Name)' after $([int]$assetTimer.Elapsed.TotalSeconds)s. Response: $errorBody"
+        if (-not [string]::IsNullOrWhiteSpace($token)) { $curlError = $curlError.Replace($token, '[REDACTED]') }
+        if ($curlError.Length -gt 400) { $curlError = $curlError.Substring(0, 400) }
+        throw "Gitee curl upload failed with exit code $curlExitCode for '$($asset.Name)' ($($asset.Length) bytes) after $([int]$assetTimer.Elapsed.TotalSeconds)s. Response: $errorBody. curl: $curlError. Check the Gitee Release attachment list before retrying."
     }
     try { $response = $responseContent | ConvertFrom-Json -ErrorAction Stop }
-    catch { throw "Gitee Release asset upload returned invalid JSON for '$($asset.Name)'." }
+    catch { throw "Gitee curl upload returned invalid JSON for '$($asset.Name)'." }
     if ($response.name -ne (Split-Path -Leaf $Path) -or [string]::IsNullOrWhiteSpace($response.browser_download_url)) {
         throw "Gitee did not return a usable attachment for $($asset.Name)."
     }
