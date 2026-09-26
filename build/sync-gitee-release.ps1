@@ -16,6 +16,7 @@ $giteeRepository = 'NetBootDhcpTool'
 $giteeWebRepository = "https://gitee.com/$giteeOwner/$giteeRepository"
 $giteeApiRepository = "https://gitee.com/api/v5/repos/$giteeOwner/$giteeRepository"
 $token = $env:GITEE_TOKEN
+$giteeAuthHeaders = if ([string]::IsNullOrWhiteSpace($token)) { @{} } else { @{ Authorization = "Bearer $token" } }
 
 if ([string]::IsNullOrWhiteSpace($token)) { throw 'GITEE_TOKEN is not available to this workflow.' }
 if ([string]::IsNullOrWhiteSpace($GitHubRepository)) { throw 'GITHUB_REPOSITORY is not available.' }
@@ -98,8 +99,7 @@ if ($releaseLookup.StatusCode -eq 200) {
         if ([string]$giteeRelease.name -cne $releaseName -or [string]$giteeRelease.body -cne $releaseBody) {
             $releaseUri = "$giteeApiRepository/releases/$releaseId"
             $updateForm = @{ access_token = $token; tag_name = $Tag; name = $releaseName; body = $releaseBody }
-            # Gitee accepts URL-encoded form fields for Release metadata updates; keep multipart encoding for file attachments only.
-            $releaseUpdate = Invoke-WebRequest -Uri $releaseUri -Method Patch -Body $updateForm -SkipHttpErrorCheck -TimeoutSec 30
+            $releaseUpdate = Invoke-WebRequest -Uri $releaseUri -Method Patch -Form $updateForm -Headers $giteeAuthHeaders -SkipHttpErrorCheck -TimeoutSec 30
             if ($releaseUpdate.StatusCode -notin @(200, 201)) { throw "Gitee Release metadata update failed with HTTP $($releaseUpdate.StatusCode)." }
         } else {
             Write-Host "[Gitee] Existing Release metadata already matches GitHub; skipping update."
@@ -142,25 +142,58 @@ foreach ($attachment in $existingAttachments | Where-Object { $_.name -in $wante
 function Add-GiteeAttachment([string]$Path) {
     $asset = Get-Item -LiteralPath $Path
     $assetTimer = [System.Diagnostics.Stopwatch]::StartNew()
-    Write-Host "[Gitee] Uploading Release asset '$($asset.Name)' ($($asset.Length) bytes; timeout 900s)."
-    $form = @{ access_token = $token; file = $asset }
-    $headers = @{ Authorization = "Bearer $token" }
+    Write-Host "[Gitee] Uploading Release asset '$($asset.Name)' ($($asset.Length) bytes over HTTP/1.1; timeout 900s)."
+    $uploadClient = $null
+    $uploadHandler = $null
+    $uploadRequest = $null
+    $uploadResponse = $null
+    $uploadCancellation = $null
+    $responseContent = ''
     try {
-        $uploadResponse = Invoke-WebRequest -Uri "$giteeApiRepository/releases/$releaseId/attach_files" -Method Post -Form $form -Headers $headers -SkipHttpErrorCheck -TimeoutSec 900
+        $uploadHandler = [System.Net.Http.HttpClientHandler]::new()
+        $uploadClient = [System.Net.Http.HttpClient]::new($uploadHandler)
+        $uploadClient.Timeout = [System.Threading.Timeout]::InfiniteTimeSpan
+        $uploadCancellation = [System.Threading.CancellationTokenSource]::new([TimeSpan]::FromSeconds(900))
+        $uploadRequest = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Post, "$giteeApiRepository/releases/$releaseId/attach_files")
+        $uploadRequest.Version = [Version]::new(1, 1)
+        $uploadRequest.VersionPolicy = [System.Net.Http.HttpVersionPolicy]::RequestVersionExact
+        $uploadRequest.Headers.Authorization = [System.Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer', $token)
+        $uploadRequest.Headers.Accept.ParseAdd('application/json')
+        $multipart = [System.Net.Http.MultipartFormDataContent]::new()
+        $multipart.Add([System.Net.Http.StringContent]::new($token), 'access_token')
+        $fileStream = [System.IO.File]::OpenRead($asset.FullName)
+        $fileContent = [System.Net.Http.StreamContent]::new($fileStream, 1024 * 1024)
+        $fileContent.Headers.ContentType = [System.Net.Http.Headers.MediaTypeHeaderValue]::new('application/octet-stream')
+        $multipart.Add($fileContent, 'file', $asset.Name)
+        $uploadRequest.Content = $multipart
+        $uploadResponse = $uploadClient.SendAsync($uploadRequest, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead, $uploadCancellation.Token).GetAwaiter().GetResult()
+        $responseContent = $uploadResponse.Content.ReadAsStringAsync($uploadCancellation.Token).GetAwaiter().GetResult()
     } catch {
         $assetTimer.Stop()
-        $errorMessage = $_.Exception.Message
-        if (-not [string]::IsNullOrWhiteSpace($token)) { $errorMessage = $errorMessage.Replace($token, '[REDACTED]') }
-        throw "Gitee Release asset upload transport failed after $([int]$assetTimer.Elapsed.TotalSeconds)s for '$($asset.Name)' ($($asset.Length) bytes): $errorMessage Check the Gitee Release attachment list before retrying."
+        $messages = [System.Collections.Generic.List[string]]::new()
+        $uploadError = $_.Exception
+        while ($null -ne $uploadError) {
+            $message = $uploadError.Message
+            if (-not [string]::IsNullOrWhiteSpace($token)) { $message = $message.Replace($token, '[REDACTED]') }
+            if (-not [string]::IsNullOrWhiteSpace($message)) { $messages.Add($message) }
+            $uploadError = $uploadError.InnerException
+        }
+        throw "Gitee Release asset upload transport failed after $([int]$assetTimer.Elapsed.TotalSeconds)s for '$($asset.Name)' ($($asset.Length) bytes): $([string]::Join(' -> ', $messages)) Check the Gitee Release attachment list before retrying."
+    } finally {
+        if ($null -ne $uploadResponse) { $uploadResponse.Dispose() }
+        if ($null -ne $uploadRequest) { $uploadRequest.Dispose() }
+        if ($null -ne $uploadCancellation) { $uploadCancellation.Dispose() }
+        if ($null -ne $uploadClient) { $uploadClient.Dispose() }
+        if ($null -ne $uploadHandler) { $uploadHandler.Dispose() }
     }
     $assetTimer.Stop()
-    if ($uploadResponse.StatusCode -notin @(200, 201)) {
-        $errorBody = [string]$uploadResponse.Content
+    if ([int]$uploadResponse.StatusCode -notin @(200, 201)) {
+        $errorBody = $responseContent
         if (-not [string]::IsNullOrWhiteSpace($token)) { $errorBody = $errorBody.Replace($token, '[REDACTED]') }
         if ($errorBody.Length -gt 400) { $errorBody = $errorBody.Substring(0, 400) }
-        throw "Gitee Release asset upload returned HTTP $($uploadResponse.StatusCode) for '$($asset.Name)' after $([int]$assetTimer.Elapsed.TotalSeconds)s. Response: $errorBody"
+        throw "Gitee Release asset upload returned HTTP $([int]$uploadResponse.StatusCode) for '$($asset.Name)' after $([int]$assetTimer.Elapsed.TotalSeconds)s. Response: $errorBody"
     }
-    try { $response = $uploadResponse.Content | ConvertFrom-Json -ErrorAction Stop }
+    try { $response = $responseContent | ConvertFrom-Json -ErrorAction Stop }
     catch { throw "Gitee Release asset upload returned invalid JSON for '$($asset.Name)'." }
     if ($response.name -ne (Split-Path -Leaf $Path) -or [string]::IsNullOrWhiteSpace($response.browser_download_url)) {
         throw "Gitee did not return a usable attachment for $($asset.Name)."
