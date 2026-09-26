@@ -17,6 +17,7 @@ $giteeWebRepository = "https://gitee.com/$giteeOwner/$giteeRepository"
 $giteeApiRepository = "https://gitee.com/api/v5/repos/$giteeOwner/$giteeRepository"
 $token = $env:GITEE_TOKEN
 $giteeAuthHeaders = if ([string]::IsNullOrWhiteSpace($token)) { @{} } else { @{ Authorization = "Bearer $token" } }
+$curlExecutable = (Get-Command curl.exe -ErrorAction Stop).Source
 
 if ([string]::IsNullOrWhiteSpace($token)) { throw 'GITEE_TOKEN is not available to this workflow.' }
 if ([string]::IsNullOrWhiteSpace($GitHubRepository)) { throw 'GITHUB_REPOSITORY is not available.' }
@@ -127,23 +128,37 @@ if ($releaseId -le 0) { throw 'Gitee returned an invalid Release ID.' }
 
 $attachmentsUri = "$giteeApiRepository/releases/$releaseId/attach_files?page=1&per_page=100"
 $existingAttachments = Invoke-RestMethod -Uri $attachmentsUri -Method Get -TimeoutSec 30
-$wantedNames = @($archiveName, "${archiveName}.sha256", 'latest.json')
-foreach ($attachment in $existingAttachments | Where-Object { $_.name -in $wantedNames }) {
-    $attachmentId = [long]$attachment.id
+function Remove-GiteeAttachment([object]$Attachment) {
+    $attachmentId = [long]$Attachment.id
     $deleteUri = "$giteeApiRepository/releases/$releaseId/attach_files/$attachmentId`?access_token=$([uri]::EscapeDataString($token))"
     try {
         $deleteResult = Invoke-WebRequest -Uri $deleteUri -Method Delete -SkipHttpErrorCheck -TimeoutSec 30
     } catch {
-        throw "Could not replace Gitee attachment '$($attachment.name)' due to an API transport error."
+        throw "Could not remove Gitee attachment '$($Attachment.name)' due to an API transport error."
     }
-    if ($deleteResult.StatusCode -ne 204) { throw "Could not replace Gitee attachment '$($attachment.name)' (HTTP $($deleteResult.StatusCode))." }
+    if ($deleteResult.StatusCode -ne 204) { throw "Could not remove Gitee attachment '$($Attachment.name)' (HTTP $($deleteResult.StatusCode))." }
+}
+
+$replaceNames = @("${archiveName}.sha256", 'latest.json')
+foreach ($attachment in $existingAttachments | Where-Object { $_.name -in $replaceNames }) {
+    Remove-GiteeAttachment $attachment
+}
+$expectedArchiveSize = [long](Get-Item -LiteralPath $archivePath).Length
+$existingArchive = $existingAttachments |
+    Where-Object { $_.name -eq $archiveName } |
+    Sort-Object { [long]$_.id } -Descending |
+    Select-Object -First 1
+$reuseExistingArchive = ($null -ne $existingArchive -and [long]$existingArchive.size -eq $expectedArchiveSize)
+if (-not $reuseExistingArchive) {
+    foreach ($attachment in $existingAttachments | Where-Object { $_.name -eq $archiveName }) {
+        Remove-GiteeAttachment $attachment
+    }
 }
 
 function Add-GiteeAttachment([string]$Path) {
     $asset = Get-Item -LiteralPath $Path
     $assetTimer = [System.Diagnostics.Stopwatch]::StartNew()
     Write-Host "[Gitee] Uploading Release asset '$($asset.Name)' ($($asset.Length) bytes via curl.exe over HTTP/1.1; up to 1800s per attempt)."
-    $curlPath = (Get-Command curl.exe -ErrorAction Stop).Source
     $curlConfigPath = Join-Path $AssetsDirectory ("gitee-curl-{0}.conf" -f [guid]::NewGuid().ToString('N'))
     $curlErrorPath = Join-Path $AssetsDirectory ("gitee-curl-{0}.stderr" -f [guid]::NewGuid().ToString('N'))
     if ($token -match '[\r\n]') { throw 'GITEE_TOKEN contains a line break and cannot be passed to curl safely.' }
@@ -164,7 +179,7 @@ function Add-GiteeAttachment([string]$Path) {
             '--form', "file=@$($asset.FullName);filename=$($asset.Name)",
             "$giteeApiRepository/releases/$releaseId/attach_files"
         )
-        $responseContent = (& $curlPath @curlArguments 2> $curlErrorPath | Out-String).Trim()
+        $responseContent = (& $curlExecutable @curlArguments 2> $curlErrorPath | Out-String).Trim()
         $curlExitCode = $LASTEXITCODE
         if (Test-Path -LiteralPath $curlErrorPath -PathType Leaf) {
             $curlError = [System.IO.File]::ReadAllText($curlErrorPath).Trim()
@@ -182,7 +197,7 @@ function Add-GiteeAttachment([string]$Path) {
         # A connection can be lost after Gitee has stored the file. Check the
         # attachment list before failing or asking the workflow to retry.
         try {
-            $readback = @(Invoke-RestMethod -Uri $attachmentsUri -Method Get -TimeoutSec 30)
+            $readback = Invoke-RestMethod -Uri $attachmentsUri -Method Get -TimeoutSec 30
             $storedAsset = $readback |
                 Where-Object { $_.name -eq $asset.Name -and [long]$_.size -eq [long]$asset.Length -and -not [string]::IsNullOrWhiteSpace($_.browser_download_url) } |
                 Sort-Object { [long]$_.id } -Descending |
@@ -211,18 +226,22 @@ function Add-GiteeAttachment([string]$Path) {
 }
 
 $giteeChecksum = Add-GiteeAttachment $checksumPath
-$giteeArchive = Add-GiteeAttachment $archivePath
+if ($reuseExistingArchive) {
+    $giteeArchive = $existingArchive
+    Write-Host "[Gitee] Reusing existing archive attachment '$archiveName' ($expectedArchiveSize bytes); full SHA-256 readback is still required."
+} else {
+    $giteeArchive = Add-GiteeAttachment $archivePath
+}
+$manifest | Add-Member -NotePropertyName downloadMirrors -NotePropertyValue @() -Force
 $manifest.downloadUrl = [string]$giteeArchive.browser_download_url
 $manifest.downloadMirrors = @("https://github.com/$GitHubRepository/releases/download/$Tag/$archiveName")
 $manifest.releasePageUrl = "$giteeWebRepository/releases/tag/$releaseTagPath"
 $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 [System.IO.File]::WriteAllText($manifestPath, ($manifest | ConvertTo-Json -Depth 8), $utf8NoBom)
-$giteeManifest = Add-GiteeAttachment $manifestPath
 
 $expectedAssets = @{
     $archiveName = [long](Get-Item -LiteralPath $archivePath).Length
     "${archiveName}.sha256" = [long](Get-Item -LiteralPath $checksumPath).Length
-    'latest.json' = [long](Get-Item -LiteralPath $manifestPath).Length
 }
 $remoteAttachments = Invoke-RestMethod -Uri $attachmentsUri -Method Get -TimeoutSec 30
 foreach ($assetName in $expectedAssets.Keys) {
@@ -234,16 +253,30 @@ foreach ($assetName in $expectedAssets.Keys) {
 
 $remoteArchivePath = Join-Path $AssetsDirectory ("gitee-readback-$archiveName")
 $readbackTimer = [System.Diagnostics.Stopwatch]::StartNew()
-Write-Host "[Gitee] Downloading uploaded archive for full SHA-256 verification (timeout 900s)."
-Invoke-WebRequest -Uri $giteeArchive.browser_download_url -OutFile $remoteArchivePath -TimeoutSec 900
+Write-Host '[Gitee] Downloading uploaded archive for full SHA-256 verification (curl HTTP/1.1, timeout 1800s per attempt).'
+$readbackStats = & $curlExecutable --silent --show-error --location --http1.1 `
+    --connect-timeout 20 --max-time 1800 --retry 5 --retry-delay 5 --retry-all-errors --fail-with-body `
+    --output $remoteArchivePath --write-out 'http=%{http_code} bytes=%{size_download} seconds=%{time_total}' `
+    $giteeArchive.browser_download_url
+$readbackExitCode = $LASTEXITCODE
 $readbackTimer.Stop()
-Write-Host "[Gitee] Archive readback download completed in $([int]$readbackTimer.Elapsed.TotalSeconds)s."
+if ($readbackExitCode -ne 0) { throw "Gitee archive readback download failed with curl exit code ${readbackExitCode}: $readbackStats" }
+Write-Host "[Gitee] Archive readback download completed in $([int]$readbackTimer.Elapsed.TotalSeconds)s ($readbackStats)."
 $remoteArchiveHash = (Get-FileHash -LiteralPath $remoteArchivePath -Algorithm SHA256).Hash.ToLowerInvariant()
 Remove-Item -LiteralPath $remoteArchivePath -Force
-if ($remoteArchiveHash -ne $localArchiveHash) { throw "Gitee archive readback SHA-256 mismatch for ${Tag}." }
+if ($remoteArchiveHash -ne $localArchiveHash) {
+    Remove-GiteeAttachment $giteeArchive
+    throw "Gitee archive readback SHA-256 mismatch for ${Tag}; the mismatched attachment was removed."
+}
 $remoteSidecarContent = Invoke-WebRequest -Uri $giteeChecksum.browser_download_url -TimeoutSec 30
 $remoteSidecarHash = ($remoteSidecarContent.Content.Trim().Split(' ')[0]).ToLowerInvariant()
 if ($remoteSidecarHash -ne $localArchiveHash) { throw "Gitee checksum sidecar readback mismatch for ${Tag}." }
+$giteeManifest = Add-GiteeAttachment $manifestPath
+$remoteAttachments = Invoke-RestMethod -Uri $attachmentsUri -Method Get -TimeoutSec 30
+$remoteManifestAsset = $remoteAttachments | Where-Object { $_.name -eq 'latest.json' } | Select-Object -First 1
+if ($null -eq $remoteManifestAsset -or [long]$remoteManifestAsset.size -ne [long](Get-Item -LiteralPath $manifestPath).Length) {
+    throw 'Gitee latest.json attachment size readback failed.'
+}
 $remoteManifestContent = Invoke-WebRequest -Uri $giteeManifest.browser_download_url -TimeoutSec 30
 $remoteManifest = $remoteManifestContent.Content | ConvertFrom-Json
 if ($remoteManifest.version -ne $version -or $remoteManifest.archiveSha256 -ne $localArchiveHash -or $remoteManifest.downloadUrl -ne $giteeArchive.browser_download_url) {
