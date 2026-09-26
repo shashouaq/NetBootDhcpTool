@@ -127,7 +127,19 @@ if ($releaseId -le 0) {
 if ($releaseId -le 0) { throw 'Gitee returned an invalid Release ID.' }
 
 $attachmentsUri = "$giteeApiRepository/releases/$releaseId/attach_files?page=1&per_page=100"
-$existingAttachments = Invoke-RestMethod -Uri $attachmentsUri -Method Get -TimeoutSec 30
+function Get-GiteeAttachments() {
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        try {
+            return Invoke-RestMethod -Uri $attachmentsUri -Method Get -TimeoutSec 60
+        } catch {
+            if ($attempt -eq 5) { throw "Gitee attachment list readback failed after $attempt attempts." }
+            Write-Host "[Gitee] Attachment list request attempt $attempt failed; retrying in 5 seconds."
+            Start-Sleep -Seconds 5
+        }
+    }
+}
+
+$existingAttachments = Get-GiteeAttachments
 function Remove-GiteeAttachment([object]$Attachment) {
     $attachmentId = [long]$Attachment.id
     $deleteUri = "$giteeApiRepository/releases/$releaseId/attach_files/$attachmentId`?access_token=$([uri]::EscapeDataString($token))"
@@ -203,7 +215,7 @@ function Add-GiteeAttachment([string]$Path) {
         # A connection can be lost after Gitee has stored the file. Check the
         # attachment list before failing or asking the workflow to retry.
         try {
-            $readback = Invoke-RestMethod -Uri $attachmentsUri -Method Get -TimeoutSec 30
+            $readback = Get-GiteeAttachments
             $storedAsset = $readback |
                 Where-Object { $_.name -eq $asset.Name -and [long]$_.size -eq [long]$asset.Length -and -not [string]::IsNullOrWhiteSpace($_.browser_download_url) } |
                 Sort-Object { [long]$_.id } -Descending |
@@ -249,7 +261,7 @@ $expectedAssets = @{
     $archiveName = [long](Get-Item -LiteralPath $archivePath).Length
     "${archiveName}.sha256" = [long](Get-Item -LiteralPath $checksumPath).Length
 }
-$remoteAttachments = Invoke-RestMethod -Uri $attachmentsUri -Method Get -TimeoutSec 30
+$remoteAttachments = Get-GiteeAttachments
 foreach ($assetName in $expectedAssets.Keys) {
     $remoteAsset = $remoteAttachments | Where-Object { $_.name -eq $assetName } | Select-Object -First 1
     if ($null -eq $remoteAsset -or [long]$remoteAsset.size -ne $expectedAssets[$assetName]) {
@@ -279,7 +291,7 @@ $remoteSidecarText = ConvertFrom-GiteeAttachmentContent $remoteSidecarContent.Co
 $remoteSidecarHash = ($remoteSidecarText.Trim().Split(' ')[0]).ToLowerInvariant()
 if ($remoteSidecarHash -ne $localArchiveHash) { throw "Gitee checksum sidecar readback mismatch for ${Tag}." }
 $giteeManifest = Add-GiteeAttachment $manifestPath
-$remoteAttachments = Invoke-RestMethod -Uri $attachmentsUri -Method Get -TimeoutSec 30
+$remoteAttachments = Get-GiteeAttachments
 $remoteManifestAsset = $remoteAttachments | Where-Object { $_.name -eq 'latest.json' } | Select-Object -First 1
 if ($null -eq $remoteManifestAsset -or [long]$remoteManifestAsset.size -ne [long](Get-Item -LiteralPath $manifestPath).Length) {
     throw 'Gitee latest.json attachment size readback failed.'
