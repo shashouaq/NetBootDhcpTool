@@ -126,6 +126,43 @@ public sealed class VersionUpdateDownloadTests
     }
 
     [TestMethod]
+    public async Task FailedPreferredMirrorFallsBackAndReportsTheSuccessfulSource()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var destination = Path.Combine(root, "update.7z");
+            await File.WriteAllTextAsync(destination, "keep until verified");
+            var package = new byte[] { 31, 32, 33, 34, 35 };
+            var giteeUrl = "https://gitee.com/joel20230302/NetBootDhcpTool/attach_files/123";
+            var githubUrl = "https://github.com/shashouaq/NetBootDhcpTool/releases/download/v1.0.14/package.7z";
+            var requestedUrls = new List<string>();
+            using var client = new HttpClient(new DelegateHandler((request, _) =>
+            {
+                requestedUrls.Add(request.RequestUri!.AbsoluteUri);
+                return Task.FromResult(request.RequestUri.Host.Equals("gitee.com", StringComparison.OrdinalIgnoreCase)
+                    ? new HttpResponseMessage(HttpStatusCode.ServiceUnavailable)
+                    : new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(package) });
+            }));
+            using var service = new VersionUpdateService(client);
+            var progress = new InlineProgress<UpdateDownloadProgress>();
+
+            var result = await service.DownloadAsync(UpdateFor(package, url: giteeUrl, mirrors: [githubUrl]), destination, progress);
+
+            Assert.AreEqual(giteeUrl, requestedUrls[0]);
+            Assert.AreEqual(githubUrl, requestedUrls[1]);
+            Assert.AreEqual(githubUrl, result.DownloadUrl);
+            Assert.IsTrue(progress.Items.Any(item => item.IsSourceFallback && item.DownloadUrl == githubUrl));
+            CollectionAssert.AreEqual(package, await File.ReadAllBytesAsync(destination));
+            Assert.AreEqual(0, Directory.GetFiles(root, "*.download").Length);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [TestMethod]
     public async Task CancellationAfterPartialWriteKeepsOldTargetAndRemovesTemporaryFile()
     {
         var root = CreateTempDirectory();
@@ -261,12 +298,17 @@ public sealed class VersionUpdateDownloadTests
         }
     }
 
-    private static UpdateCheckResult UpdateFor(byte[] bytes, string? checksum = null, string? url = null) => new()
+    private static UpdateCheckResult UpdateFor(byte[] bytes, string? checksum = null, string? url = null, IReadOnlyList<string>? mirrors = null)
     {
-        Succeeded = true,
-        DownloadUrl = url ?? "https://github.com/shashouaq/NetBootDhcpTool/releases/download/v1.0.0/test.7z",
-        ArchiveSha256 = checksum ?? Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant()
-    };
+        var primaryUrl = url ?? "https://github.com/shashouaq/NetBootDhcpTool/releases/download/v1.0.0/test.7z";
+        return new UpdateCheckResult
+        {
+            Succeeded = true,
+            DownloadUrl = primaryUrl,
+            DownloadUrls = [primaryUrl, .. mirrors ?? []],
+            ArchiveSha256 = checksum ?? Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant()
+        };
+    }
 
     private static string CreateTempDirectory()
     {
@@ -278,6 +320,12 @@ public sealed class VersionUpdateDownloadTests
     private sealed class DelegateHandler(Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> send) : HttpMessageHandler
     {
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) => send(request, cancellationToken);
+    }
+
+    private sealed class InlineProgress<T> : IProgress<T>
+    {
+        public List<T> Items { get; } = [];
+        public void Report(T value) => Items.Add(value);
     }
 
     private sealed class FailureAfterPrefixStream(byte[] prefix) : Stream

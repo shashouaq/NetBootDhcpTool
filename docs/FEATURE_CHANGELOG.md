@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## v1.0.14 / 2026-09-26
+
+- Type: Distribution / update fallback / T18
+- Affected files/modules: `src/NetBootDhcpTool.Core/VersionUpdateService.cs`, `src/NetBootDhcpTool.App/MainWindow.xaml.cs`, `src/NetBootDhcpTool.UnitTests/VersionUpdateSourceTests.cs`, `src/NetBootDhcpTool.UnitTests/VersionUpdateDownloadTests.cs`, `src/NetBootDhcpTool.UiTests/Program.cs`, `.github/workflows/gitee-release-sync.yml`, `build/sync-gitee-release.ps1`, `src/NetBootDhcpTool.App/NetBootDhcpTool.App.csproj`, `README.md`, `PROJECT_MEMORY.md`, `docs/MAINTENANCE_GUIDE.md`, `docs/RELEASE_PROCESS.md`, `docs/RELEASE_NOTES.md`, `docs/tasks/T18.md`, `docs/TODO.md`
+- Concrete change: Check Gitee's public latest stable Release before GitHub. Once an update is found, request at most 64 KB from each approved download source in parallel, order URLs by successful measured speed, and keep failed sources as later fallbacks. GitHub and Gitee manifests advertise both mirrors. The bilingual UI shows per-source probe results, the preferred mirror, live download rate/source, and any automatic source switch. Every downloaded archive still requires the release SHA-256 before replacing an existing destination.
+- Verification: The previously authorized disposable Gitee branch check using GitHub Actions Secret `GITEE_TOKEN` passed create/read/delete and cleaned up; both remote `main` branches remained unchanged. Focused updater regression tests passed for speed ordering, capped Range reads, no-update probe skipping, Gitee-to-GitHub metadata fallback, and failed-source download fallback. Release build (0 warnings/errors), MSTest 144/144, console smoke `OK`, non-admin UI smoke `UI_SMOKE_OK`, maintenance checks (294 keys, 62/62 static help), and 7-Zip archive/hash checks passed. Exact-commit CI, Gitee asset upload/readback, and real-source speed samples will be appended after the authorized publication.
+- User impact: Mainland users can use the faster available Gitee/GitHub release mirror without changing settings; download speed and source selection remain visible, and updates are never installed automatically. Gitee credentials remain in GitHub Actions only.
+- Status: T18 awaits final exact-commit CI, formal remote release and measured network readback.
+
 ## v1.0.13 / 2026-09-25
 
 - Type: Maintenance / reliability / lifecycle feedback / startup performance / T01-T17

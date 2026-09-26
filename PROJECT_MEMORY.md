@@ -115,5 +115,5 @@ Select the evidence for a change from the [maintenance guide's verification map]
 - Collection state used by the main window is now held by `MainWindowViewModel`; keep new UI state out of the code-behind where practical.
 - Favorite passwords use current-user Windows DPAPI; keep exports credential-free and ask the user to re-enter a password when a different Windows identity cannot decrypt it.
 - Favorite JSON import/export and per-favorite HTTPS preference are implemented; preserve the credential-free export boundary.
-- The in-app version check only opens the validated direct GitHub download. Do not add automatic installation without a signed-update and rollback design.
+- The in-app version check reads Gitee release metadata first and falls back to GitHub. For a newer version, it probes up to 64 KB from each approved release mirror, orders downloads by measured speed, shows probe/live speed and source changes in the bilingual UI, verifies SHA-256, and never installs automatically. Do not add automatic installation without a signed-update and rollback design.
 - If Wi-Fi coexistence complaints reappear, inspect `Microsoft-Windows-WLAN-AutoConfig/Operational` before changing adapter code again. Never change WcmSvc coexistence/auto-connect policy; explicit adapter restart/MAC controls remain a separate user-authorized adapter operation.

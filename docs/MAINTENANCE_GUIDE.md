@@ -13,12 +13,13 @@ The 2026-09-23 audit baseline and unperformed real-network checks are recorded i
 ## Repository
 
 - GitHub repository: `https://github.com/shashouaq/NetBootDhcpTool`
+- Gitee distribution repository: `https://gitee.com/joel20230302/NetBootDhcpTool`
 - Default branch: `main`
 - Release tag format: `v<version>`
-- Current application version: `1.0.13`
+- Current application version: `1.0.14`
 - Target framework: .NET 10; the repository pins SDK `10.0.401` in `global.json` with `latestFeature` roll-forward.
 - Resolve the SDK through `build/resolve-dotnet.ps1`; it honors the repository pin and bootstraps that SDK when needed. The first run may need network access.
-- Current release manifest URL:
+- GitHub fallback manifest URL:
 
 ```text
 https://github.com/shashouaq/NetBootDhcpTool/releases/latest/download/latest.json
@@ -35,8 +36,8 @@ https://github.com/shashouaq/NetBootDhcpTool/releases/latest/download/latest.jso
 - For documentation-only changes, run lightweight checks instead of a full build unless the docs affect packaging or release behavior.
 - For application changes that are not being published, finish validation by opening the current source `Release` build for preview; documentation-only changes do not need an application preview. Do not push or publish unless the user explicitly asks.
 - Before an application preview, check whether `NetBootDhcpTool` is already running. `build/run-app-admin.ps1` manages only a process whose resolved `.exe`/`dotnet` entry point is one of this repository's source Release or packaged app outputs. It requests normal close and waits up to 240 seconds for the app's serialized cleanup; refusal, unreadable ownership, or timeout leaves the process running and does not start another GUI. It prefers the current source Release output and falls back to `release/NetBootDhcpTool` only when the source executable is absent. It never uses `Stop-Process -Force` for the app.
-- Only when the user explicitly says to publish/release may source, packages, tags, or GitHub Releases be pushed. After publishing, verify the remote commit/release/assets and report the exact GitHub URL or commit; never claim publication from a local command alone.
-- A formal version release must update local artifacts and its GitHub Release assets; do not describe a local version bump or package as a published release.
+- Only when the user explicitly says to publish/release may source, packages, tags, or releases be pushed to either host. After publishing, verify the remote commit/release/assets and report the exact URLs or commit; never claim publication from a local command alone.
+- A formal version release must update local artifacts and its GitHub Release assets. Publishing a stable GitHub Release triggers the Gitee mirror workflow; verify both services before claiming complete distribution.
 - Every application run must create a new UTF-8 session log whose filename contains the start timestamp; user actions and slow-operation start/completion, elapsed time, and errors must be traceable in that run's log.
 - Prioritize Chinese/English bilingual support for every future user-visible change, including UI labels, buttons, dialogs, status messages, logs, help text, and maintenance documentation. Reuse the language resources where practical; do not add Chinese-only or English-only text without documenting the reason.
 - Every user-facing application button must have a separate compact round `?` help button beside it. Keep the indicator small and visible by default; hovering the action or indicator shows a contextual Chinese/English explanation, and clicking the indicator opens the same explanation in a dialog without executing the neighboring action. Run-time-created buttons must use `HelpButtonService.Attach`.
@@ -152,7 +153,7 @@ Update the version in `src/NetBootDhcpTool.App/NetBootDhcpTool.App.csproj`, revi
 
 ## Upgrade Detection Contract
 
-Future in-app upgrade detection must consume:
+In-app upgrade detection currently tries the Gitee latest Release API and its `latest.json` attachment first, then falls back to this GitHub manifest URL:
 
 ```text
 https://github.com/shashouaq/NetBootDhcpTool/releases/latest/download/latest.json
@@ -164,7 +165,10 @@ The app now:
 - display the running version immediately at startup
 - show a clickable `有新版本！` / `New version available!` link beside the version when a newer validated release exists
 - show the manifest `releaseNotes`/`changes` in a confirmation dialog, then download the validated archive in the background to the user's Downloads folder
-- accept only HTTPS GitHub release URLs and a valid SHA256 field; it does not install files automatically
+- accept only HTTPS assets and release pages from the exact project repositories on GitHub or Gitee, plus a valid SHA256 field; it does not install files automatically
+- when an update exists, request at most 64 KB from each approved Gitee/GitHub mirror concurrently; show each measurement as it completes and put the fastest successful URL first
+- show measured source speeds beside the update link and in its tooltip/confirmation, then show the active source and refreshed transfer speed during download; report a source switch if a mirror fails
+- try approved mirrors in measured-speed order, validating the same SHA256 before replacing the destination
 - use the same injectable `HttpClient` transport for manifest and archive requests; the service disposes only a client it created itself, and rejects a second overlapping download while one is active
 
 The archive is streamed into a uniquely named temporary file created with `CreateNew`. The output is flushed and closed; the hash-read handle is also closed before the temporary file replaces the destination. A failed/canceled transfer or a failed replacement keeps an existing destination intact and removes only this operation's temporary file. If cleanup itself fails, the result must report both the download and cleanup failures. Keep URL and SHA validation ahead of the first HTTP request. If speed remains below 3 KB/s for 10 seconds, the UI only displays `1406829360@qq.com`; it never sends email automatically. Future automatic installation requires signed-update and rollback controls.

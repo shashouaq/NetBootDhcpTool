@@ -1,5 +1,22 @@
 # Release Notes
 
+## v1.0.14
+
+NetBoot DHCP Tool v1.0.14 adds Gitee release distribution for mainland users and selects the faster available update mirror after a bounded download-speed probe.
+
+### Changes
+
+- Publishes the same SHA-256-verified archive to Gitee and GitHub and keeps both download URLs in each update manifest.
+- Checks Gitee release metadata first, then falls back to GitHub when Gitee metadata is unavailable.
+- When an update is found, concurrently samples up to 64 KB from each source and prioritizes the faster mirror; failed sources remain available as automatic fallbacks.
+- Shows source-speed results and the selected mirror beside the update link and in the confirmation; the download status refreshes its live rate and identifies source changes.
+- Preserves SHA-256 verification, safe replacement, bilingual UI, and manual installation.
+
+### Validation
+
+- Release solution build passed with 0 warnings and 0 errors; all 144 MSTest tests passed; console smoke returned `OK`; non-admin WPF UI smoke verified the speed display, selected mirror, live fallback status, and confirmation details. Maintenance checks reported 294 localization keys and 62/62 static help buttons.
+- The self-contained x64 archive is about 55 MiB and passed 7-Zip integrity testing; its SHA-256 sidecar and `latest.json` agree. The packaged executable file version is `1.0.14.0`.
+
 ## v1.0.13
 
 NetBoot DHCP Tool v1.0.13 bundles the approved maintenance work through T17. Startup and refresh now read network adapters and current IPv4/IPv6 routes concurrently, reducing the measured network-discovery wait while preserving the full current route list and fresh checks before route changes.

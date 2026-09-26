@@ -1,0 +1,41 @@
+name: Sync Gitee Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: gitee-release-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  sync-release:
+    if: github.event.release.prerelease == false
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Download GitHub Release assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          $assetDirectory = Join-Path $env:RUNNER_TEMP ("gitee-release-" + [guid]::NewGuid().ToString("N"))
+          New-Item -ItemType Directory -Path $assetDirectory | Out-Null
+          & gh release download $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --dir $assetDirectory
+          if ($LASTEXITCODE -ne 0) { throw "Could not download GitHub Release assets for $env:RELEASE_TAG." }
+          "GITEE_ASSETS=$assetDirectory" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Sync source and release assets to Gitee
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: .\build\sync-gitee-release.ps1 -Tag $env:RELEASE_TAG -AssetsDirectory $env:GITEE_ASSETS

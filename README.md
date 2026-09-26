@@ -1,6 +1,6 @@
 # NetBoot DHCP Tool
 
-Version: 1.0.13
+Version: 1.0.14
 
 Authors: Joel & Codex
 
@@ -10,7 +10,7 @@ Windows portable IPv4 DHCP, adapter IP configuration, IPv4/IPv6 static route rul
 
 Start with the [maintenance guide](docs/MAINTENANCE_GUIDE.md), then read only the selected [approved work item](docs/TODO.md) and its source references. [PROJECT_MEMORY.md](PROJECT_MEMORY.md) holds stable product/network boundaries; the [release process](docs/RELEASE_PROCESS.md) owns publication steps. The [change log](docs/FEATURE_CHANGELOG.md) records completed changes, not future work. T01-T17 are marked complete; see the work-item index for current status and validation limits.
 
-维护顺序：维护指南 → 待办索引 → 单个任务及相关代码。T01-T17 均已标记完成。当前唯一状态与验证边界请看[待办索引](docs/TODO.md)。无需每次读取全部任务或历史日志。仅明确授权“发布/release”后才能提交、推送或发布。
+维护顺序：维护指南 → 待办索引 → 单个任务及相关代码。T01-T17 均已标记完成；Gitee 分发仍待正式 Release 的附件上传读回验收。当前唯一状态与验证边界请看[待办索引](docs/TODO.md)。无需每次读取全部任务或历史日志。仅明确授权“发布/release”后才能提交、推送或发布。
 
 At startup, the application claims a system-wide mutex keyed by the normalized full data-directory path before it migrates legacy files, creates defaults, or reads recovery journals. The owner keeps the mutex through asynchronous exit cleanup. A second process shows a bilingual notice and exits without changing shared files; an abnormal exit releases the mutex so a later run can inspect the preserved recovery data.
 
@@ -32,7 +32,7 @@ Every application action button has a small, visible-by-default round `?` help i
 
 ## Version Check
 
-The application displays its running version when it starts. It checks the GitHub `latest.json` manifest in the background; when a newer validated release is available, `有新版本！` / `New version available!` appears beside the version. Clicking it shows the release changes and downloads the archive in the background to Downloads, with SHA-256 verification and no automatic installation. The verified file replaces its destination only after all download and hash handles close; a failed or canceled download leaves an existing file intact. If speed remains below 3 KB/s for 10 seconds, the app only displays `1406829360@qq.com`.
+The application displays its running version when it starts. It checks the public [Gitee releases](https://gitee.com/joel20230302/NetBootDhcpTool/releases) first and falls back to the GitHub `latest.json` manifest if Gitee is unavailable. When a newer validated release is available, it probes up to 64 KB from each available mirror, prioritizes the faster source, and shows the results beside the update link and in its tooltip. Confirming the update downloads the archive in the background to Downloads, displaying the live speed and source; a failed preferred source automatically falls back to the other mirror. SHA-256 is checked before replacing a destination. The app never installs automatically. If speed remains below 3 KB/s for 10 seconds, the app only displays `1406829360@qq.com`.
 
 ## Build
 
@@ -46,11 +46,11 @@ For development and change-specific validation, follow the [standard maintenance
 
 ## Publish
 
-For local packaging and GitHub distribution, follow the single [release process](docs/RELEASE_PROCESS.md).
+For local packaging and GitHub/Gitee distribution, follow the single [release process](docs/RELEASE_PROCESS.md).
 
 The portable output is `release\NetBootDhcpTool`. Copy this folder to another Windows x64 computer and run `NetBootDhcpTool.exe`.
 
-For maintenance, packaging, and GitHub release standards, see `docs\MAINTENANCE_GUIDE.md` and `docs\RELEASE_PROCESS.md`.
+For maintenance, packaging, and release standards, see `docs\MAINTENANCE_GUIDE.md` and `docs\RELEASE_PROCESS.md`.
 
 The repository pins the .NET 10 SDK in `global.json`. Build scripts use a matching local or system SDK and bootstrap .NET 10 into `.dotnet` when needed.
 

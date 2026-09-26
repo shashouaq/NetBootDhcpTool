@@ -4,6 +4,7 @@ using System.Reflection;
 using System.Windows;
 using System.Windows.Automation;
 using System.Windows.Controls;
+using System.Windows.Documents;
 using System.Windows.Input;
 using System.Windows.Threading;
 using NetBootDhcpTool.App;
@@ -70,6 +71,47 @@ internal static class Program
 
         var application = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown };
         var window = new MainWindow(paths, new FileLogger(paths));
+        const string giteeArchiveUrl = "https://gitee.com/joel20230302/NetBootDhcpTool/attach_files/123456";
+        const string githubArchiveUrl = "https://github.com/shashouaq/NetBootDhcpTool/releases/download/v1.0.15/NetBootDhcpTool-v1.0.15.7z";
+        var syntheticUpdate = new UpdateCheckResult
+        {
+            CurrentVersion = new Version(1, 0, 14),
+            LatestVersion = new Version(1, 0, 15),
+            Succeeded = true,
+            IsNewVersion = true,
+            DownloadUrl = githubArchiveUrl,
+            DownloadUrls = [githubArchiveUrl, giteeArchiveUrl],
+            DownloadSpeeds =
+            [
+                new UpdateSourceSpeed(giteeArchiveUrl, 800 * 1024),
+                new UpdateSourceSpeed(githubArchiveUrl, 1536 * 1024)
+            ],
+            ReleasePageUrl = "https://gitee.com/joel20230302/NetBootDhcpTool/releases/tag/v1.0.15",
+            ArchiveName = "NetBootDhcpTool-v1.0.15.7z",
+            ArchiveSha256 = new string('a', 64),
+            Changes = ["Synthetic UI speed display check"]
+        };
+        window.GetType().GetField("_updateCheckStarted", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(window, true);
+        window.GetType().GetField("_lastUpdateResult", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(window, syntheticUpdate);
+        InvokePrivate(window, "UpdateVersionPresentation");
+        var updateStatus = (TextBlock)window.FindName("TxtUpdateStatus")!;
+        var updateLink = (Hyperlink)window.FindName("UpdateLink")!;
+        if (!updateStatus.Text.Contains("Gitee 800.0 KB/s", StringComparison.Ordinal)
+            || !updateStatus.Text.Contains("GitHub 1.5 MB/s", StringComparison.Ordinal)
+            || !updateStatus.Text.Contains("Selected GitHub", StringComparison.Ordinal)
+            || updateLink.ToolTip is not string updateTooltip || !updateTooltip.Contains(githubArchiveUrl, StringComparison.Ordinal))
+            throw new InvalidOperationException("the update toolbar did not show both mirror speeds and the selected source");
+        InvokePrivate(window, "UpdateDownloadProgressPresentation", new UpdateDownloadProgress
+        {
+            BytesReceived = 512 * 1024,
+            TotalBytes = 2 * 1024 * 1024,
+            BytesPerSecond = 1536 * 1024,
+            DownloadUrl = githubArchiveUrl,
+            IsSourceFallback = true
+        });
+        if (!updateStatus.Text.Contains("Switched to GitHub", StringComparison.Ordinal)
+            || !updateStatus.Text.Contains("1.5 MB/s", StringComparison.Ordinal))
+            throw new InvalidOperationException("the live update status did not show the current mirror and transfer rate");
         var busyStageText = (TextBlock)window.FindName("BusyStageText")!;
         var busyElapsedText = (TextBlock)window.FindName("BusyElapsedText")!;
         var busyStageProgress = (ProgressBar)window.FindName("BusyStageProgress")!;
@@ -100,6 +142,8 @@ internal static class Program
         var favoriteDialogInteractionDone = false;
         var captureProfileCompareDialog = false;
         var profileComparisonMessage = "";
+        var captureUpdateDialog = false;
+        var updateConfirmationMessage = "";
         var captureRouteCleanupDialog = false;
         var routeCleanupDialogMessage = "";
         var closeRequestedAt = DateTime.MinValue;
@@ -143,7 +187,13 @@ internal static class Program
             dialog.Dispatcher.BeginInvoke(DispatcherPriority.Loaded, new Action(() =>
             {
                 if (!dialog.IsVisible) return;
-                if (captureProfileCompareDialog)
+                if (captureUpdateDialog)
+                {
+                    updateConfirmationMessage = ((TextBox)dialog.FindName("MessageText")!).Text;
+                    captureUpdateDialog = false;
+                    dialog.Close();
+                }
+                else if (captureProfileCompareDialog)
                 {
                     profileComparisonMessage = ((TextBox)dialog.FindName("MessageText")!).Text;
                     captureProfileCompareDialog = false;
@@ -616,6 +666,14 @@ internal static class Program
                     || profileComparisonMessage.Contains("no differences found", StringComparison.OrdinalIgnoreCase))
                     throw new InvalidOperationException("profile comparison did not report the changed DHCP gateway value");
 
+                InvokePrivate(window, "UpdateVersionPresentation");
+                captureUpdateDialog = true;
+                InvokePrivate(window, "UpdateLink_Click", updateLink, new RoutedEventArgs());
+                if (captureUpdateDialog
+                    || !updateConfirmationMessage.Contains("Gitee: 800.0 KB/s", StringComparison.Ordinal)
+                    || !updateConfirmationMessage.Contains("GitHub: 1.5 MB/s (selected)", StringComparison.Ordinal))
+                    throw new InvalidOperationException("the update confirmation did not include both probe results and the selected mirror");
+
                 completed = true;
                 closeRequested = true;
                 closeRequestedAt = DateTime.UtcNow;
@@ -650,7 +708,7 @@ internal static class Program
                 timer.Stop();
                 Console.Error.WriteLine("UI_SMOKE_FAILED: window closed before its active operation released.");
             }
-            Console.WriteLine("UI_SMOKE_OK: non-admin WPF window, DHCP session restore fail-closed/unavailable recovery retention, static route cleanup failure detail/count, recovery journal safety, lease state/session/Ping separation and IP reuse, bounded scan-range validation, canceled-scan partial-result history, operation gate, refresh shortcuts, favorite cancel/re-entry/clear, profile DHCP field visibility and comparison, recovery handlers, and close wait verified.");
+            Console.WriteLine("UI_SMOKE_OK: non-admin WPF window, update mirror speeds/selection/live fallback/confirmation, DHCP session restore fail-closed/unavailable recovery retention, static route cleanup failure detail/count, recovery journal safety, lease state/session/Ping separation and IP reuse, bounded scan-range validation, canceled-scan partial-result history, operation gate, refresh shortcuts, favorite cancel/re-entry/clear, profile DHCP field visibility and comparison, recovery handlers, and close wait verified.");
             timer.Stop();
             application.Shutdown();
         };

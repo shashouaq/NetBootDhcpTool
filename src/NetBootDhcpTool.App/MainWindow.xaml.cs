@@ -96,6 +96,7 @@ public partial class MainWindow : Window
     private DhcpFirewallRuleLease? _dhcpFirewallRules;
     private string? _activeDhcpUiSessionId;
     private UpdateCheckResult? _lastUpdateResult;
+    private IReadOnlyList<UpdateSourceSpeed> _updateSourceSpeeds = [];
     private bool _updateCheckStarted;
     private string? _activeOperationText;
     private CancellationTokenSource? _operationCts;
@@ -472,10 +473,21 @@ public partial class MainWindow : Window
     {
         if (_updateCheckStarted) return;
         _updateCheckStarted = true;
+        _updateSourceSpeeds = [];
         UpdateVersionPresentation();
         try
         {
-            _lastUpdateResult = await _updateService.CheckAsync(CurrentVersion, _updateCts.Token);
+            var speedProgress = new Progress<UpdateSourceSpeed>(source =>
+            {
+                if (_lastUpdateResult != null) return;
+                _updateSourceSpeeds = _updateSourceSpeeds
+                    .Where(existing => !existing.Url.Equals(source.Url, StringComparison.OrdinalIgnoreCase))
+                    .Append(source)
+                    .ToArray();
+                UpdateVersionPresentation();
+            });
+            _lastUpdateResult = await _updateService.CheckAsync(CurrentVersion, _updateCts.Token, speedProgress);
+            _updateSourceSpeeds = _lastUpdateResult.DownloadSpeeds;
             _logger.Info(_lastUpdateResult.Succeeded
                 ? $"Update check completed: current={CurrentVersionText} latest={_lastUpdateResult.LatestVersion} new={_lastUpdateResult.IsNewVersion}"
                 : "Update check failed: " + _lastUpdateResult.Error);
@@ -504,7 +516,11 @@ public partial class MainWindow : Window
 
         if (_lastUpdateResult == null)
         {
-            TxtUpdateStatus.Text = _lang.T("checking.update");
+            var speedSummary = FormatUpdateSpeedSummary(_updateSourceSpeeds);
+            TxtUpdateStatus.Text = string.IsNullOrWhiteSpace(speedSummary)
+                ? _lang.T("checking.update")
+                : IsChineseUi() ? $"检查更新 · {speedSummary}" : $"Checking updates · {speedSummary}";
+            TxtUpdateStatus.ToolTip = FormatUpdateSpeedDetails(_updateSourceSpeeds);
             TxtUpdateLink.Visibility = Visibility.Collapsed;
             UpdateLink.IsEnabled = false;
             return;
@@ -512,10 +528,13 @@ public partial class MainWindow : Window
 
         if (_lastUpdateResult.Succeeded && _lastUpdateResult.IsNewVersion)
         {
-            TxtUpdateStatus.Text = "";
+            var speedSummary = FormatUpdateSpeedSummary(_lastUpdateResult.DownloadSpeeds, _lastUpdateResult.DownloadUrl);
+            TxtUpdateStatus.Text = speedSummary;
+            var speedDetails = FormatUpdateSpeedDetails(_lastUpdateResult.DownloadSpeeds, _lastUpdateResult.DownloadUrl);
+            TxtUpdateStatus.ToolTip = speedDetails;
             UpdateLink.Inlines.Clear();
             UpdateLink.Inlines.Add(new Run($"{_lang.T("new.version")} v{_lastUpdateResult.LatestVersion}"));
-            UpdateLink.ToolTip = _lastUpdateResult.DownloadUrl;
+            UpdateLink.ToolTip = $"{speedDetails}{Environment.NewLine}{_lastUpdateResult.DownloadUrl}";
             TxtUpdateLink.Visibility = Visibility.Visible;
             UpdateLink.IsEnabled = true;
             return;
@@ -526,6 +545,47 @@ public partial class MainWindow : Window
         TxtUpdateStatus.Text = _lastUpdateResult.Succeeded ? _lang.T("latest.version") : _lang.T("update.failed");
         TxtUpdateStatus.ToolTip = _lastUpdateResult.Succeeded ? null : _lastUpdateResult.Error;
     }
+
+    private string FormatUpdateSpeedSummary(IReadOnlyList<UpdateSourceSpeed> speeds, string? selectedUrl = null)
+    {
+        if (speeds.Count == 0) return "";
+        var summary = string.Join(" · ", speeds.Select(source =>
+        {
+            var state = source.IsChecking
+                ? IsChineseUi() ? "测速中" : "testing"
+                : source.BytesPerSecond is > 0
+                    ? FormatBytesPerSecond(source.BytesPerSecond.Value)
+                    : IsChineseUi() ? "不可用" : "unavailable";
+            return $"{source.SourceName} {state}";
+        }));
+        var selectedName = speeds.FirstOrDefault(source => source.Url.Equals(selectedUrl, StringComparison.OrdinalIgnoreCase))?.SourceName;
+        if (!string.IsNullOrWhiteSpace(selectedName))
+            summary += IsChineseUi() ? $" · 已选 {selectedName}" : $" · Selected {selectedName}";
+        return summary;
+    }
+
+    private string FormatUpdateSpeedDetails(IReadOnlyList<UpdateSourceSpeed> speeds, string? selectedUrl = null)
+    {
+        if (speeds.Count == 0) return "";
+        return string.Join(Environment.NewLine, speeds.Select(source =>
+        {
+            var state = source.IsChecking
+                ? IsChineseUi() ? "测速中" : "testing"
+                : source.BytesPerSecond is > 0
+                    ? FormatBytesPerSecond(source.BytesPerSecond.Value)
+                    : IsChineseUi() ? "测速失败" : "unavailable";
+            var selected = source.Url.Equals(selectedUrl, StringComparison.OrdinalIgnoreCase)
+                ? IsChineseUi() ? "（当前首选）" : " (selected)"
+                : "";
+            return $"{source.SourceName}: {state}{selected}";
+        }));
+    }
+
+    private static string FormatBytesPerSecond(double bytesPerSecond) => bytesPerSecond >= 1024 * 1024
+        ? $"{bytesPerSecond / (1024 * 1024):0.0} MB/s"
+        : bytesPerSecond >= 1024
+            ? $"{bytesPerSecond / 1024:0.0} KB/s"
+            : $"{bytesPerSecond:0} B/s";
 
     private void LoadDefaults()
     {
@@ -5066,9 +5126,12 @@ public partial class MainWindow : Window
             ? string.Join(Environment.NewLine, result.Changes.Select(x => "• " + x))
             : result.ReleaseNotes;
         if (string.IsNullOrWhiteSpace(changes)) changes = IsChineseUi() ? "发布方未提供详细更新内容。" : "The publisher did not provide detailed release notes.";
+        var sourceDetails = FormatUpdateSpeedDetails(result.DownloadSpeeds, result.DownloadUrl);
+        if (string.IsNullOrWhiteSpace(sourceDetails))
+            sourceDetails = IsChineseUi() ? $"当前首选下载源：{GetUpdateSourceName(result.DownloadUrl)}" : $"Preferred download source: {GetUpdateSourceName(result.DownloadUrl)}";
         var message = IsChineseUi()
-            ? $"版本 v{result.LatestVersion}\n\n更新内容：\n{changes}\n\n确认后将在后台下载更新包，不会自动安装。下载文件会保存到“下载”文件夹。"
-            : $"Version v{result.LatestVersion}\n\nChanges:\n{changes}\n\nAfter confirmation the package will download in the background and will not be installed automatically. It will be saved to your Downloads folder.";
+            ? $"版本 v{result.LatestVersion}\n\n更新内容：\n{changes}\n\n下载源测速：\n{sourceDetails}\n\n确认后将在后台下载更新包，不会自动安装。下载文件会保存到“下载”文件夹。"
+            : $"Version v{result.LatestVersion}\n\nChanges:\n{changes}\n\nDownload source speed:\n{sourceDetails}\n\nAfter confirmation the package will download in the background and will not be installed automatically. It will be saved to your Downloads folder.";
         if (!AppDialog.Show(this, IsChineseUi() ? "发现新版本" : "New Version", message, confirm: true)) return;
         if (_updateDownloadInProgress)
         {
@@ -5088,29 +5151,18 @@ public partial class MainWindow : Window
         var destination = Path.Combine(downloads, fileName);
         if (File.Exists(destination)) destination = Path.Combine(downloads, Path.GetFileNameWithoutExtension(fileName) + $"-{DateTime.Now:yyyyMMdd-HHmmss}" + Path.GetExtension(fileName));
         _logger.Info($"Update background download started: version={result.LatestVersion} destination={destination}");
-        TxtUpdateStatus.Text = IsChineseUi() ? "正在后台下载更新..." : "Downloading update in background...";
-        var progress = new Progress<UpdateDownloadProgress>(p =>
-        {
-            var speed = p.BytesPerSecond / 1024d;
-            var size = p.TotalBytes.HasValue ? $"{p.BytesReceived / 1024d:0.0}/{p.TotalBytes.Value / 1024d:0.0} KB" : $"{p.BytesReceived / 1024d:0.0} KB";
-            TxtUpdateStatus.Text = IsChineseUi()
-                ? $"后台下载 {size}，速度 {speed:0.0} KB/s"
-                : $"Background download {size}, {speed:0.0} KB/s";
-            if (!_updateSlowWarningShown && p.LowSpeedDuration >= TimeSpan.FromSeconds(10))
-            {
-                _updateSlowWarningShown = true;
-                _logger.Warn($"Update download speed below 3 KB/s for {p.LowSpeedDuration.TotalSeconds:0} seconds");
-                AppDialog.Show(this,
-                    IsChineseUi() ? "下载速度过慢" : "Download Too Slow",
-                    IsChineseUi() ? "下载速度连续 10 秒低于 3 KB/s，可以通过邮件向作者获取更新包：1406829360@qq.com" : "Download speed stayed below 3 KB/s for 10 seconds. You can email the author for the update package: 1406829360@qq.com",
-                    danger: true);
-            }
-        });
+        TxtUpdateStatus.Text = IsChineseUi()
+            ? $"正在从 {GetUpdateSourceName(result.DownloadUrl)} 下载更新..."
+            : $"Downloading update from {GetUpdateSourceName(result.DownloadUrl)}...";
+        var progress = new Progress<UpdateDownloadProgress>(UpdateDownloadProgressPresentation);
         try
         {
             var downloaded = await Task.Run(() => _updateService.DownloadAsync(result, destination, progress, _updateDownloadCts.Token));
             _logger.Info($"Update background download completed: version={result.LatestVersion} path={downloaded.FilePath} sha256={downloaded.Sha256}");
-            TxtUpdateStatus.Text = IsChineseUi() ? $"更新包已下载（未安装）：{downloaded.FilePath}" : $"Update downloaded (not installed): {downloaded.FilePath}";
+            TxtUpdateStatus.Text = IsChineseUi()
+                ? $"更新包已从 {GetUpdateSourceName(downloaded.DownloadUrl)} 下载（未安装）：{downloaded.FilePath}"
+                : $"Update downloaded from {GetUpdateSourceName(downloaded.DownloadUrl)} (not installed): {downloaded.FilePath}";
+            TxtUpdateStatus.ToolTip = FormatUpdateSpeedDetails(result.DownloadSpeeds, downloaded.DownloadUrl);
         }
         catch (OperationCanceledException) when (_updateDownloadCts.IsCancellationRequested)
         {
@@ -5128,6 +5180,41 @@ public partial class MainWindow : Window
             _updateDownloadInProgress = false;
         }
     }
+
+    private void UpdateDownloadProgressPresentation(UpdateDownloadProgress progress)
+    {
+        var sourceName = GetUpdateSourceName(progress.DownloadUrl);
+        if (progress.BytesReceived == 0 && progress.BytesPerSecond == 0)
+        {
+            TxtUpdateStatus.Text = progress.IsSourceFallback
+                ? IsChineseUi() ? $"首选源不可用，正在切换到 {sourceName}..." : $"Preferred source unavailable; switching to {sourceName}..."
+                : IsChineseUi() ? $"正在从 {sourceName} 下载更新..." : $"Downloading update from {sourceName}...";
+        }
+        else
+        {
+            var size = progress.TotalBytes.HasValue
+                ? $"{progress.BytesReceived / 1024d:0.0}/{progress.TotalBytes.Value / 1024d:0.0} KB"
+                : $"{progress.BytesReceived / 1024d:0.0} KB";
+            var prefix = progress.IsSourceFallback
+                ? IsChineseUi() ? $"已切换到 {sourceName}：" : $"Switched to {sourceName}: "
+                : IsChineseUi() ? $"{sourceName} 下载：" : $"{sourceName} download: ";
+            TxtUpdateStatus.Text = IsChineseUi()
+                ? $"{prefix}{size}，速度 {FormatBytesPerSecond(progress.BytesPerSecond)}"
+                : $"{prefix}{size}, {FormatBytesPerSecond(progress.BytesPerSecond)}";
+        }
+        TxtUpdateStatus.ToolTip = FormatUpdateSpeedDetails(_lastUpdateResult?.DownloadSpeeds ?? [], progress.DownloadUrl);
+        if (!_updateSlowWarningShown && progress.LowSpeedDuration >= TimeSpan.FromSeconds(10))
+        {
+            _updateSlowWarningShown = true;
+            _logger.Warn($"Update download speed below 3 KB/s for {progress.LowSpeedDuration.TotalSeconds:0} seconds");
+            AppDialog.Show(this,
+                IsChineseUi() ? "下载速度过慢" : "Download Too Slow",
+                IsChineseUi() ? "下载速度连续 10 秒低于 3 KB/s，可以通过邮件向作者获取更新包：1406829360@qq.com" : "Download speed stayed below 3 KB/s for 10 seconds. You can email the author for the update package: 1406829360@qq.com",
+                danger: true);
+        }
+    }
+
+    private static string GetUpdateSourceName(string? url) => new UpdateSourceSpeed(url ?? "", null).SourceName;
 
     private void OpenHttpsLink_Click(object sender, RoutedEventArgs e)
     {

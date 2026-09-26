@@ -1,6 +1,6 @@
 # Release Process
 
-This project uses a single repeatable release path for local packaging and GitHub distribution.
+This project uses a single repeatable release path for local packaging, GitHub publication, and Gitee distribution.
 
 For day-to-day maintenance, required change-log practice, GitHub synchronization, and upgrade work, start with `docs\MAINTENANCE_GUIDE.md`.
 
@@ -104,6 +104,16 @@ $manifest = Invoke-RestMethod -Uri "https://github.com/shashouaq/NetBootDhcpTool
 if ($manifest.version -ne "<version>") { throw "Latest manifest version mismatch: $($manifest.version)" }
 ```
 
+## Gitee Distribution
+
+The public Gitee repository is `https://gitee.com/joel20230302/NetBootDhcpTool`. The app checks its latest stable Gitee Release first and falls back to the GitHub manifest if Gitee metadata cannot be read. Both hosts publish a `latest.json` containing Gitee and GitHub archive URLs. When an update is available, the app requests at most 64 KB from each mirror, orders the sources by measured speed, shows the chosen source, and tries the next approved mirror if transfer or SHA-256 validation fails. Keep the Gitee repository public so unauthenticated clients can read release metadata and assets.
+
+The GitHub Actions workflow `.github/workflows/gitee-release-sync.yml` runs only after a stable GitHub Release is published. It downloads that release's archive, checksum, and manifest; verifies their local hashes; then fast-forward pushes GitHub `main` and the exact release tag to Gitee without force. It creates or updates the matching Gitee Release, replaces only the three managed assets (`.7z`, `.7z.sha256`, and `latest.json`), and verifies the remote asset sizes, manifest, and downloaded archive hash. It then replaces the GitHub `latest.json` with the verified dual-source manifest and reads it back. The workflow requires `contents: write` for that one release-asset update. A non-fast-forward Git push fails closed and requires resolving the Gitee branch divergence before retrying.
+
+The workflow reads the repository Actions secret named `GITEE_TOKEN`. Configure it in the GitHub repository under **Settings → Secrets and variables → Actions → New repository secret**. The value must be a Gitee token that can push to this repository and create/update Releases and upload/delete Release attachments. The token is used only by the workflow; the desktop app does not need it. Never print or put the token in a command-line URL. The Gitee API operations follow the [official Gitee API v5 specification](https://gitee.com/api/v5/swagger_doc.json).
+
+The temporary credential check created, read, and deleted a disposable Gitee Git branch. It confirms Git push permission through the secret, but it did not create a Gitee Release or upload an attachment. The first authorized stable release must therefore be checked in the Actions run and on Gitee before claiming release-asset synchronization; the workflow itself performs readback and SHA-256 verification. Do not publish a test tag or release just to exercise this path.
+
 Download the remote archive and compare its hash with the local archive and published sidecar before closing the release:
 
 ```powershell
@@ -130,7 +140,7 @@ if ($LASTEXITCODE -ne 0) { throw "Downloaded release archive failed 7-Zip testin
 
 ## Upgrade Detection
 
-The application checks this URL in the background after the main window is ready:
+The application first requests the latest stable release from Gitee's public API, reads its `latest.json` attachment, and falls back to this GitHub URL if that request or manifest validation fails:
 
 ```text
 https://github.com/shashouaq/NetBootDhcpTool/releases/latest/download/latest.json
@@ -141,10 +151,11 @@ The manifest contains:
 - `version`: latest available version.
 - `archiveName`: release archive file name.
 - `archiveSha256`: SHA256 checksum for download verification.
-- `downloadUrl`: direct GitHub asset URL.
-- `releasePageUrl`: user-facing GitHub release page.
+- `downloadUrl`: direct URL for the primary host's release asset.
+- `downloadMirrors`: approved alternate release asset URLs from the other host.
+- `releasePageUrl`: user-facing release page on the host serving the manifest.
 - `minimumSupportedVersion`: oldest version allowed to use this update path.
 - `releaseNotes`: Markdown release-note section extracted from the unreleased/current-version change-log section.
 - `changes`: concise change items extracted from the same change-log section for the in-app update dialog.
 
-When `version` is newer than the running version, the UI shows a clickable `有新版本！` / `New version available!` link beside the current version. The link shows the release changes and starts a background download to the user's Downloads folder after confirmation. The archive is written to a temporary `.download` file and SHA-256 verified before it is moved into place; it is never installed automatically. Below 3 KB/s for 10 continuous seconds only produces an email contact hint and no automatic email.
+When `version` is newer than the running version, the app requests at most 64 KB from each valid download URL in parallel. Successful rates determine download order; a failed or timed-out probe is shown as unavailable and remains a later fallback. The toolbar shows rates and the selected host, with per-source details in its tooltip and confirmation dialog. After confirmation, a background download to the user's Downloads folder refreshes transfer speed and host in the status bar and reports a fallback switch. The archive is written to a temporary `.download` file and SHA-256 verified before it is moved into place; it is never installed automatically. Below 3 KB/s for 10 continuous seconds only produces an email contact hint and no automatic email.
