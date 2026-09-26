@@ -100,7 +100,8 @@ if ($releaseLookup.StatusCode -eq 200) {
             name = if ([string]::IsNullOrWhiteSpace($githubRelease.name)) { "NetBoot DHCP Tool $Tag" } else { $githubRelease.name }
             body = [string]$githubRelease.body
         }
-        $releaseUpdate = Invoke-WebRequest -Uri $releaseUri -Method Patch -Form $updateForm -SkipHttpErrorCheck -TimeoutSec 30
+        # Gitee accepts URL-encoded form fields for Release metadata updates; keep multipart encoding for file attachments only.
+        $releaseUpdate = Invoke-WebRequest -Uri $releaseUri -Method Patch -Body $updateForm -SkipHttpErrorCheck -TimeoutSec 30
         if ($releaseUpdate.StatusCode -notin @(200, 201)) { throw "Gitee Release metadata update failed with HTTP $($releaseUpdate.StatusCode)." }
     }
 } elseif ($releaseLookup.StatusCode -ne 404) {
