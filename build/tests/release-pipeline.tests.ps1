@@ -96,6 +96,17 @@ try {
         throw 'The self-hosted runner must install the pinned SDK into its persistent user-writable directory before setup-dotnet runs.'
     }
     if ($formalWorkflow -notmatch 'build[\\/]publish-release\.ps1') { throw 'Formal Release must invoke the idempotent local publisher.' }
+    foreach ($credentialSetting in @(
+        "GIT_CONFIG_COUNT: '1'",
+        'GIT_CONFIG_KEY_0: credential.helper',
+        "GIT_CONFIG_VALUE_0: ''",
+        "GIT_TERMINAL_PROMPT: '0'",
+        'GCM_INTERACTIVE: never'
+    )) {
+        if (-not $formalWorkflow.Contains($credentialSetting)) {
+            throw "The release publisher must bypass machine-wide interactive Git credential helpers: missing $credentialSetting."
+        }
+    }
     if ($windowsWorkflow -notmatch '(?m)^    runs-on: windows-latest') { throw 'Day-to-day CI must remain on GitHub-hosted Windows.' }
     $publisher = Get-Content -Raw -LiteralPath (Join-Path $repoRoot 'build\publish-release.ps1')
     if ($publisher -notmatch "'--draft'") { throw 'GitHub Release must remain draft until final verification.' }

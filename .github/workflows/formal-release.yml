@@ -96,6 +96,14 @@ jobs:
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
           RELEASE_TAG: ${{ inputs.release_tag }}
           RELEASE_COMMIT: ${{ needs.verify-ci.outputs.release_commit }}
+          # The publisher supplies Gitee credentials through GIT_ASKPASS. Ignore
+          # machine-wide credential helpers so this runner never blocks on an
+          # interactive Windows Credential Manager prompt.
+          GIT_CONFIG_COUNT: '1'
+          GIT_CONFIG_KEY_0: credential.helper
+          GIT_CONFIG_VALUE_0: ''
+          GIT_TERMINAL_PROMPT: '0'
+          GCM_INTERACTIVE: never
         run: |
           $workspace = [System.IO.Path]::GetFullPath($env:GITHUB_WORKSPACE)
           $runnerWork = Split-Path -Parent (Split-Path -Parent $workspace)
