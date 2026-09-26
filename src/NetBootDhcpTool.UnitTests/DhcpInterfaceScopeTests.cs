@@ -126,7 +126,9 @@ public sealed class DhcpInterfaceScopeTests
     }
 
     [TestMethod]
-    public async Task LeaseJournalFailureStopsServerWithoutSendingAck()
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task LeaseJournalFailureStopsServerWithoutSendingAck(bool throwNonIoException)
     {
         var loopback = NetworkInterface.GetAllNetworkInterfaces().Single(x => x.NetworkInterfaceType == NetworkInterfaceType.Loopback);
         var interfaceIndex = loopback.GetIPProperties().GetIPv4Properties()?.Index ??
@@ -145,7 +147,11 @@ public sealed class DhcpInterfaceScopeTests
         };
         var stopped = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
         server.StoppedUnexpectedly += reason => stopped.TrySetResult(reason);
-        await server.StartAsync(settings, persistLeaseTable: _ => throw new IOException("injected lease journal write failure"));
+        await server.StartAsync(settings, persistLeaseTable: _ =>
+        {
+            if (throwNonIoException) throw new InvalidOperationException("injected unexpected persistence failure");
+            throw new IOException("injected lease journal write failure");
+        });
 
         await client.SendAsync(BuildDhcpRequest(DhcpMessageType.Discover), new IPEndPoint(IPAddress.Loopback, server.ListenPort));
         var offer = DhcpPacketParser.Parse((await ReceiveWithTimeoutAsync(client)).Buffer);
@@ -156,6 +162,40 @@ public sealed class DhcpInterfaceScopeTests
         Assert.IsTrue(stopReason.Contains("journal persistence failed", StringComparison.OrdinalIgnoreCase));
         Assert.IsFalse(server.IsRunning, "the service stops when a committed lease cannot be persisted");
         Assert.IsFalse(await HasDhcpPacketAsync(client, 200), "an unpersisted lease never receives an ACK");
+    }
+
+    [TestMethod]
+    public async Task LeaseExpiryJournalFailureStopsServer()
+    {
+        var loopback = NetworkInterface.GetAllNetworkInterfaces().Single(x => x.NetworkInterfaceType == NetworkInterfaceType.Loopback);
+        var interfaceIndex = loopback.GetIPProperties().GetIPv4Properties()?.Index ??
+            throw new AssertFailedException("Loopback IPv4 index unavailable.");
+        var settings = new DhcpServerSettings
+        {
+            AdapterId = loopback.Id,
+            InterfaceIndex = interfaceIndex,
+            ServerIp = IPAddress.Loopback,
+            SubnetMask = IPAddress.Parse("255.0.0.0"),
+            PoolStart = IPAddress.Parse("127.0.0.100"),
+            PoolEnd = IPAddress.Parse("127.0.0.101")
+        };
+        var now = DateTimeOffset.UtcNow;
+        var binding = new DhcpLeaseBinding
+        {
+            ClientKey = "MAC:02-11-22-33-44-55",
+            MacAddress = "02-11-22-33-44-55",
+            IpAddress = "127.0.0.100",
+            LeaseStart = now.AddMinutes(-1),
+            LeaseEnd = now.AddMilliseconds(500)
+        };
+        using var server = new DhcpServer(NullLogger.Instance, listenPort: 0, leaseSweepInterval: TimeSpan.FromMilliseconds(20));
+        var stopped = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        server.StoppedUnexpectedly += reason => stopped.TrySetResult(reason);
+        await server.StartAsync(settings, restoredBindings: [binding], persistLeaseTable: _ => throw new InvalidOperationException("injected expiry persistence failure"));
+
+        var stopReason = await stopped.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        Assert.IsTrue(stopReason.Contains("expiry sweep failed", StringComparison.OrdinalIgnoreCase));
+        Assert.IsFalse(server.IsRunning);
     }
 
     private static byte[] BuildDhcpRequest(DhcpMessageType type, IPAddress? requestedIp = null, IPAddress? serverIdentifier = null)

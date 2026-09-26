@@ -37,7 +37,8 @@ public partial class MainWindow : Window
     private readonly MainWindowViewModel _viewModel;
     private readonly VersionUpdateService _updateService;
     private readonly CancellationTokenSource _updateCts = new();
-    private readonly CancellationTokenSource _updateDownloadCts = new();
+    private CancellationTokenSource? _updateDownloadCts;
+    private Task? _updateDownloadTask;
     private readonly SemaphoreSlim _leaseUpdateGate = new(1, 1);
     private readonly NetworkWorkflowCoordinator _networkWorkflows = new();
     private readonly List<string> _startupDataWarnings = [];
@@ -299,14 +300,14 @@ public partial class MainWindow : Window
         _adapterStatusTimer.Stop();
         _feedbackTimer.Stop();
         _updateCts.Cancel();
-        _updateDownloadCts.Cancel();
+        _updateDownloadCts?.Cancel();
         IsEnabled = false;
+        if (_updateDownloadTask is not null) await _updateDownloadTask;
         SetBusy(true, IsChineseUi() ? "正在保存恢复信息并停止 DHCP..." : "Saving recovery state and stopping DHCP...");
         await CleanupWorkEnvironmentAsync();
         SetBusy(false);
         _updateService.Dispose();
         _updateCts.Dispose();
-        _updateDownloadCts.Dispose();
         _closeAfterCleanup = true;
         await Dispatcher.InvokeAsync(Close, DispatcherPriority.Background);
     }
@@ -408,6 +409,7 @@ public partial class MainWindow : Window
         BtnExportProfile.Content = _lang.T("profile.export");
         BtnDeleteProfile.Content = _lang.T("profile.delete");
         BtnCancelOperation.Content = _lang.T("cancel");
+        BtnCancelUpdateDownload.Content = _lang.T("cancel");
         AllowGateway.Content = _lang.T("allow.gateway");
         DetectExistingDhcp.Content = _lang.T("detect.existing.dhcp");
         AllowRestartAnyAdapter.Content = _lang.T("allow.restart.any");
@@ -1010,7 +1012,7 @@ public partial class MainWindow : Window
             scope.DeclinedAddresses = previousDeclined;
             _dhcpLeaseJournalWritable = false;
             _logger.Error("Save DHCP lease journal failed; existing files were retained and no DHCP acknowledgement will be sent", ex);
-            UpdateRecoveryBanner();
+            if (!Dispatcher.HasShutdownStarted) Dispatcher.BeginInvoke(UpdateRecoveryBanner);
             throw new IOException(Ui("dhcp.lease.journal.unreadable"), ex);
         }
     }
@@ -1697,42 +1699,69 @@ public partial class MainWindow : Window
 
     private async Task HandleUnexpectedDhcpStopAsync(string reason)
     {
-        if (_dhcpServer.IsRunning) return;
-        _logger.Error("DHCP stopped unexpectedly: " + reason);
-        _leasePingTimer.Stop();
-        _leaseHintCts?.Cancel();
-        MarkLeaseSessionHistorical(_activeDhcpUiSessionId);
-        _activeDhcpUiSessionId = null;
-
-        var firewallCleanupSucceeded = await RemoveDhcpFirewallRulesAsync(CancellationToken.None);
-        var adapterRestored = false;
-        var recovery = _activeDhcpSession;
-        if (RestoreOnStop.IsChecked == true && recovery?.RequiresRestore == true)
+        while (!_closingCleanupStarted && !_dhcpServer.IsRunning)
         {
-            try
-            {
-                await RestoreDhcpSessionAsync(recovery, CancellationToken.None);
-                adapterRestored = true;
-            }
-            catch (Exception ex)
-            {
-                _logger.Error("Unexpected DHCP stop adapter recovery remains pending", ex);
-            }
+            var activeCompletion = _activeNetworkWorkflow?.Completion ?? _standaloneOperationCompletion?.Task;
+            if (activeCompletion is null) break;
+            await activeCompletion;
         }
-        if (adapterRestored) _activeDhcpSession = null;
-        SetDhcpRunningState(false);
-        UpdateManualScanButtons();
-        var details = $"{reason}; firewallCleanup={firewallCleanupSucceeded}; adapterRestored={adapterRestored}";
-        AddOperationHistory("DHCP", DhcpServerIp.Text.Trim(), recovery?.AdapterIdentity.AdapterMac ?? "",
-            "Unexpected stop / 意外停止", details, scope: "DHCP session", rollbackAvailable: recovery?.RequiresRestore == true);
-        ShowActionFeedback(
-            firewallCleanupSucceeded
-                ? "DHCP 意外停止；请检查网卡恢复记录。"
-                : "DHCP 意外停止；临时防火墙规则仍待恢复中心清理。",
-            firewallCleanupSucceeded
-                ? "DHCP stopped unexpectedly. Review adapter recovery if needed."
-                : "DHCP stopped unexpectedly; temporary firewall rules remain in Recovery Center.",
-            error: true);
+        if (_closingCleanupStarted || _dhcpServer.IsRunning || _activeDhcpUiSessionId is null) return;
+
+        var workflow = TryBeginNetworkWorkflow("Unexpected DHCP stop", allowWhileDhcpRunning: true);
+        if (workflow is null)
+        {
+            _logger.Error("Unexpected DHCP stop cleanup could not acquire the network workflow; recovery records remain available.");
+            return;
+        }
+        try
+        {
+            _logger.Error("DHCP stopped unexpectedly: " + reason);
+            _leasePingTimer.Stop();
+            _leaseHintCts?.Cancel();
+            MarkLeaseSessionHistorical(_activeDhcpUiSessionId);
+            _activeDhcpUiSessionId = null;
+
+            var firewallCleanupSucceeded = await RemoveDhcpFirewallRulesAsync(CancellationToken.None);
+            var adapterRestored = false;
+            var recovery = _activeDhcpSession;
+            if (RestoreOnStop.IsChecked == true && recovery?.RequiresRestore == true)
+            {
+                try
+                {
+                    await RestoreDhcpSessionAsync(recovery, CancellationToken.None);
+                    adapterRestored = true;
+                }
+                catch (Exception ex)
+                {
+                    _logger.Error("Unexpected DHCP stop adapter recovery remains pending", ex);
+                }
+            }
+            if (adapterRestored) _activeDhcpSession = null;
+            SetDhcpRunningState(false);
+            UpdateManualScanButtons();
+            var details = $"{reason}; firewallCleanup={firewallCleanupSucceeded}; adapterRestored={adapterRestored}";
+            AddOperationHistory("DHCP", DhcpServerIp.Text.Trim(), recovery?.AdapterIdentity.AdapterMac ?? "",
+                "Unexpected stop / 意外停止", details, scope: "DHCP session", rollbackAvailable: recovery?.RequiresRestore == true);
+            ShowActionFeedback(
+                firewallCleanupSucceeded
+                    ? "DHCP 意外停止；请检查网卡恢复记录。"
+                    : "DHCP 意外停止；临时防火墙规则仍待恢复中心清理。",
+                firewallCleanupSucceeded
+                    ? "DHCP stopped unexpectedly. Review adapter recovery if needed."
+                    : "DHCP stopped unexpectedly; temporary firewall rules remain in Recovery Center.",
+                error: true);
+        }
+        catch (Exception ex)
+        {
+            _logger.Error("Unexpected DHCP stop cleanup failed; recovery records remain available", ex);
+            SetDhcpRunningState(false);
+            UpdateManualScanButtons();
+            ShowActionFeedback("DHCP 意外停止，自动清理未完成，请检查恢复中心。", "DHCP stopped unexpectedly and automatic cleanup did not finish. Review Recovery Center.", error: true);
+        }
+        finally
+        {
+            EndNetworkWorkflow(workflow);
+        }
     }
 
     private async void ApplyScan_Click(object sender, RoutedEventArgs e)
@@ -5130,41 +5159,56 @@ public partial class MainWindow : Window
         if (string.IsNullOrWhiteSpace(sourceDetails))
             sourceDetails = IsChineseUi() ? $"当前首选下载源：{GetUpdateSourceName(result.DownloadUrl)}" : $"Preferred download source: {GetUpdateSourceName(result.DownloadUrl)}";
         var message = IsChineseUi()
-            ? $"版本 v{result.LatestVersion}\n\n更新内容：\n{changes}\n\n下载源测速：\n{sourceDetails}\n\n确认后将在后台下载更新包，不会自动安装。下载文件会保存到“下载”文件夹。"
-            : $"Version v{result.LatestVersion}\n\nChanges:\n{changes}\n\nDownload source speed:\n{sourceDetails}\n\nAfter confirmation the package will download in the background and will not be installed automatically. It will be saved to your Downloads folder.";
+            ? $"版本 v{result.LatestVersion}\n\n更新内容：\n{changes}\n\n下载源测速：\n{sourceDetails}\n\n确认后将在后台下载更新包，不会自动安装。下载文件会保存到“下载”文件夹；下载过程中可随时点击“取消”停止。"
+            : $"Version v{result.LatestVersion}\n\nChanges:\n{changes}\n\nDownload source speed:\n{sourceDetails}\n\nAfter confirmation the package will download in the background and will not be installed automatically. It will be saved to your Downloads folder; click Cancel at any time to stop the download.";
         if (!AppDialog.Show(this, IsChineseUi() ? "发现新版本" : "New Version", message, confirm: true)) return;
         if (_updateDownloadInProgress)
         {
             AppDialog.Show(this, IsChineseUi() ? "更新下载" : "Update Download", IsChineseUi() ? "更新已在后台下载中。" : "The update is already downloading.");
             return;
         }
-        _ = DownloadUpdateAsync(result);
+        _updateDownloadTask = DownloadUpdateAsync(result);
+    }
+
+    private void CancelUpdateDownload_Click(object sender, RoutedEventArgs e)
+    {
+        if (!_updateDownloadInProgress || _updateDownloadCts is not { IsCancellationRequested: false } cancellation) return;
+        cancellation.Cancel();
+        BtnCancelUpdateDownload.IsEnabled = false;
+        TxtUpdateStatus.Text = IsChineseUi() ? "正在取消更新下载..." : "Canceling update download...";
     }
 
     private async Task DownloadUpdateAsync(UpdateCheckResult result)
     {
         _updateDownloadInProgress = true;
+        using var cancellation = new CancellationTokenSource();
+        _updateDownloadCts = cancellation;
+        BtnCancelUpdateDownload.IsEnabled = true;
+        BtnCancelUpdateDownload.Visibility = Visibility.Visible;
         _updateSlowWarningShown = false;
-        var fileName = string.IsNullOrWhiteSpace(result.ArchiveName) ? $"NetBootDhcpTool-v{result.LatestVersion}.7z" : Path.GetFileName(result.ArchiveName);
-        if (string.IsNullOrWhiteSpace(fileName)) fileName = $"NetBootDhcpTool-v{result.LatestVersion}.7z";
-        var downloads = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
-        var destination = Path.Combine(downloads, fileName);
-        if (File.Exists(destination)) destination = Path.Combine(downloads, Path.GetFileNameWithoutExtension(fileName) + $"-{DateTime.Now:yyyyMMdd-HHmmss}" + Path.GetExtension(fileName));
-        _logger.Info($"Update background download started: version={result.LatestVersion} destination={destination}");
-        TxtUpdateStatus.Text = IsChineseUi()
-            ? $"正在从 {GetUpdateSourceName(result.DownloadUrl)} 下载更新..."
-            : $"Downloading update from {GetUpdateSourceName(result.DownloadUrl)}...";
-        var progress = new Progress<UpdateDownloadProgress>(UpdateDownloadProgressPresentation);
         try
         {
-            var downloaded = await Task.Run(() => _updateService.DownloadAsync(result, destination, progress, _updateDownloadCts.Token));
+            var fileName = string.IsNullOrWhiteSpace(result.ArchiveName) ? $"NetBootDhcpTool-v{result.LatestVersion}.7z" : Path.GetFileName(result.ArchiveName);
+            if (string.IsNullOrWhiteSpace(fileName)) fileName = $"NetBootDhcpTool-v{result.LatestVersion}.7z";
+            var downloads = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
+            var destination = Path.Combine(downloads, fileName);
+            if (File.Exists(destination)) destination = Path.Combine(downloads, Path.GetFileNameWithoutExtension(fileName) + $"-{DateTime.Now:yyyyMMdd-HHmmss}" + Path.GetExtension(fileName));
+            _logger.Info($"Update background download started: version={result.LatestVersion} destination={destination}");
+            TxtUpdateStatus.Text = IsChineseUi()
+                ? $"正在从 {GetUpdateSourceName(result.DownloadUrl)} 下载更新..."
+                : $"Downloading update from {GetUpdateSourceName(result.DownloadUrl)}...";
+            var progress = new Progress<UpdateDownloadProgress>(item =>
+            {
+                if (ReferenceEquals(_updateDownloadCts, cancellation)) UpdateDownloadProgressPresentation(item);
+            });
+            var downloaded = await Task.Run(() => _updateService.DownloadAsync(result, destination, progress, cancellation.Token));
             _logger.Info($"Update background download completed: version={result.LatestVersion} path={downloaded.FilePath} sha256={downloaded.Sha256}");
             TxtUpdateStatus.Text = IsChineseUi()
                 ? $"更新包已从 {GetUpdateSourceName(downloaded.DownloadUrl)} 下载（未安装）：{downloaded.FilePath}"
                 : $"Update downloaded from {GetUpdateSourceName(downloaded.DownloadUrl)} (not installed): {downloaded.FilePath}";
             TxtUpdateStatus.ToolTip = FormatUpdateSpeedDetails(result.DownloadSpeeds, downloaded.DownloadUrl);
         }
-        catch (OperationCanceledException) when (_updateDownloadCts.IsCancellationRequested)
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
         {
             _logger.Info("Update background download canceled");
             TxtUpdateStatus.Text = _lang.T("update.download.canceled");
@@ -5173,16 +5217,20 @@ public partial class MainWindow : Window
         {
             _logger.Error("Update background download failed", ex);
             TxtUpdateStatus.Text = IsChineseUi() ? "更新下载失败，请查看日志或联系作者" : "Update download failed; see logs or contact the author";
-            AppDialog.Show(this, IsChineseUi() ? "更新下载失败" : "Update Download Failed", ex.Message + "\n\n1406829360@qq.com", danger: true);
+            if (!_closingCleanupStarted)
+                AppDialog.Show(this, IsChineseUi() ? "更新下载失败" : "Update Download Failed", ex.Message + "\n\n1406829360@qq.com", danger: true);
         }
         finally
         {
             _updateDownloadInProgress = false;
+            _updateDownloadCts = null;
+            BtnCancelUpdateDownload.Visibility = Visibility.Collapsed;
         }
     }
 
     private void UpdateDownloadProgressPresentation(UpdateDownloadProgress progress)
     {
+        if (!_updateDownloadInProgress || _closingCleanupStarted) return;
         var sourceName = GetUpdateSourceName(progress.DownloadUrl);
         if (progress.BytesReceived == 0 && progress.BytesPerSecond == 0)
         {

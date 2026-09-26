@@ -68,10 +68,13 @@ public sealed class VersionUpdateService : IDisposable
     private readonly HttpClient _httpClient;
     private readonly bool _ownsHttpClient;
     private readonly IReadOnlyList<Uri> _manifestUris;
+    private readonly TimeSpan _downloadIdleTimeout;
     private readonly SemaphoreSlim _downloadGate = new(1, 1);
 
-    public VersionUpdateService(HttpClient? httpClient = null, string? manifestUrl = null)
+    public VersionUpdateService(HttpClient? httpClient = null, string? manifestUrl = null, TimeSpan? downloadIdleTimeout = null)
     {
+        _downloadIdleTimeout = downloadIdleTimeout ?? TimeSpan.FromSeconds(30);
+        if (_downloadIdleTimeout <= TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(downloadIdleTimeout));
         _httpClient = httpClient ?? new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
         _ownsHttpClient = httpClient == null;
         _manifestUris = string.IsNullOrWhiteSpace(manifestUrl)
@@ -95,8 +98,9 @@ public sealed class VersionUpdateService : IDisposable
                 var result = Evaluate(json, currentVersion);
                 if (result.Succeeded)
                 {
-                    candidate = result;
-                    break;
+                    if (candidate?.LatestVersion is null || result.LatestVersion > candidate.LatestVersion)
+                        candidate = result;
+                    continue;
                 }
                 errors.Add($"{manifestUri.Host}: {result.Error}");
             }
@@ -278,15 +282,19 @@ public sealed class VersionUpdateService : IDisposable
     {
         var tempPath = fullDestinationPath + "." + Guid.NewGuid().ToString("N") + ".download";
         var ownsTempFile = false;
+        using var idleTimeout = new CancellationTokenSource();
+        using var linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(ct, idleTimeout.Token);
 
         try
         {
             using var request = new HttpRequestMessage(HttpMethod.Get, downloadUrl);
             request.Headers.UserAgent.ParseAdd("NetBootDhcpTool-UpdateDownload/1.0");
-            using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct);
+            idleTimeout.CancelAfter(_downloadIdleTimeout);
+            using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, linkedCancellation.Token);
             response.EnsureSuccessStatusCode();
             var totalBytes = response.Content.Headers.ContentLength;
-            await using var input = await response.Content.ReadAsStreamAsync(ct);
+            await using var input = await response.Content.ReadAsStreamAsync(linkedCancellation.Token);
+            idleTimeout.CancelAfter(Timeout.InfiniteTimeSpan);
             await using (var output = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 64 * 1024, useAsync: true))
             {
                 ownsTempFile = true;
@@ -297,8 +305,12 @@ public sealed class VersionUpdateService : IDisposable
                 var sampledAt = stopwatch.Elapsed;
                 var lowSpeedDuration = TimeSpan.Zero;
                 int read;
-                while ((read = await input.ReadAsync(buffer.AsMemory(), ct)) > 0)
+                while (true)
                 {
+                    idleTimeout.CancelAfter(_downloadIdleTimeout);
+                    try { read = await input.ReadAsync(buffer.AsMemory(), linkedCancellation.Token); }
+                    finally { idleTimeout.CancelAfter(Timeout.InfiniteTimeSpan); }
+                    if (read == 0) break;
                     await output.WriteAsync(buffer.AsMemory(0, read), ct);
                     received += read;
                     var now = stopwatch.Elapsed;
@@ -360,6 +372,8 @@ public sealed class VersionUpdateService : IDisposable
                     throw new AggregateException("Update download failed and its temporary file could not be removed.", downloadFailure, cleanupFailure);
                 }
             }
+            if (downloadFailure is OperationCanceledException && !ct.IsCancellationRequested && idleTimeout.IsCancellationRequested)
+                throw new IOException("Update download source was idle for too long.", downloadFailure);
             throw;
         }
     }

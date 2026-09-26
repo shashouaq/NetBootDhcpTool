@@ -456,6 +456,7 @@ if ($remaining.Count -gt 0) { throw 'Owned route still exists after removal' }
         var family = FamilyName(target.Route.AddressFamily);
         var destination = PsQuote(target.Route.DestinationPrefix);
         var nextHop = PsQuote(target.Route.NextHop);
+        var expectedGuid = Guid.Parse(target.Adapter.Id);
         var script = $$"""
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [Console]::OutputEncoding
@@ -464,9 +465,11 @@ $idx={{target.Adapter.InterfaceIndex}}
 $family='{{family}}'
 $destination={{destination}}
 $nextHop={{nextHop}}
+$expectedGuid=[guid]'{{expectedGuid:D}}'
 $expectedMac={{PsQuote(target.Adapter.MacAddress ?? "")}}
 $netAdapter = Get-NetAdapter -InterfaceIndex $idx -ErrorAction Stop
 if ($netAdapter.Status -ne 'Up') { throw 'Selected adapter is not Up' }
+if ([guid]$netAdapter.InterfaceGuid -ne $expectedGuid) { throw 'Selected adapter identity changed' }
 if (-not [string]::IsNullOrWhiteSpace($expectedMac) -and [string]$netAdapter.MacAddress -ne $expectedMac) { throw 'Selected adapter identity changed' }
         New-NetRoute -DestinationPrefix $destination -InterfaceIndex $idx -AddressFamily $family -NextHop $nextHop -RouteMetric {{target.Route.RouteMetric}} -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
 $route = @(Get-NetRoute -InterfaceIndex $idx -AddressFamily $family -DestinationPrefix $destination -ErrorAction Stop |
@@ -707,6 +710,7 @@ ConvertTo-Json -InputObject $routes -Compress -Depth 4
     private static void EnsureApplyTarget(NetworkAdapterInfo adapter)
     {
         if (!int.TryParse(adapter.InterfaceIndex, out var index) || index <= 0) throw new InvalidOperationException("InterfaceIndex missing / 缺少网卡 InterfaceIndex");
+        if (!Guid.TryParse(adapter.Id, out _)) throw new InvalidOperationException("Adapter GUID missing / 缺少网卡稳定 GUID");
     }
 
     private void EnsureAdministratorForOperation()

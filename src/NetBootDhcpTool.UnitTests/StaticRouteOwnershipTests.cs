@@ -221,6 +221,42 @@ public sealed class StaticRouteOwnershipTests
     }
 
     [TestMethod]
+    public async Task ReusedInterfaceIndexWithMatchingMacCannotCreateRoute()
+    {
+        var attemptedCreate = false;
+        var service = Service(async (script, summary, token, _) =>
+        {
+            var planOutput = PlanReadOutput(summary);
+            if (planOutput != null) return planOutput;
+            if (!summary.Contains("create IPv4 static route", StringComparison.Ordinal))
+                Assert.Fail($"Unexpected PowerShell call: {summary}");
+
+            var wrapped = $$"""
+function Get-NetAdapter {
+  param([int]$InterfaceIndex)
+  [pscustomobject]@{ Status = 'Up'; InterfaceGuid = [guid]'e52a0bc0-32b7-423f-aa42-dd0013b0b6bd'; MacAddress = '00-11-22-33-44-55' }
+}
+function New-NetRoute { $global:routeCreated = $true }
+try {
+{{script}}
+} catch {
+  Write-Output ('__ERROR__' + $_.Exception.Message)
+}
+Write-Output ('__CREATED__' + [bool]$global:routeCreated)
+""";
+            var execution = await RunPowerShellAsync(wrapped, token);
+            Assert.AreEqual(0, execution.ExitCode, execution.Error);
+            StringAssert.Contains(execution.Output, "__ERROR__Selected adapter identity changed");
+            StringAssert.Contains(execution.Output, "__CREATED__False");
+            attemptedCreate = true;
+            throw new IOException("The adapter identity check rejected a reused interface index.");
+        });
+
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => service.ApplyAsync([Target()], onCreating: _ => { }));
+        Assert.IsTrue(attemptedCreate);
+    }
+
+    [TestMethod]
     public async Task JournalFailureAfterCreateRunsExactOwnershipRollback()
     {
         var calls = new List<string>();
@@ -430,7 +466,7 @@ public sealed class StaticRouteOwnershipTests
 
     private static NetworkAdapterInfo Adapter() => new()
     {
-        Id = "adapter-id",
+        Id = "d7866951-1034-46a9-a94b-627c6137c835",
         InterfaceIndex = "17",
         Name = "Ethernet",
         MacAddress = "00-11-22-33-44-55",
@@ -483,12 +519,20 @@ try {
 }
 Write-Output ('__MOCK_STATE__' + (ConvertTo-Json -InputObject @($global:mockRoutes) -Compress -Depth 4))
 """;
+        var execution = await RunPowerShellAsync(wrapped, cancellationToken);
+        var marker = execution.Output.LastIndexOf("__MOCK_STATE__", StringComparison.Ordinal);
+        return new MockPowerShellResult(execution.ExitCode, execution.Output, execution.Error,
+            marker >= 0 ? execution.Output[(marker + "__MOCK_STATE__".Length)..] : null);
+    }
+
+    private static async Task<(int ExitCode, string Output, string Error)> RunPowerShellAsync(string script, CancellationToken cancellationToken)
+    {
         using var process = new Process
         {
             StartInfo = new ProcessStartInfo
             {
                 FileName = Path.Combine(Environment.SystemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe"),
-                Arguments = "-NoProfile -ExecutionPolicy Bypass -EncodedCommand " + Convert.ToBase64String(Encoding.Unicode.GetBytes(wrapped)),
+                Arguments = "-NoProfile -ExecutionPolicy Bypass -EncodedCommand " + Convert.ToBase64String(Encoding.Unicode.GetBytes(script)),
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
@@ -502,10 +546,7 @@ Write-Output ('__MOCK_STATE__' + (ConvertTo-Json -InputObject @($global:mockRout
         var errorTask = process.StandardError.ReadToEndAsync(cancellationToken);
         await Task.WhenAll(outputTask, errorTask);
         await process.WaitForExitAsync(cancellationToken);
-        var output = outputTask.Result.Trim();
-        var error = errorTask.Result.Trim();
-        var marker = output.LastIndexOf("__MOCK_STATE__", StringComparison.Ordinal);
-        return new MockPowerShellResult(process.ExitCode, output, error, marker >= 0 ? output[(marker + "__MOCK_STATE__".Length)..] : null);
+        return (process.ExitCode, outputTask.Result.Trim(), errorTask.Result.Trim());
     }
 
     private sealed record MockRoute(string InstanceId, string DestinationPrefix, string NextHop, int RouteMetric, string Store)

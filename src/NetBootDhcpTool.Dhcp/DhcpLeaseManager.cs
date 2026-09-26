@@ -3,6 +3,12 @@ using NetBootDhcpTool.Core;
 
 namespace NetBootDhcpTool.Dhcp;
 
+internal sealed class DhcpLeasePersistenceException : IOException
+{
+    public DhcpLeasePersistenceException(Exception innerException)
+        : base("DHCP lease journal persistence failed.", innerException) { }
+}
+
 public sealed class DhcpLeaseManager
 {
     public static readonly TimeSpan OfferLifetime = TimeSpan.FromSeconds(60);
@@ -327,7 +333,8 @@ public sealed class DhcpLeaseManager
             Bindings = _bindings.Values.Where(x => x.LeaseEnd > now).Select(Clone).ToList(),
             DeclinedAddresses = _declined.Values.Where(x => x.ExpiresAt > now).Select(Clone).ToList()
         };
-        _persist?.Invoke(snapshot);
+        try { _persist?.Invoke(snapshot); }
+        catch (Exception ex) { throw new DhcpLeasePersistenceException(ex); }
         TableChanged?.Invoke(snapshot);
     }
 

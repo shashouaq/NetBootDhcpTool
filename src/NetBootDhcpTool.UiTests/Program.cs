@@ -101,6 +101,22 @@ internal static class Program
             || !updateStatus.Text.Contains("Selected GitHub", StringComparison.Ordinal)
             || updateLink.ToolTip is not string updateTooltip || !updateTooltip.Contains(githubArchiveUrl, StringComparison.Ordinal))
             throw new InvalidOperationException("the update toolbar did not show both mirror speeds and the selected source");
+        var downloadInProgress = window.GetType().GetField("_updateDownloadInProgress", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var downloadCancellation = window.GetType().GetField("_updateDownloadCts", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var cancelDownload = (Button)window.FindName("BtnCancelUpdateDownload")!;
+        using (var cancellation = new CancellationTokenSource())
+        {
+            downloadInProgress.SetValue(window, true);
+            downloadCancellation.SetValue(window, cancellation);
+            cancelDownload.Visibility = Visibility.Visible;
+            InvokePrivate(window, "CancelUpdateDownload_Click", cancelDownload, new RoutedEventArgs());
+            if (!cancellation.IsCancellationRequested || cancelDownload.IsEnabled
+                || !updateStatus.Text.Contains("Canceling update download", StringComparison.Ordinal))
+                throw new InvalidOperationException("the update toolbar did not cancel an active download");
+            cancelDownload.Visibility = Visibility.Collapsed;
+            cancelDownload.IsEnabled = true;
+            downloadCancellation.SetValue(window, null);
+        }
         InvokePrivate(window, "UpdateDownloadProgressPresentation", new UpdateDownloadProgress
         {
             BytesReceived = 512 * 1024,
@@ -112,6 +128,7 @@ internal static class Program
         if (!updateStatus.Text.Contains("Switched to GitHub", StringComparison.Ordinal)
             || !updateStatus.Text.Contains("1.5 MB/s", StringComparison.Ordinal))
             throw new InvalidOperationException("the live update status did not show the current mirror and transfer rate");
+        downloadInProgress.SetValue(window, false);
         var busyStageText = (TextBlock)window.FindName("BusyStageText")!;
         var busyElapsedText = (TextBlock)window.FindName("BusyElapsedText")!;
         var busyStageProgress = (ProgressBar)window.FindName("BusyStageProgress")!;
@@ -130,6 +147,9 @@ internal static class Program
             throw new InvalidOperationException("The invalid Wi-Fi DHCP override must be absent while other adapter safety settings remain available.");
         var owner = InvokePrivate<NetworkWorkflowLease?>(window, "TryBeginNetworkWorkflow", "UI smoke owner", false);
         if (owner == null) throw new InvalidOperationException("could not reserve a fake in-process workflow");
+        var unexpectedStopCleanup = InvokePrivate<Task>(window, "HandleUnexpectedDhcpStopAsync", "synthetic stop while another workflow owns the gate");
+        if (unexpectedStopCleanup.IsCompleted)
+            throw new InvalidOperationException("unexpected DHCP stop cleanup did not wait for the active network workflow");
         var ownerToken = owner.Token;
         var completed = false;
         var failed = false;
@@ -671,8 +691,9 @@ internal static class Program
                 InvokePrivate(window, "UpdateLink_Click", updateLink, new RoutedEventArgs());
                 if (captureUpdateDialog
                     || !updateConfirmationMessage.Contains("Gitee: 800.0 KB/s", StringComparison.Ordinal)
-                    || !updateConfirmationMessage.Contains("GitHub: 1.5 MB/s (selected)", StringComparison.Ordinal))
-                    throw new InvalidOperationException("the update confirmation did not include both probe results and the selected mirror");
+                    || !updateConfirmationMessage.Contains("GitHub: 1.5 MB/s (selected)", StringComparison.Ordinal)
+                    || !updateConfirmationMessage.Contains("click Cancel at any time", StringComparison.Ordinal))
+                    throw new InvalidOperationException("the update confirmation did not explain the mirror selection and how to cancel the download");
 
                 completed = true;
                 closeRequested = true;
@@ -708,7 +729,7 @@ internal static class Program
                 timer.Stop();
                 Console.Error.WriteLine("UI_SMOKE_FAILED: window closed before its active operation released.");
             }
-            Console.WriteLine("UI_SMOKE_OK: non-admin WPF window, update mirror speeds/selection/live fallback/confirmation, DHCP session restore fail-closed/unavailable recovery retention, static route cleanup failure detail/count, recovery journal safety, lease state/session/Ping separation and IP reuse, bounded scan-range validation, canceled-scan partial-result history, operation gate, refresh shortcuts, favorite cancel/re-entry/clear, profile DHCP field visibility and comparison, recovery handlers, and close wait verified.");
+            Console.WriteLine("UI_SMOKE_OK: non-admin WPF window, update mirror speeds/selection/live fallback/cancellation/confirmation, serialized unexpected DHCP stop cleanup, DHCP session restore fail-closed/unavailable recovery retention, static route cleanup failure detail/count, recovery journal safety, lease state/session/Ping separation and IP reuse, bounded scan-range validation, canceled-scan partial-result history, operation gate, refresh shortcuts, favorite cancel/re-entry/clear, profile DHCP field visibility and comparison, recovery handlers, and close wait verified.");
             timer.Stop();
             application.Shutdown();
         };

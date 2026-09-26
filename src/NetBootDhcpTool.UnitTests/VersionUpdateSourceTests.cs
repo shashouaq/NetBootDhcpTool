@@ -29,6 +29,8 @@ public sealed class VersionUpdateSourceTests
                 return Json($"[{{\"name\":\"latest.json\",\"browser_download_url\":\"{GiteeManifestUrl}\"}}]");
             if (request.RequestUri.AbsoluteUri == GiteeManifestUrl)
                 return Json(Manifest("1.0.14"));
+            if (request.RequestUri.AbsoluteUri == VersionUpdateService.DefaultManifestUrl)
+                return Json(Manifest("1.0.14"));
             if (request.Headers.Range?.Ranges.SingleOrDefault() is not { From: 0, To: 65535 })
                 return new HttpResponseMessage(HttpStatusCode.RequestedRangeNotSatisfiable);
             if (request.RequestUri.Host.Equals("github.com", StringComparison.OrdinalIgnoreCase))
@@ -52,6 +54,8 @@ public sealed class VersionUpdateSourceTests
         Assert.IsTrue(requests.Where(request => request.Headers.Range != null).All(request =>
             request.Headers.Range!.Ranges.Single().From == 0 && request.Headers.Range.Ranges.Single().To == 65535));
         Assert.AreEqual(2, requests.Count(request => request.Headers.Range != null));
+        Assert.AreEqual("https://gitee.com/joel20230302/NetBootDhcpTool/releases/tag/v1.0.14", result.ReleasePageUrl,
+            "An equal version keeps the first valid release source.");
     }
 
     [TestMethod]
@@ -75,8 +79,36 @@ public sealed class VersionUpdateSourceTests
         Assert.IsTrue(result.Succeeded, result.Error);
         Assert.IsFalse(result.IsNewVersion);
         Assert.AreEqual(0, result.DownloadSpeeds.Count);
-        Assert.AreEqual(3, requests.Count);
+        Assert.AreEqual(4, requests.Count);
         Assert.AreEqual(0, requests.Count(request => request.Headers.Range != null));
+    }
+
+    [TestMethod]
+    public async Task NewerGitHubManifestWinsOverStaleGiteeLatestRelease()
+    {
+        var requests = new ConcurrentQueue<string>();
+        using var client = new HttpClient(new DelegateHandler((request, _) =>
+        {
+            var url = request.RequestUri!.AbsoluteUri;
+            requests.Enqueue(url);
+            if (url == VersionUpdateService.GiteeLatestReleaseApiUrl)
+                return Task.FromResult(Json("{\"id\":123,\"tag_name\":\"v1.0.13\",\"prerelease\":false}"));
+            if (request.RequestUri.AbsolutePath.EndsWith("/attach_files", StringComparison.Ordinal))
+                return Task.FromResult(Json($"[{{\"name\":\"latest.json\",\"browser_download_url\":\"{GiteeManifestUrl}\"}}]"));
+            if (url == GiteeManifestUrl) return Task.FromResult(Json(Manifest("1.0.13")));
+            if (url == VersionUpdateService.DefaultManifestUrl) return Task.FromResult(Json(GithubManifest()));
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent([1, 2, 3]) });
+        }));
+        using var service = new VersionUpdateService(client);
+
+        var result = await service.CheckAsync(new Version(1, 0, 13));
+
+        Assert.IsTrue(result.Succeeded, result.Error);
+        Assert.AreEqual(new Version(1, 0, 14), result.LatestVersion);
+        Assert.IsTrue(result.IsNewVersion);
+        Assert.AreEqual(GithubArchiveUrl, result.DownloadUrl);
+        Assert.AreEqual("https://github.com/shashouaq/NetBootDhcpTool/releases/tag/v1.0.14", result.ReleasePageUrl);
+        Assert.IsTrue(requests.Contains(VersionUpdateService.DefaultManifestUrl));
     }
 
     [TestMethod]
@@ -120,6 +152,16 @@ public sealed class VersionUpdateSourceTests
           "downloadMirrors": ["{{GithubArchiveUrl}}"],
           "releasePageUrl": "https://gitee.com/joel20230302/NetBootDhcpTool/releases/tag/v1.0.14",
           "changes": ["Gitee distribution"]
+        }
+        """;
+
+    private static string GithubManifest() => $$"""
+        {
+          "version": "1.0.14",
+          "archiveName": "NetBootDhcpTool-v1.0.14.7z",
+          "archiveSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "downloadUrl": "{{GithubArchiveUrl}}",
+          "releasePageUrl": "https://github.com/shashouaq/NetBootDhcpTool/releases/tag/v1.0.14"
         }
         """;
 

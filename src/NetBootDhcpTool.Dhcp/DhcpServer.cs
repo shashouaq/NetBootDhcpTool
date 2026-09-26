@@ -15,13 +15,14 @@ public sealed class DhcpServer : IDisposable
     private readonly int _clientPort;
     private readonly IPAddress? _replyAddress;
     private readonly bool _allowUnscopedTestBinding;
+    private readonly TimeSpan _leaseSweepInterval;
     private readonly object _sync = new();
     private UdpClient? _udp;
     private CancellationTokenSource? _cts;
     private Task? _loopTask;
     private Task? _expirationTask;
 
-    public DhcpServer(ILogger logger, int listenPort = 67, int clientPort = 68, IPAddress? replyAddress = null, bool allowUnscopedTestBinding = false)
+    public DhcpServer(ILogger logger, int listenPort = 67, int clientPort = 68, IPAddress? replyAddress = null, bool allowUnscopedTestBinding = false, TimeSpan? leaseSweepInterval = null)
     {
         _logger = logger;
         if (listenPort is < 0 or > 65535) throw new ArgumentOutOfRangeException(nameof(listenPort));
@@ -30,6 +31,8 @@ public sealed class DhcpServer : IDisposable
         _clientPort = clientPort;
         _replyAddress = replyAddress;
         _allowUnscopedTestBinding = allowUnscopedTestBinding;
+        _leaseSweepInterval = leaseSweepInterval ?? TimeSpan.FromSeconds(10);
+        if (_leaseSweepInterval <= TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(leaseSweepInterval));
     }
 
     public event Action<DhcpLease>? LeaseChanged;
@@ -186,10 +189,16 @@ public sealed class DhcpServer : IDisposable
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
             catch (ObjectDisposedException) when (ct.IsCancellationRequested) { break; }
-            catch (IOException ex)
+            catch (DhcpLeasePersistenceException ex)
             {
                 if (ct.IsCancellationRequested) break;
                 StopUnexpectedly("DHCP lease journal persistence failed; the service stopped before acknowledging the request.", ex);
+                return;
+            }
+            catch (IOException ex)
+            {
+                if (ct.IsCancellationRequested) break;
+                StopUnexpectedly("DHCP socket I/O failed; the service stopped.", ex);
                 return;
             }
             catch (Exception ex)
@@ -202,7 +211,7 @@ public sealed class DhcpServer : IDisposable
 
     private async Task ExpireLeasesAsync(DhcpLeaseManager leases, CancellationToken ct)
     {
-        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(10));
+        using var timer = new PeriodicTimer(_leaseSweepInterval);
         try
         {
             while (await timer.WaitForNextTickAsync(ct)) leases.SweepExpired();
@@ -210,7 +219,8 @@ public sealed class DhcpServer : IDisposable
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
         catch (Exception ex)
         {
-            if (!ct.IsCancellationRequested) _logger.Error("DHCP lease expiry sweep failed; existing lease records remain retained", ex);
+            if (!ct.IsCancellationRequested)
+                StopUnexpectedly("DHCP lease expiry sweep failed; the service stopped with its lease records retained.", ex);
         }
     }
 

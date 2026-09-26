@@ -1,5 +1,21 @@
 # Release Notes
 
+## v1.0.15
+
+NetBoot DHCP Tool v1.0.15 hardens DHCP lease recovery and route adapter identity checks, and makes update selection and downloads easier to recover.
+
+### Changes
+
+- Stop DHCP before acknowledging a lease when its journal cannot be saved; unexpected-stop recovery waits for active network operations.
+- Verify a static-route target by stable adapter GUID immediately before writing the route.
+- Select the newest valid update manifest across Gitee and GitHub, even when one mirror is stale.
+- Fall back when a download source is idle for 30 seconds; explain and provide cancellation in the bilingual update flow.
+
+### Validation
+
+- Pinned .NET 10.0.401 Release solution build: 0 warnings/errors; MSTest: 150/150; console smoke: `OK`; non-admin WPF UI smoke: `UI_SMOKE_OK`; maintenance checks: 295 localization keys and 63/63 static help buttons.
+- Physical adapter and independent DHCP client acceptance are not included in this release's automated evidence.
+
 ## v1.0.14
 
 NetBoot DHCP Tool v1.0.14 adds Gitee release distribution for mainland users and selects the faster available update mirror after a bounded download-speed probe.

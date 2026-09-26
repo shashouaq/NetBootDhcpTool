@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## v1.0.15 / 2026-09-26
+
+- Date: 2026-09-26
+- Type: Reliability / maintenance / update usability
+- Affected files/modules: DHCP lease persistence and server, MainWindow stop/download flows and help text, static route creation, update service, focused unit and UI smoke tests, `README.md`, release documentation.
+- Concrete change: DHCP journal callback failures now consistently stop the service before ACK, including lease-expiry persistence failures; the UI reports journal errors on its dispatcher. Unexpected DHCP stop cleanup joins the network workflow gate and waits for active work. Route creation verifies the adapter's stable GUID immediately before the Windows route write. Update checks compare both release sources and choose the newer valid version; downloads fall back after 30 seconds of source inactivity, and the bilingual confirmation and toolbar explain and support cancellation.
+- Verification: Pinned .NET 10.0.401 Release solution build passed with 0 warnings/errors; MSTest 150/150; console smoke `OK`; non-admin WPF UI smoke `UI_SMOKE_OK` opened the source Release build with isolated data and covered cancellation and network-workflow serialization; maintenance check passed with 295 localization keys and 63/63 static button help coverage; `git diff --check` passed.
+- User impact: Journal write failure leaves DHCP stopped with recovery state retained; route writes reject interface-index reuse; update selection tolerates a stale mirror, and a stalled download can switch mirrors or be canceled and retried. Physical adapter, independent DHCP client, and release-host acceptance are tracked separately from these local checks.
+
 ## v1.0.14 / 2026-09-26
 
 - Type: Distribution / update fallback / T18

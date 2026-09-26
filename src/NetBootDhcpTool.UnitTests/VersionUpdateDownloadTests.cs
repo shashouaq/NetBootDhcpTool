@@ -163,7 +163,79 @@ public sealed class VersionUpdateDownloadTests
     }
 
     [TestMethod]
-    public async Task CancellationAfterPartialWriteKeepsOldTargetAndRemovesTemporaryFile()
+    public async Task IdlePreferredMirrorFallsBackAfterPartialDownload()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var destination = Path.Combine(root, "update.7z");
+            await File.WriteAllTextAsync(destination, "keep until verified");
+            var package = new byte[] { 31, 32, 33, 34, 35 };
+            var giteeUrl = "https://gitee.com/joel20230302/NetBootDhcpTool/attach_files/123";
+            var githubUrl = "https://github.com/shashouaq/NetBootDhcpTool/releases/download/v1.0.14/package.7z";
+            var stalledStream = new BlockingReadStream(package[..2]);
+            var requestedUrls = new List<string>();
+            using var client = new HttpClient(new DelegateHandler((request, _) =>
+            {
+                requestedUrls.Add(request.RequestUri!.AbsoluteUri);
+                return Task.FromResult(request.RequestUri.Host.Equals("gitee.com", StringComparison.OrdinalIgnoreCase)
+                    ? new HttpResponseMessage(HttpStatusCode.OK) { Content = new StreamContent(stalledStream) }
+                    : new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(package) });
+            }));
+            using var service = new VersionUpdateService(client, downloadIdleTimeout: TimeSpan.FromMilliseconds(200));
+
+            var download = service.DownloadAsync(UpdateFor(package, url: giteeUrl, mirrors: [githubUrl]), destination);
+            await stalledStream.SecondReadStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.AreEqual("keep until verified", await File.ReadAllTextAsync(destination));
+            var result = await download.WaitAsync(TimeSpan.FromSeconds(5));
+
+            CollectionAssert.AreEqual(new[] { giteeUrl, githubUrl }, requestedUrls);
+            Assert.AreEqual(githubUrl, result.DownloadUrl);
+            CollectionAssert.AreEqual(package, await File.ReadAllBytesAsync(destination));
+            Assert.AreEqual(0, Directory.GetFiles(root, "*.download").Length);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [TestMethod]
+    public async Task IdleResponseHeadersAlsoTriggerMirrorFallback()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            var destination = Path.Combine(root, "update.7z");
+            var package = new byte[] { 31, 32, 33 };
+            var giteeUrl = "https://gitee.com/joel20230302/NetBootDhcpTool/attach_files/123";
+            var githubUrl = "https://github.com/shashouaq/NetBootDhcpTool/releases/download/v1.0.14/package.7z";
+            var requestedUrls = new List<string>();
+            using var client = new HttpClient(new DelegateHandler(async (request, token) =>
+            {
+                requestedUrls.Add(request.RequestUri!.AbsoluteUri);
+                if (request.RequestUri.Host.Equals("gitee.com", StringComparison.OrdinalIgnoreCase))
+                    await Task.Delay(Timeout.InfiniteTimeSpan, token);
+                return new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(package) };
+            }));
+            using var service = new VersionUpdateService(client, downloadIdleTimeout: TimeSpan.FromMilliseconds(200));
+
+            var result = await service.DownloadAsync(UpdateFor(package, url: giteeUrl, mirrors: [githubUrl]), destination)
+                .WaitAsync(TimeSpan.FromSeconds(5));
+
+            CollectionAssert.AreEqual(new[] { giteeUrl, githubUrl }, requestedUrls);
+            Assert.AreEqual(githubUrl, result.DownloadUrl);
+            CollectionAssert.AreEqual(package, await File.ReadAllBytesAsync(destination));
+            Assert.AreEqual(0, Directory.GetFiles(root, "*.download").Length);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [TestMethod]
+    public async Task CancellationAfterPartialWriteKeepsOldTargetRemovesTemporaryFileAndAllowsRetry()
     {
         var root = CreateTempDirectory();
         try
@@ -171,18 +243,28 @@ public sealed class VersionUpdateDownloadTests
             var destination = Path.Combine(root, "update.7z");
             await File.WriteAllTextAsync(destination, "keep me");
             var blockingStream = new BlockingReadStream([1, 2, 3, 4]);
+            var package = new byte[] { 1, 2, 3, 4, 5 };
+            var requests = 0;
             using var client = new HttpClient(new DelegateHandler((_, _) => Task.FromResult(
-                new HttpResponseMessage(HttpStatusCode.OK) { Content = new StreamContent(blockingStream) })));
+                new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = Interlocked.Increment(ref requests) == 1
+                        ? new StreamContent(blockingStream)
+                        : new ByteArrayContent(package)
+                })));
             using var service = new VersionUpdateService(client);
             using var cancellation = new CancellationTokenSource();
 
-            var download = service.DownloadAsync(UpdateFor([1, 2, 3, 4, 5]), destination, ct: cancellation.Token);
+            var download = service.DownloadAsync(UpdateFor(package), destination, ct: cancellation.Token);
             await blockingStream.SecondReadStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
             cancellation.Cancel();
             await Assert.ThrowsExactlyAsync<TaskCanceledException>(() => download);
 
             Assert.AreEqual("keep me", await File.ReadAllTextAsync(destination));
             Assert.AreEqual(0, Directory.GetFiles(root, "*.download").Length);
+            await service.DownloadAsync(UpdateFor(package), destination);
+            CollectionAssert.AreEqual(package, await File.ReadAllBytesAsync(destination));
+            Assert.AreEqual(2, requests);
         }
         finally
         {
