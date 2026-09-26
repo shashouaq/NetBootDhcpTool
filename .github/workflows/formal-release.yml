@@ -48,6 +48,11 @@ jobs:
           git merge-base --is-ancestor $releaseCommit $mainCommit
           if ($LASTEXITCODE -ne 0) { throw 'Release tag is not contained in origin/main.' }
 
+          foreach ($requiredTagFile in @('build/publish-release.ps1', 'build/release-pipeline/ReleaseState.psm1', 'build/publish.ps1')) {
+            git cat-file -e "${releaseCommit}:$requiredTagFile"
+            if ($LASTEXITCODE -ne 0) { throw "Release tag $($env:RELEASE_TAG) does not contain required release file $requiredTagFile." }
+          }
+
           $endpoint = "repos/$env:GITHUB_REPOSITORY/actions/workflows/windows-ci.yml/runs?head_sha=$releaseCommit&status=success&per_page=100"
           $runJson = gh api $endpoint
           if ($LASTEXITCODE -ne 0) { throw 'Could not read Windows CI runs for the release commit.' }

@@ -2,13 +2,14 @@
 
 ## Unreleased
 
+## v1.0.16 / 2026-09-26
+
 - Date: 2026-09-26
 - Type: Formal release pipeline / T19
-- Affected files/modules: `.github/workflows/formal-release.yml`, `.github/workflows/windows-ci.yml`, `build/publish-release.ps1`, `build/release-pipeline/ReleaseState.psm1`, `build/tests/release-pipeline.tests.ps1`, `README.md`, `docs/MAINTENANCE_GUIDE.md`, `docs/RELEASE_PROCESS.md`, `docs/tasks/T19.md`, `docs/TODO.md`
-- Concrete change: Kept routine CI on GitHub-hosted Windows and moved formal publication behind an exact-commit CI gate to a Windows x64 self-hosted runner. The runner builds the existing `.7z` once, persists the package and Gitee attachment IDs outside the checkout, and uploads the same bytes to both Release hosts. New Releases remain draft/prerelease until both remote archives, sidecars, and dual-source manifests pass full readback. Removed the GitHub-hosted GitHub-to-Gitee large-file sync workflow. Aligned the README handoff status and maintenance release instructions with the current T19 workflow and its outstanding acceptance gate.
-- Verification: Release-state tests cover stable tag validation, local sidecar/manifest consistency, cache resume and commit binding, dual-source manifest contents, and workflow runner routing. Documentation consistency and repository maintenance checks passed. The repository currently has no registered self-hosted runner, so the formal Release workflow was not dispatched and remote end-to-end acceptance remains pending.
-- User impact: Formal releases no longer move the package from a GitHub-hosted runner to Gitee; a failed release can reuse the locally cached package and checkpointed Gitee attachment IDs. The updater keeps its current `.7z` package format and live GitHub/Gitee speed selection.
-- Status: T19 implementation and handoff documentation are locally verified; self-hosted runner and remote-release acceptance remain pending.
+- Affected files/modules: `.github/workflows/formal-release.yml`, `.github/workflows/windows-ci.yml`, `build/publish-release.ps1`, `build/release-pipeline/ReleaseState.psm1`, `build/tests/release-pipeline.tests.ps1`, `src/NetBootDhcpTool.App/NetBootDhcpTool.App.csproj`, `README.md`, `docs/MAINTENANCE_GUIDE.md`, `docs/RELEASE_PROCESS.md`, `docs/RELEASE_NOTES.md`, `docs/tasks/T19.md`, `docs/TODO.md`
+- Concrete change: Kept routine CI on GitHub-hosted Windows and moved formal publication behind an exact-commit CI gate to a Windows x64 self-hosted runner. The runner builds the existing `.7z` once, persists the package and Gitee attachment IDs outside the checkout, and uploads the same bytes to both Release hosts. New Releases remain draft/prerelease until both remote archives, sidecars, and dual-source manifests pass full readback. Removed the GitHub-hosted GitHub-to-Gitee large-file sync workflow. The hosted gate now rejects tags that lack the publisher files. Bumped the package version to 1.0.16 for the first end-to-end validation of this release path.
+- Verification: The PowerShell release-pipeline regression passed for stable-tag validation, legacy-tag preflight, local sidecar/manifest consistency, cache resume and commit binding, Gitee attachment checkpoints, dual-source manifests, and runner routing. Maintenance checks passed with 295 localization keys and 63/63 static help buttons. Exact-commit Windows CI and full remote archive/manifest readback remain mandatory publication gates.
+- User impact: The existing `.7z` updater format and GitHub/Gitee speed selection remain unchanged. Version 1.0.16 validates a release path that builds once on the registered Windows runner and reuses the cached package and checkpointed Gitee attachment IDs on same-tag retries.
 
 ## v1.0.15 / 2026-09-26
 

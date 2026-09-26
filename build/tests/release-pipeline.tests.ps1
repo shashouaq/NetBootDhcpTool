@@ -88,6 +88,7 @@ try {
     if ($formalWorkflow -match '(?m)^  release:') { throw 'Formal Release must not automatically start after an asset has already been published.' }
     if ($formalWorkflow -notmatch '(?ms)  verify-ci:.*?runs-on: windows-latest') { throw 'Exact-commit validation must remain on a GitHub-hosted runner.' }
     if ($formalWorkflow -notmatch '(?ms)  publish:.*?runs-on: \[self-hosted, windows, x64, netboot-release\]') { throw 'Release publication must use the dedicated Windows x64 release runner.' }
+    if ($formalWorkflow -notmatch 'git cat-file -e "\$\{releaseCommit\}:\$requiredTagFile"') { throw 'The CI gate must reject legacy tags that do not contain the publisher used by the release job.' }
     if ($formalWorkflow -notmatch 'build[\\/]publish-release\.ps1') { throw 'Formal Release must invoke the idempotent local publisher.' }
     if ($windowsWorkflow -notmatch '(?m)^    runs-on: windows-latest') { throw 'Day-to-day CI must remain on GitHub-hosted Windows.' }
     $publisher = Get-Content -Raw -LiteralPath (Join-Path $repoRoot 'build\publish-release.ps1')

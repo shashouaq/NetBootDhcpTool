@@ -1,5 +1,16 @@
 # Release Notes
 
+## v1.0.16
+
+NetBoot DHCP Tool v1.0.16 validates the new formal release path while preserving the existing portable archive format and update behavior.
+
+### Changes
+
+- Build the `.7z` package once on a dedicated Windows x64 runner and publish the identical archive and SHA-256 sidecar to GitHub and Gitee.
+- Verify remote archive bytes, checksum files, and update manifests before making either Release stable.
+- Resume a same-tag retry from its persistent package and Gitee attachment checkpoints without rebuilding or duplicating verified assets.
+- No DHCP, adapter, route, or update-selection behavior changes in this version.
+
 ## v1.0.15
 
 NetBoot DHCP Tool v1.0.15 hardens DHCP lease recovery and route adapter identity checks, and makes update selection and downloads easier to recover.
