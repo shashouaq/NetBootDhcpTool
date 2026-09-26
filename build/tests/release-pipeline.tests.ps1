@@ -120,9 +120,12 @@ try {
         $formalWorkflow -notmatch 'PUBLISHER_COMMIT: \$\{\{ needs\.verify-ci\.outputs\.publisher_commit \}\}') {
         throw 'The current publisher commit and the release tag commit must each have a successful exact-main push CI run before publication.'
     }
-    $publishTimeout = [regex]::Match($formalWorkflow, '(?m)^    timeout-minutes: (\d+)$')
-    if (-not $publishTimeout.Success -or [int]$publishTimeout.Groups[1].Value -gt 30) {
-        throw 'The self-hosted publish job must fail within 30 minutes if a platform or credential operation hangs.'
+    $workflowLf = $formalWorkflow.Replace("`r`n", "`n")
+    foreach ($workflowText in @($workflowLf, $workflowLf.Replace("`n", "`r`n"))) {
+        $publishTimeout = [regex]::Match($workflowText, '(?m)^    timeout-minutes: (\d+)\r?$')
+        if (-not $publishTimeout.Success -or [int]$publishTimeout.Groups[1].Value -gt 30) {
+            throw 'The self-hosted publish job must fail within 30 minutes if a platform or credential operation hangs.'
+        }
     }
     $publisherSourceSetup = $formalWorkflow.IndexOf('Load release tooling from the workflow commit', [System.StringComparison]::Ordinal)
     $publisherInvocation = $formalWorkflow.IndexOf('.\build\publish-release.ps1', [System.StringComparison]::Ordinal)
