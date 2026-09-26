@@ -19,6 +19,48 @@ function Get-ReleaseArchiveName {
     return "NetBootDhcpTool-$Tag.7z"
 }
 
+function Test-SuccessfulMainWindowsCiRun {
+    [CmdletBinding()]
+    param(
+        [AllowNull()][object[]]$Runs,
+        [Parameter(Mandatory)][string]$Commit
+    )
+
+    if ($Commit -notmatch '^[a-fA-F0-9]{40}$') { throw 'CI evidence requires a full Git SHA.' }
+    foreach ($run in $Runs) {
+        if ($null -ne $run -and
+            [string]$run.head_sha -ceq $Commit -and
+            [string]$run.event -ceq 'push' -and
+            [string]$run.head_branch -ceq 'main' -and
+            [string]$run.conclusion -ceq 'success') {
+            return $true
+        }
+    }
+    return $false
+}
+
+function New-GiteeReleasePayload {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidateSet('Create', 'Update', 'Publish')][string]$Operation,
+        [Parameter(Mandatory)][string]$Tag,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Body,
+        [string]$TargetCommit
+    )
+
+    $null = Get-ReleaseVersionFromTag $Tag
+    $payload = [ordered]@{ tag_name = $Tag; name = $Name; body = $Body }
+    if ($Operation -ceq 'Create') {
+        if ($TargetCommit -notmatch '^[a-fA-F0-9]{40}$') { throw 'Gitee Release target must be a full Git SHA.' }
+        $payload.target_commitish = $TargetCommit.ToLowerInvariant()
+        $payload.prerelease = $true
+    } elseif ($Operation -ceq 'Publish') {
+        $payload.prerelease = $false
+    }
+    return $payload
+}
+
 function Get-ReleaseFileSha256 {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Path)
@@ -234,4 +276,4 @@ function New-DualSourceManifest {
     return $manifest
 }
 
-Export-ModuleMember -Function Get-ReleaseVersionFromTag, Get-ReleaseArchiveName, Get-ReleaseFileSha256, Assert-SafeGiteeDownloadUrl, Get-ReleaseBundle, New-ReleaseState, Save-ReleaseState, Read-ReleaseState, Assert-ReleaseCachePolicy, Save-GiteeAttachmentCheckpoint, New-DualSourceManifest
+Export-ModuleMember -Function Get-ReleaseVersionFromTag, Get-ReleaseArchiveName, Test-SuccessfulMainWindowsCiRun, New-GiteeReleasePayload, Get-ReleaseFileSha256, Assert-SafeGiteeDownloadUrl, Get-ReleaseBundle, New-ReleaseState, Save-ReleaseState, Read-ReleaseState, Assert-ReleaseCachePolicy, Save-GiteeAttachmentCheckpoint, New-DualSourceManifest

@@ -223,13 +223,8 @@ function Ensure-GiteeRelease {
     $createdByPipeline = $false
     if ($null -eq $release) {
         $mainCommit = (Invoke-GitChecked -Arguments @('rev-parse', 'refs/remotes/origin/main')).Trim()
-        $payload = [ordered]@{
-            tag_name = $Tag
-            name = "NetBoot DHCP Tool $Tag"
-            body = [string]$BaseManifest.releaseNotes
-            target_commitish = $mainCommit
-            prerelease = $true
-        }
+        $payload = New-GiteeReleasePayload -Operation Create -Tag $Tag -Name "NetBoot DHCP Tool $Tag" `
+            -Body ([string]$BaseManifest.releaseNotes) -TargetCommit $mainCommit
         try {
             $created = Invoke-GiteeJsonRequest -Uri "https://gitee.com/api/v5/repos/$GiteeOwner/$GiteeRepository/releases" -Method Post -Payload $payload
         } catch { throw 'Gitee Release creation failed; rerunning this tag is safe.' }
@@ -259,7 +254,7 @@ function Ensure-GiteeRelease {
     $normalizedCurrentBody = ([string]$release.body -replace "`r`n?", "`n").TrimEnd()
     $normalizedExpectedBody = ($expectedBody -replace "`r`n?", "`n").TrimEnd()
     if ([string]$release.name -cne $expectedName -or $normalizedCurrentBody -cne $normalizedExpectedBody) {
-        $payload = [ordered]@{ tag_name = $Tag; name = $expectedName; body = $expectedBody }
+        $payload = New-GiteeReleasePayload -Operation Update -Tag $Tag -Name $expectedName -Body $expectedBody
         try {
             $update = Invoke-GiteeJsonRequest -Uri "https://gitee.com/api/v5/repos/$GiteeOwner/$GiteeRepository/releases/$releaseId" -Method Patch -Payload $payload
         } catch { throw 'Gitee Release metadata update failed; no existing assets were removed.' }
@@ -580,12 +575,7 @@ function Get-OrCreateGitHubRelease {
 function Publish-GiteeRelease([System.Collections.IDictionary]$Release) {
     if (-not [bool]$Release.prerelease) { return $Release }
     $releaseId = [long]$Release.id
-    $payload = [ordered]@{
-        tag_name = $Tag
-        name = [string]$Release.name
-        body = [string]$Release.body
-        prerelease = $false
-    }
+    $payload = New-GiteeReleasePayload -Operation Publish -Tag $Tag -Name ([string]$Release.name) -Body ([string]$Release.body)
     try {
         $response = Invoke-GiteeJsonRequest -Uri "https://gitee.com/api/v5/repos/$GiteeOwner/$GiteeRepository/releases/$releaseId" -Method Patch -Payload $payload
     } catch { throw 'Could not mark the fully verified Gitee Release as stable.' }

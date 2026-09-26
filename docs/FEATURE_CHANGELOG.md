@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Date: 2026-09-26
+- Type: Formal release guardrails / T19 follow-up
+- Affected files/modules: `.github/workflows/formal-release.yml`, `build/publish-release.ps1`, `build/release-pipeline/ReleaseState.psm1`, `build/tests/release-pipeline.tests.ps1`, `docs/RELEASE_PROCESS.md`
+- Concrete change: Require successful `main` push Windows CI for both the immutable application tag commit and the exact publisher/workflow commit before the self-hosted job starts. Build Gitee create/update/publish payloads through one checked field contract, including the required create fields that previously caused HTTP 400. Bound the self-hosted publish job to 30 minutes so a blocked credential or platform operation cannot run for hours.
+- Verification: The new CI-evidence regression failed against the old helper set, then `build/tests/release-pipeline.tests.ps1` passed after the fix. The CI-evidence helper accepted the actual GitHub Actions API records for the v1.0.16 tag and publisher commits. `build/verify-maintenance.ps1` passed (`295` localization keys, `63/63` static help buttons); changed PowerShell files and workflow YAML parsed, and `git diff --check` passed. This entry records local checks; the change has not yet run through remote Windows CI.
+- User impact: Future formal releases reject untested publisher changes before creating or uploading Release assets, and Gitee Release requests keep their required JSON fields across all publication states.
+
 ## v1.0.16 / 2026-09-26
 
 - Date: 2026-09-26

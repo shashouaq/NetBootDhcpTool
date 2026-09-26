@@ -23,6 +23,7 @@ jobs:
     runs-on: windows-latest
     outputs:
       release_commit: ${{ steps.verify.outputs.release_commit }}
+      publisher_commit: ${{ steps.verify.outputs.publisher_commit }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -43,33 +44,43 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Could not fetch main and release tags.' }
           $releaseCommit = (git rev-parse "refs/tags/$($env:RELEASE_TAG)^{commit}").Trim()
           if ($LASTEXITCODE -ne 0) { throw "Release tag $($env:RELEASE_TAG) does not exist on GitHub." }
+          $publisherCommit = [string]$env:GITHUB_SHA
+          if ($publisherCommit -notmatch '^[a-fA-F0-9]{40}$') { throw 'Workflow publisher commit is not a full Git SHA.' }
+          $publisherCommit = $publisherCommit.ToLowerInvariant()
           $mainCommit = (git rev-parse 'refs/remotes/origin/main').Trim()
           if ($LASTEXITCODE -ne 0) { throw 'Could not resolve origin/main.' }
           git merge-base --is-ancestor $releaseCommit $mainCommit
           if ($LASTEXITCODE -ne 0) { throw 'Release tag is not contained in origin/main.' }
+          git merge-base --is-ancestor $publisherCommit $mainCommit
+          if ($LASTEXITCODE -ne 0) { throw 'Workflow publisher commit is not contained in origin/main.' }
 
           foreach ($requiredTagFile in @('build/publish-release.ps1', 'build/release-pipeline/ReleaseState.psm1', 'build/publish.ps1')) {
             git cat-file -e "${releaseCommit}:$requiredTagFile"
             if ($LASTEXITCODE -ne 0) { throw "Release tag $($env:RELEASE_TAG) does not contain required release file $requiredTagFile." }
+            git cat-file -e "${publisherCommit}:$requiredTagFile"
+            if ($LASTEXITCODE -ne 0) { throw "Workflow publisher commit does not contain required release file $requiredTagFile." }
           }
 
-          $endpoint = "repos/$env:GITHUB_REPOSITORY/actions/workflows/windows-ci.yml/runs?head_sha=$releaseCommit&status=success&per_page=100"
-          $runJson = gh api $endpoint
-          if ($LASTEXITCODE -ne 0) { throw 'Could not read Windows CI runs for the release commit.' }
-          $runs = $runJson | ConvertFrom-Json
-          $hasPassingPush = @($runs.workflow_runs | Where-Object {
-            $_.head_sha -ceq $releaseCommit -and $_.event -ceq 'push' -and $_.head_branch -ceq 'main' -and $_.conclusion -ceq 'success'
-          }).Count -gt 0
-          if (-not $hasPassingPush) { throw "Windows CI has no successful main push run for exact commit $releaseCommit." }
+          Import-Module .\build\release-pipeline\ReleaseState.psm1 -Force
+          foreach ($requiredCommit in @($releaseCommit, $publisherCommit) | Select-Object -Unique) {
+            $endpoint = "repos/$env:GITHUB_REPOSITORY/actions/workflows/windows-ci.yml/runs?head_sha=$requiredCommit&status=success&per_page=100"
+            $runJson = gh api $endpoint
+            if ($LASTEXITCODE -ne 0) { throw "Could not read Windows CI runs for commit $requiredCommit." }
+            $runs = $runJson | ConvertFrom-Json
+            if (-not (Test-SuccessfulMainWindowsCiRun -Runs @($runs.workflow_runs) -Commit $requiredCommit)) {
+              throw "Windows CI has no successful main push run for exact commit $requiredCommit."
+            }
+          }
 
           "release_commit=$releaseCommit" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          Write-Host "Release tag $($env:RELEASE_TAG) resolves to CI-verified commit $releaseCommit."
+          "publisher_commit=$publisherCommit" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "Release tag $($env:RELEASE_TAG) and publisher $publisherCommit both have successful exact-commit Windows CI."
 
   publish:
     name: Build once and publish both mirrors
     needs: verify-ci
     runs-on: [self-hosted, windows, x64, netboot-release]
-    timeout-minutes: 180
+    timeout-minutes: 30
     permissions:
       contents: write
     steps:
@@ -81,7 +92,7 @@ jobs:
       - name: Load release tooling from the workflow commit
         shell: pwsh
         env:
-          PUBLISHER_COMMIT: ${{ github.sha }}
+          PUBLISHER_COMMIT: ${{ needs.verify-ci.outputs.publisher_commit }}
         run: |
           if ($env:PUBLISHER_COMMIT -notmatch '^[a-fA-F0-9]{40}$') { throw 'Workflow publisher commit is not a full Git SHA.' }
           git fetch origin $env:PUBLISHER_COMMIT --no-tags
