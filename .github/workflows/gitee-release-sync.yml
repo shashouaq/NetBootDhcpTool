@@ -3,17 +3,23 @@ name: Sync Gitee Release
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing stable release tag to synchronize
+        required: true
+        type: string
 
 permissions:
   contents: write
 
 concurrency:
-  group: gitee-release-${{ github.event.release.tag_name }}
+  group: gitee-release-${{ github.event.release.tag_name || inputs.release_tag }}
   cancel-in-progress: false
 
 jobs:
   sync-release:
-    if: github.event.release.prerelease == false
+    if: github.event_name == 'workflow_dispatch' || github.event.release.prerelease == false
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
@@ -24,7 +30,7 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
         run: |
           $assetDirectory = Join-Path $env:RUNNER_TEMP ("gitee-release-" + [guid]::NewGuid().ToString("N"))
           New-Item -ItemType Directory -Path $assetDirectory | Out-Null
@@ -37,5 +43,5 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
         run: .\build\sync-gitee-release.ps1 -Tag $env:RELEASE_TAG -AssetsDirectory $env:GITEE_ASSETS

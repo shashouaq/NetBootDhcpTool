@@ -87,19 +87,27 @@ finally {
 $releaseTagPath = [uri]::EscapeDataString($Tag)
 $releaseLookupUri = "$giteeApiRepository/releases/tags/$releaseTagPath"
 $releaseLookup = Invoke-WebRequest -Uri $releaseLookupUri -Method Get -SkipHttpErrorCheck -TimeoutSec 30
+$releaseId = 0
 if ($releaseLookup.StatusCode -eq 200) {
-    $giteeRelease = $releaseLookup.Content | ConvertFrom-Json
-    $releaseId = [long]$giteeRelease.id
-    $releaseUri = "$giteeApiRepository/releases/$releaseId"
-    $updateForm = @{
-        access_token = $token
-        tag_name = $Tag
-        name = if ([string]::IsNullOrWhiteSpace($githubRelease.name)) { "NetBoot DHCP Tool $Tag" } else { $githubRelease.name }
-        body = [string]$githubRelease.body
+    try { $giteeRelease = $releaseLookup.Content | ConvertFrom-Json -ErrorAction Stop }
+    catch { throw 'Gitee Release lookup returned invalid JSON.' }
+    if ($null -ne $giteeRelease -and $null -ne $giteeRelease.id -and [long]$giteeRelease.id -gt 0) {
+        $releaseId = [long]$giteeRelease.id
+        $releaseUri = "$giteeApiRepository/releases/$releaseId"
+        $updateForm = @{
+            access_token = $token
+            tag_name = $Tag
+            name = if ([string]::IsNullOrWhiteSpace($githubRelease.name)) { "NetBoot DHCP Tool $Tag" } else { $githubRelease.name }
+            body = [string]$githubRelease.body
+        }
+        $releaseUpdate = Invoke-WebRequest -Uri $releaseUri -Method Patch -Form $updateForm -SkipHttpErrorCheck -TimeoutSec 30
+        if ($releaseUpdate.StatusCode -notin @(200, 201)) { throw "Gitee Release metadata update failed with HTTP $($releaseUpdate.StatusCode)." }
     }
-    $releaseUpdate = Invoke-WebRequest -Uri $releaseUri -Method Patch -Form $updateForm -SkipHttpErrorCheck -TimeoutSec 30
-    if ($releaseUpdate.StatusCode -notin @(200, 201)) { throw "Gitee Release metadata update failed with HTTP $($releaseUpdate.StatusCode)." }
-} elseif ($releaseLookup.StatusCode -eq 404) {
+} elseif ($releaseLookup.StatusCode -ne 404) {
+    throw "Gitee Release lookup failed with HTTP $($releaseLookup.StatusCode)."
+}
+
+if ($releaseId -le 0) {
     $createForm = @{
         access_token = $token
         tag_name = $Tag
@@ -112,8 +120,6 @@ if ($releaseLookup.StatusCode -eq 200) {
     if ($releaseCreate.StatusCode -notin @(200, 201)) { throw "Gitee Release creation failed with HTTP $($releaseCreate.StatusCode)." }
     $giteeRelease = $releaseCreate.Content | ConvertFrom-Json
     $releaseId = [long]$giteeRelease.id
-} else {
-    throw "Gitee Release lookup failed with HTTP $($releaseLookup.StatusCode)."
 }
 if ($releaseId -le 0) { throw 'Gitee returned an invalid Release ID.' }
 
