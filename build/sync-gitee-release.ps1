@@ -144,13 +144,24 @@ function Add-GiteeAttachment([string]$Path) {
     $assetTimer = [System.Diagnostics.Stopwatch]::StartNew()
     Write-Host "[Gitee] Uploading Release asset '$($asset.Name)' ($($asset.Length) bytes; timeout 900s)."
     $form = @{ access_token = $token; file = $asset }
+    $headers = @{ Authorization = "Bearer $token" }
     try {
-        $response = Invoke-RestMethod -Uri "$giteeApiRepository/releases/$releaseId/attach_files" -Method Post -Form $form -TimeoutSec 900
+        $uploadResponse = Invoke-WebRequest -Uri "$giteeApiRepository/releases/$releaseId/attach_files" -Method Post -Form $form -Headers $headers -SkipHttpErrorCheck -TimeoutSec 900
     } catch {
         $assetTimer.Stop()
-        throw "Gitee Release asset upload failed or timed out after $([int]$assetTimer.Elapsed.TotalSeconds)s for '$($asset.Name)' ($($asset.Length) bytes). Check the Gitee Release attachment list before retrying."
+        $errorMessage = $_.Exception.Message
+        if (-not [string]::IsNullOrWhiteSpace($token)) { $errorMessage = $errorMessage.Replace($token, '[REDACTED]') }
+        throw "Gitee Release asset upload transport failed after $([int]$assetTimer.Elapsed.TotalSeconds)s for '$($asset.Name)' ($($asset.Length) bytes): $errorMessage Check the Gitee Release attachment list before retrying."
     }
     $assetTimer.Stop()
+    if ($uploadResponse.StatusCode -notin @(200, 201)) {
+        $errorBody = [string]$uploadResponse.Content
+        if (-not [string]::IsNullOrWhiteSpace($token)) { $errorBody = $errorBody.Replace($token, '[REDACTED]') }
+        if ($errorBody.Length -gt 400) { $errorBody = $errorBody.Substring(0, 400) }
+        throw "Gitee Release asset upload returned HTTP $($uploadResponse.StatusCode) for '$($asset.Name)' after $([int]$assetTimer.Elapsed.TotalSeconds)s. Response: $errorBody"
+    }
+    try { $response = $uploadResponse.Content | ConvertFrom-Json -ErrorAction Stop }
+    catch { throw "Gitee Release asset upload returned invalid JSON for '$($asset.Name)'." }
     if ($response.name -ne (Split-Path -Leaf $Path) -or [string]::IsNullOrWhiteSpace($response.browser_download_url)) {
         throw "Gitee did not return a usable attachment for $($asset.Name)."
     }
