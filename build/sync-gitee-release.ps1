@@ -139,6 +139,12 @@ function Remove-GiteeAttachment([object]$Attachment) {
     if ($deleteResult.StatusCode -ne 204) { throw "Could not remove Gitee attachment '$($Attachment.name)' (HTTP $($deleteResult.StatusCode))." }
 }
 
+function ConvertFrom-GiteeAttachmentContent([object]$Content) {
+    if ($null -eq $Content) { return '' }
+    if ($Content -is [byte[]]) { return [System.Text.Encoding]::UTF8.GetString($Content) }
+    return [string]$Content
+}
+
 $replaceNames = @("${archiveName}.sha256", 'latest.json')
 foreach ($attachment in $existingAttachments | Where-Object { $_.name -in $replaceNames }) {
     Remove-GiteeAttachment $attachment
@@ -269,7 +275,8 @@ if ($remoteArchiveHash -ne $localArchiveHash) {
     throw "Gitee archive readback SHA-256 mismatch for ${Tag}; the mismatched attachment was removed."
 }
 $remoteSidecarContent = Invoke-WebRequest -Uri $giteeChecksum.browser_download_url -TimeoutSec 30
-$remoteSidecarHash = ($remoteSidecarContent.Content.Trim().Split(' ')[0]).ToLowerInvariant()
+$remoteSidecarText = ConvertFrom-GiteeAttachmentContent $remoteSidecarContent.Content
+$remoteSidecarHash = ($remoteSidecarText.Trim().Split(' ')[0]).ToLowerInvariant()
 if ($remoteSidecarHash -ne $localArchiveHash) { throw "Gitee checksum sidecar readback mismatch for ${Tag}." }
 $giteeManifest = Add-GiteeAttachment $manifestPath
 $remoteAttachments = Invoke-RestMethod -Uri $attachmentsUri -Method Get -TimeoutSec 30
@@ -278,7 +285,8 @@ if ($null -eq $remoteManifestAsset -or [long]$remoteManifestAsset.size -ne [long
     throw 'Gitee latest.json attachment size readback failed.'
 }
 $remoteManifestContent = Invoke-WebRequest -Uri $giteeManifest.browser_download_url -TimeoutSec 30
-$remoteManifest = $remoteManifestContent.Content | ConvertFrom-Json
+$remoteManifestText = ConvertFrom-GiteeAttachmentContent $remoteManifestContent.Content
+$remoteManifest = $remoteManifestText | ConvertFrom-Json
 if ($remoteManifest.version -ne $version -or $remoteManifest.archiveSha256 -ne $localArchiveHash -or $remoteManifest.downloadUrl -ne $giteeArchive.browser_download_url) {
     throw "Gitee latest.json readback does not match Gitee archive ${Tag}."
 }
