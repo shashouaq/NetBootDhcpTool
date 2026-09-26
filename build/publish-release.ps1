@@ -120,6 +120,14 @@ function Test-DownloadedAsset {
     }
 }
 
+function Assert-ReleaseAssetFileName {
+    param([Parameter(Mandatory)][string]$LocalPath, [Parameter(Mandatory)][string]$Name)
+
+    if ([System.IO.Path]::GetFileName($LocalPath) -cne $Name) {
+        throw "The local asset filename must match the remote asset name '$Name'."
+    }
+}
+
 function Download-GitHubAsset([string]$Name, [string]$DestinationDirectory) {
     New-Item -ItemType Directory -Path $DestinationDirectory -Force | Out-Null
     $result = Invoke-Gh -Arguments @('release', 'download', $Tag, '--repo', $GitHubRepository, '--pattern', $Name, '--dir', $DestinationDirectory)
@@ -135,6 +143,7 @@ function Ensure-GitHubAsset {
         [Parameter(Mandatory)][string]$ArchiveSha256
     )
 
+    Assert-ReleaseAssetFileName -LocalPath $LocalPath -Name $Name
     $asset = Get-GitHubAsset $Name
     if ($null -ne $asset) {
         if ([long]$asset.size -ne [long](Get-Item -LiteralPath $LocalPath).Length) {
@@ -449,6 +458,7 @@ function Ensure-GiteeAsset {
         [Parameter(Mandatory)][string]$ArchiveSha256
     )
 
+    Assert-ReleaseAssetFileName -LocalPath $LocalPath -Name $Name
     $record = $script:releaseState.giteeAssets[$Name]
     if ($null -ne $record -and -not [string]::IsNullOrWhiteSpace([string]$record.attachmentId)) {
         $id = [long]$record.attachmentId
@@ -677,7 +687,9 @@ Ensure-GiteeAsset -LocalPath $bundle.ArchivePath -Name $bundle.ArchiveName -Arch
 # latest.json is created only after both remote archive and checksum pairs pass full readback.
 $giteeArchiveUrl = Get-GiteeArchiveDownloadUrl
 $giteeReleasePageUrl = Get-GiteeReleasePageUrl
-$finalManifestPath = Join-Path $stateDirectory 'final-latest.json'
+$finalManifestDirectory = Join-Path $stateDirectory 'final-manifest'
+New-Item -ItemType Directory -Path $finalManifestDirectory -Force | Out-Null
+$finalManifestPath = Join-Path $finalManifestDirectory 'latest.json'
 $finalManifest = New-DualSourceManifest -BaseManifestPath $bundle.ManifestPath -Tag $Tag -GitHubRepository $GitHubRepository -GiteeReleasePageUrl $giteeReleasePageUrl -GiteeArchiveDownloadUrl $giteeArchiveUrl -OutputPath $finalManifestPath
 $finalManifestBundleHash = Get-ReleaseFileSha256 $finalManifestPath
 

@@ -125,6 +125,10 @@ try {
         $publisher -notmatch 'Invoke-GiteeJsonRequest -Uri .*?/releases" -Method Post') {
         throw 'Gitee Release create/update calls must send a JSON request body so the API receives its required fields.'
     }
+    if ($publisher -notmatch 'function Assert-ReleaseAssetFileName' -or
+        $publisher -notmatch 'Join-Path \$finalManifestDirectory ''latest\.json''') {
+        throw 'Every remote asset must be uploaded using the exact filename clients request, including latest.json.'
+    }
     if ($publisher -notmatch "'--draft'") { throw 'GitHub Release must remain draft until final verification.' }
     if ($publisher -notmatch 'prerelease\s*=\s*\$true') { throw 'Gitee Release must remain prerelease until final verification.' }
     if ($publisher -notmatch 'prerelease\s*=\s*\$false') { throw 'Gitee Release must be promoted only after final verification.' }
