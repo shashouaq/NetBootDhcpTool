@@ -8,9 +8,9 @@ Windows portable IPv4 DHCP, adapter IP configuration, IPv4/IPv6 static route rul
 
 ## Maintenance Entry / 维护入口
 
-Start with the [maintenance guide](docs/MAINTENANCE_GUIDE.md), then read only the selected [approved work item](docs/TODO.md) and its source references. [PROJECT_MEMORY.md](PROJECT_MEMORY.md) holds stable product/network boundaries; the [release process](docs/RELEASE_PROCESS.md) owns publication steps. The [change log](docs/FEATURE_CHANGELOG.md) records completed changes, not future work. T01-T18 are complete; T19's release pipeline is implemented and its dedicated runner is registered. The [work-item index](docs/TODO.md) is the source for current status and remaining remote acceptance.
+Start with the [maintenance guide](docs/MAINTENANCE_GUIDE.md), then read only the selected [approved work item](docs/TODO.md) and its source references. [PROJECT_MEMORY.md](PROJECT_MEMORY.md) holds stable product/network boundaries; the [release process](docs/RELEASE_PROCESS.md) owns publication steps. The [change log](docs/FEATURE_CHANGELOG.md) records completed changes, not future work. T01-T19 are complete; v1.0.16 passed dual-host verification and a same-tag idempotent retry. The [work-item index](docs/TODO.md) is the source for current status and remaining remote acceptance.
 
-维护顺序：维护指南 → 待办索引 → 单个任务及相关代码。T01-T18 已完成；T19 发布链路已实现并注册专用 Runner，双端远端发布和幂等重跑验收仍待完成。当前状态和阻塞原因以[待办索引](docs/TODO.md)为准。无需每次读取全部任务或历史日志。仅明确授权“发布/release”后才能提交、推送或发布。
+维护顺序：维护指南 → 待办索引 → 单个任务及相关代码。T01-T19 已完成；v1.0.16 已通过双端远端校验和同标签幂等重跑。当前状态和剩余事项以[待办索引](docs/TODO.md)为准。无需每次读取全部任务或历史日志。仅明确授权“发布/release”后才能提交、推送或发布。
 
 At startup, the application claims a system-wide mutex keyed by the normalized full data-directory path before it migrates legacy files, creates defaults, or reads recovery journals. The owner keeps the mutex through asynchronous exit cleanup. A second process shows a bilingual notice and exits without changing shared files; an abnormal exit releases the mutex so a later run can inspect the preserved recovery data.
 
