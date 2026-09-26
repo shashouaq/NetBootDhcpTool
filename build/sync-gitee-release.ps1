@@ -138,16 +138,26 @@ foreach ($attachment in $existingAttachments | Where-Object { $_.name -in $wante
 }
 
 function Add-GiteeAttachment([string]$Path) {
-    $form = @{ access_token = $token; file = Get-Item -LiteralPath $Path }
-    $response = Invoke-RestMethod -Uri "$giteeApiRepository/releases/$releaseId/attach_files" -Method Post -Form $form -TimeoutSec 180
-    if ($response.name -ne (Split-Path -Leaf $Path) -or [string]::IsNullOrWhiteSpace($response.browser_download_url)) {
-        throw "Gitee did not return a usable attachment for $(Split-Path -Leaf $Path)."
+    $asset = Get-Item -LiteralPath $Path
+    $assetTimer = [System.Diagnostics.Stopwatch]::StartNew()
+    Write-Host "[Gitee] Uploading Release asset '$($asset.Name)' ($($asset.Length) bytes; timeout 900s)."
+    $form = @{ access_token = $token; file = $asset }
+    try {
+        $response = Invoke-RestMethod -Uri "$giteeApiRepository/releases/$releaseId/attach_files" -Method Post -Form $form -TimeoutSec 900
+    } catch {
+        $assetTimer.Stop()
+        throw "Gitee Release asset upload failed or timed out after $([int]$assetTimer.Elapsed.TotalSeconds)s for '$($asset.Name)' ($($asset.Length) bytes). Check the Gitee Release attachment list before retrying."
     }
+    $assetTimer.Stop()
+    if ($response.name -ne (Split-Path -Leaf $Path) -or [string]::IsNullOrWhiteSpace($response.browser_download_url)) {
+        throw "Gitee did not return a usable attachment for $($asset.Name)."
+    }
+    Write-Host "[Gitee] Uploaded Release asset '$($asset.Name)' in $([int]$assetTimer.Elapsed.TotalSeconds)s."
     return $response
 }
 
-$giteeArchive = Add-GiteeAttachment $archivePath
 $giteeChecksum = Add-GiteeAttachment $checksumPath
+$giteeArchive = Add-GiteeAttachment $archivePath
 $manifest.downloadUrl = [string]$giteeArchive.browser_download_url
 $manifest.downloadMirrors = @("https://github.com/$GitHubRepository/releases/download/$Tag/$archiveName")
 $manifest.releasePageUrl = "$giteeWebRepository/releases/tag/$releaseTagPath"
@@ -169,7 +179,11 @@ foreach ($assetName in $expectedAssets.Keys) {
 }
 
 $remoteArchivePath = Join-Path $AssetsDirectory ("gitee-readback-$archiveName")
-Invoke-WebRequest -Uri $giteeArchive.browser_download_url -OutFile $remoteArchivePath -TimeoutSec 300
+$readbackTimer = [System.Diagnostics.Stopwatch]::StartNew()
+Write-Host "[Gitee] Downloading uploaded archive for full SHA-256 verification (timeout 900s)."
+Invoke-WebRequest -Uri $giteeArchive.browser_download_url -OutFile $remoteArchivePath -TimeoutSec 900
+$readbackTimer.Stop()
+Write-Host "[Gitee] Archive readback download completed in $([int]$readbackTimer.Elapsed.TotalSeconds)s."
 $remoteArchiveHash = (Get-FileHash -LiteralPath $remoteArchivePath -Algorithm SHA256).Hash.ToLowerInvariant()
 Remove-Item -LiteralPath $remoteArchivePath -Force
 if ($remoteArchiveHash -ne $localArchiveHash) { throw "Gitee archive readback SHA-256 mismatch for ${Tag}." }
