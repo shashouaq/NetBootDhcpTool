@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Date: 2026-09-26
+- Type: Formal release pipeline / T19
+- Affected files/modules: `.github/workflows/formal-release.yml`, `.github/workflows/windows-ci.yml`, `build/publish-release.ps1`, `build/release-pipeline/ReleaseState.psm1`, `build/tests/release-pipeline.tests.ps1`, `docs/RELEASE_PROCESS.md`, `docs/tasks/T19.md`, `docs/TODO.md`
+- Concrete change: Kept routine CI on GitHub-hosted Windows and moved formal publication behind an exact-commit CI gate to a Windows x64 self-hosted runner. The runner builds the existing `.7z` once, persists the package and Gitee attachment IDs outside the checkout, and uploads the same bytes to both Release hosts. New Releases remain draft/prerelease until both remote archives, sidecars, and dual-source manifests pass full readback. Removed the GitHub-hosted GitHub-to-Gitee large-file sync workflow.
+- Verification: Release-state tests cover stable tag validation, local sidecar/manifest consistency, cache resume and commit binding, dual-source manifest contents, and workflow runner routing. The repository currently has no registered self-hosted runner, so the formal Release workflow was not dispatched and remote end-to-end acceptance remains pending.
+- User impact: Formal releases no longer move the package from a GitHub-hosted runner to Gitee; a failed release can reuse the locally cached package and checkpointed Gitee attachment IDs. The updater keeps its current `.7z` package format and live GitHub/Gitee speed selection.
+- Status: T19 implementation is ready for CI; self-hosted runner and remote-release acceptance remain pending.
+
 ## v1.0.15 / 2026-09-26
 
 - Date: 2026-09-26

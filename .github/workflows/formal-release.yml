@@ -1,0 +1,91 @@
+name: Formal Release
+run-name: Formal release ${{ inputs.release_tag }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Stable tag whose exact main commit already passed Windows CI
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: netboot-formal-release
+  cancel-in-progress: false
+
+jobs:
+  verify-ci:
+    name: Verify tag and exact-commit CI
+    runs-on: windows-latest
+    outputs:
+      release_commit: ${{ steps.verify.outputs.release_commit }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Require a stable main tag with passing Windows CI
+        id: verify
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          if ($env:GITHUB_REF -cne 'refs/heads/main') { throw 'Dispatch Formal Release from the main branch.' }
+          if ($env:RELEASE_TAG -notmatch '^v\d+\.\d+\.\d+$') { throw 'Release tag must use v<major>.<minor>.<patch>.' }
+          [xml]$project = Get-Content -LiteralPath 'src\NetBootDhcpTool.App\NetBootDhcpTool.App.csproj'
+          if ($env:RELEASE_TAG -cne "v$($project.Project.PropertyGroup.Version)") { throw 'Release tag does not match the checked-in application version.' }
+          git fetch origin main --tags
+          if ($LASTEXITCODE -ne 0) { throw 'Could not fetch main and release tags.' }
+          $releaseCommit = (git rev-parse "refs/tags/$($env:RELEASE_TAG)^{commit}").Trim()
+          if ($LASTEXITCODE -ne 0) { throw "Release tag $($env:RELEASE_TAG) does not exist on GitHub." }
+          $mainCommit = (git rev-parse 'refs/remotes/origin/main').Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'Could not resolve origin/main.' }
+          git merge-base --is-ancestor $releaseCommit $mainCommit
+          if ($LASTEXITCODE -ne 0) { throw 'Release tag is not contained in origin/main.' }
+
+          $endpoint = "repos/$env:GITHUB_REPOSITORY/actions/workflows/windows-ci.yml/runs?head_sha=$releaseCommit&status=success&per_page=100"
+          $runJson = gh api $endpoint
+          if ($LASTEXITCODE -ne 0) { throw 'Could not read Windows CI runs for the release commit.' }
+          $runs = $runJson | ConvertFrom-Json
+          $hasPassingPush = @($runs.workflow_runs | Where-Object {
+            $_.head_sha -ceq $releaseCommit -and $_.event -ceq 'push' -and $_.head_branch -ceq 'main' -and $_.conclusion -ceq 'success'
+          }).Count -gt 0
+          if (-not $hasPassingPush) { throw "Windows CI has no successful main push run for exact commit $releaseCommit." }
+
+          "release_commit=$releaseCommit" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "Release tag $($env:RELEASE_TAG) resolves to CI-verified commit $releaseCommit."
+
+  publish:
+    name: Build once and publish both mirrors
+    needs: verify-ci
+    runs-on: [self-hosted, windows, x64, netboot-release]
+    timeout-minutes: 180
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.release_tag }}
+          fetch-depth: 0
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.401
+
+      - name: Publish the cached package to GitHub and Gitee
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_COMMIT: ${{ needs.verify-ci.outputs.release_commit }}
+        run: |
+          $workspace = [System.IO.Path]::GetFullPath($env:GITHUB_WORKSPACE)
+          $runnerWork = Split-Path -Parent (Split-Path -Parent $workspace)
+          $stateRoot = Join-Path $runnerWork '_release-state\NetBootDhcpTool'
+          .\build\publish-release.ps1 -Tag $env:RELEASE_TAG -SourceCommit $env:RELEASE_COMMIT -StateRoot $stateRoot

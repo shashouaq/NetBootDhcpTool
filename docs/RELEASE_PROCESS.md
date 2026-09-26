@@ -72,72 +72,31 @@ if ($sidecarHash -ne $hash -or $manifest.version -ne $version -or $manifest.arch
 }
 ```
 
-## GitHub Release Standard
+## Formal Release Workflow
 
-Local source changes are not committed/pushed or published unless the user explicitly says `发布` or `release`. Normal feature-change validation and source-preview rules are owned by the [maintenance guide](MAINTENANCE_GUIDE.md#standard-change-workflow). When publication is explicitly authorized, publish the source commit and matching `v<version>` tag, create/update the GitHub Release from that tag, then verify the remote commit, tag, release, and assets before claiming GitHub publication. Keep the release change-log entry and notes aligned; `publish.ps1` prefers the current version section and falls back to `Unreleased` when that version section does not exist.
+Local source changes are not committed, pushed, or published unless the user explicitly authorizes `发布` or `release`. Normal feature-change validation and source-preview rules are owned by the [maintenance guide](MAINTENANCE_GUIDE.md#standard-change-workflow). Keep the release change-log entry and notes aligned; `publish.ps1` prefers the current version section and falls back to `Unreleased` when that section does not exist.
 
-Before creating the GitHub Release, confirm the Windows CI workflow succeeded for the exact commit and verify that the pushed tag resolves to that commit. The workflow is defined in `.github/workflows/windows-ci.yml`; it runs restore, maintenance checks, Release build, unit tests, console smoke, and non-admin UI smoke when the runner is not elevated.
+GitHub-hosted Windows CI remains the gate for everyday branch and pull-request work. Before release, push the commit to `main`, wait for the exact commit's `windows-ci.yml` push run to succeed, and push its matching stable `v<version>` tag. The Windows CI run covers restore, maintenance checks, Release build, unit tests, console smoke, non-admin UI smoke when available, and the release-pipeline helper tests.
 
-Compare the local release commit with the remote branch and tag (for annotated tags, compare the peeled `^{}` tag ref):
+The only formal publication entry point is `.github/workflows/formal-release.yml` → **Run workflow** on `main`, with the stable tag as input. A GitHub-hosted validation job confirms the tag is in `main` and that Windows CI passed for that exact commit. The publish job then runs on `[self-hosted, windows, x64]`; it builds the existing `.7z` package once, stores the package and release checkpoint outside the checkout, and uploads those same bytes to GitHub and Gitee. The `.7z` format remains unchanged for current updater compatibility.
 
-```powershell
-git rev-parse HEAD
-git ls-remote origin main "refs/tags/v<version>" "refs/tags/v<version>^{}"
-```
+Register one repository-level Windows x64 self-hosted runner before dispatching a release, following [GitHub's runner setup](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/add-runners). In addition to GitHub's default `self-hosted`, `windows`, and `x64` labels, assign it the custom `netboot-release` label. Keep that label on exactly one runner restricted to this repository; normal pull-request CI must continue to use GitHub-hosted runners. The runner must have Git, PowerShell 7, GitHub CLI, curl 7.76 or newer, and 7-Zip; the workflow provisions .NET SDK 10.0.401. Keep its `_work\_release-state\NetBootDhcpTool` directory on persistent storage so an Actions retry can reuse the exact archive and saved Gitee attachment IDs. Do not clear this directory while a release is incomplete.
 
-Create a GitHub Release with:
+The publisher creates each GitHub/Gitee Release only when absent. New Releases remain a GitHub draft and a Gitee prerelease until all assets and manifests have passed remote verification, so clients do not see an incomplete version as the latest stable release. It reuses a named attachment only after downloading and comparing its SHA-256; a same-name asset with different content fails closed and is never overwritten. After each successful Gitee upload, the attachment ID and returned URL are checkpointed locally. Recovery uses the official single-attachment lookup and download endpoints by ID. The attachment list endpoint is used only when an upload outcome is ambiguous or the checkpoint is missing. An ambiguous upload is never blindly repeated. GitHub and Gitee `latest.json` are published only after both archives and checksum sidecars pass complete remote readback; both manifests are then verified to contain identical dual-source content before the GitHub Release is published and the Gitee Release is promoted last. If the final Gitee promotion is interrupted, the verified GitHub Release remains available and a retry safely completes the Gitee promotion.
 
-- Tag: `v<version>`
-- Title: `NetBoot DHCP Tool v<version>`
-- Assets:
-  - `NetBootDhcpTool-v<version>.7z`
-  - `NetBootDhcpTool-v<version>.7z.sha256`
-  - `latest.json`
+If a release job fails, use **Re-run failed jobs** on that workflow run or dispatch the same tag again from the same runner. The persistent cache prevents rebuilding the package; verified assets are skipped. A Gitee `main` branch that cannot fast-forward fails closed and requires resolving the source divergence before retrying. The workflow does not delete a Release or force-push a tag.
 
-Release notes must be extracted and polished from `docs/FEATURE_CHANGELOG.md`. Do not write release notes without a matching change log entry.
+The workflow reads the repository Actions secret `GITEE_TOKEN`, which must have permission to push to the Gitee repository and manage Releases and attachments. Never print it or put it in a command-line URL. Uploads use one HTTP/1.1 request with a 10-minute transfer cap; there is no repeated 30-minute retry loop. If an upload response is ambiguous, recovery checks the saved attachment ID or performs one list lookup before deciding whether another upload is safe. Gitee API behavior follows the [official Gitee API v5 specification](https://gitee.com/api/v5/swagger_doc.json), including single-attachment metadata and download operations.
 
-After creating or updating a release, verify the GitHub Release assets and the latest manifest:
+For every release, verify the exact source commit and tag, the green exact-commit CI run, the stable GitHub and Gitee Release pages, the archive and sidecar SHA-256 values on both hosts, and identical dual-source manifests. The publisher performs full archive readback from each host and checks the GitHub manifest readback; do not claim publication while that workflow is incomplete.
 
-```powershell
-& "C:\Program Files\GitHub CLI\gh.exe" release view v<version> --repo shashouaq/NetBootDhcpTool
-$manifest = Invoke-RestMethod -Uri "https://github.com/shashouaq/NetBootDhcpTool/releases/latest/download/latest.json"
-if ($manifest.version -ne "<version>") { throw "Latest manifest version mismatch: $($manifest.version)" }
-```
+The v1.0.14 publication used the former GitHub-hosted sync path; its measured full downloads and variable 64 KiB client probes are historical evidence only. The app continues to probe the Gitee and GitHub sources independently and select by measured speed. It does not pin users to one host.
 
 ## Gitee Distribution
 
 The public Gitee repository is `https://gitee.com/joel20230302/NetBootDhcpTool`. The app checks its latest stable Gitee Release first and falls back to the GitHub manifest if Gitee metadata cannot be read. Both hosts publish a `latest.json` containing Gitee and GitHub archive URLs. When an update is available, the app requests at most 64 KB from each mirror, orders the sources by measured speed, shows the chosen source, and tries the next approved mirror if transfer or SHA-256 validation fails. Keep the Gitee repository public so unauthenticated clients can read release metadata and assets.
 
-The GitHub Actions workflow `.github/workflows/gitee-release-sync.yml` runs after a stable GitHub Release is published; it also accepts a manually supplied existing stable tag for retrying a failed sync. It downloads that release's archive, checksum, and manifest; verifies their local hashes; then fast-forward pushes GitHub `main` and the exact release tag to Gitee without force. It creates or updates the matching Gitee Release and manages three assets (`.7z`, `.7z.sha256`, and `latest.json`). An existing archive with the expected size is reused and fully downloaded for SHA-256 verification; a missing or differently sized archive is replaced. The checksum and manifest are replaced, and the dual-source manifest is published only after the archive and checksum pass remote readback. Attachment uploads use `curl.exe` with HTTP/1.1 and Gitee API v5 multipart form fields `access_token` and `file`; curl generates the multipart boundary. The access token is passed through a short-lived curl config file that the workflow removes after each upload. Each upload has a 20-second connection timeout, a 30-minute transfer timeout, and five retries with a five-second delay. The workflow logs each attachment upload and archive readback duration, and uploads the small checksum before the archive so a failed large upload is distinguishable from a general attachment API failure. If the upload response is interrupted, the script checks the Release attachment list before reporting failure. It then replaces the GitHub `latest.json` with the verified dual-source manifest and reads it back. The workflow requires `contents: write` for that one release-asset update. A non-fast-forward Git push fails closed and requires resolving the Gitee branch divergence before retrying.
-
-The workflow reads the repository Actions secret named `GITEE_TOKEN`. Configure it in the GitHub repository under **Settings → Secrets and variables → Actions → New repository secret**. The value must be a Gitee token that can push to this repository and create/update Releases and upload/delete Release attachments. The token is used only by the workflow; the desktop app does not need it. Never print or put the token in a command-line URL. The Gitee API operations follow the [official Gitee API v5 specification](https://gitee.com/api/v5/swagger_doc.json).
-
-The temporary credential check created, read, and deleted a disposable Gitee Git branch. For the v1.0.14 publication, all three assets were uploaded through the attachment API; remote sizes, the dual-source manifests, and the full archive SHA-256 were read back successfully. Full archive downloads from both Gitee and GitHub matched the local hash. On the measured local network Gitee took 48.8 seconds and GitHub took 18.8 seconds; repeated client-sized 64 KiB probes were variable, with median rates of 0.106 MiB/s for Gitee and 0.392 MiB/s for GitHub. These are point-in-time measurements, so clients must keep probing both sources and display/select according to their own results. If Gitee returns `null` with HTTP 200 for an absent tag release, treat it as not yet created; do not PATCH a missing release ID. Do not publish a test tag or release just to exercise this path.
-
-Download the remote archive and compare its hash with the local archive and published sidecar before closing the release:
-
-```powershell
-$version = "<version>"
-$archiveName = "NetBootDhcpTool-v$version.7z"
-$localArchive = Join-Path (Get-Location) "release\$archiveName"
-$localSidecar = "$localArchive.sha256"
-$verifyDir = Join-Path $env:TEMP ("netboot-release-verify-" + [guid]::NewGuid().ToString("N"))
-New-Item -ItemType Directory -Force -Path $verifyDir | Out-Null
-& "C:\Program Files\GitHub CLI\gh.exe" release download "v$version" --repo shashouaq/NetBootDhcpTool --dir $verifyDir
-if ($LASTEXITCODE -ne 0) { throw "Could not download release assets for v$version" }
-$expectedHash = (Get-Content -Raw $localSidecar).Trim().Split(' ')[0].ToLowerInvariant()
-$localHash = (Get-FileHash -LiteralPath $localArchive -Algorithm SHA256).Hash.ToLowerInvariant()
-$remoteArchive = Join-Path $verifyDir $archiveName
-$remoteSidecar = "$remoteArchive.sha256"
-$remoteExpectedHash = (Get-Content -Raw $remoteSidecar).Trim().Split(' ')[0].ToLowerInvariant()
-$remoteHash = (Get-FileHash -LiteralPath $remoteArchive -Algorithm SHA256).Hash.ToLowerInvariant()
-if ($localHash -ne $expectedHash -or $remoteHash -ne $expectedHash -or $remoteHash -ne $remoteExpectedHash) { throw "Release archive SHA-256 mismatch" }
-$manifest = Invoke-RestMethod -Uri "https://github.com/shashouaq/NetBootDhcpTool/releases/latest/download/latest.json"
-if ($manifest.version -ne $version -or $manifest.archiveName -ne $archiveName -or $manifest.archiveSha256 -ne $expectedHash) { throw "Published manifest does not match v$version archive" }
-& "C:\Program Files\7-Zip\7z.exe" t $remoteArchive
-if ($LASTEXITCODE -ne 0) { throw "Downloaded release archive failed 7-Zip testing" }
-```
-
+The publisher also fast-forward pushes GitHub `main` and the exact release tag to Gitee without force. Gitee attachment APIs are called directly from the domestic Windows runner. A workflow retry looks up a checkpointed attachment by its ID and verifies its downloaded bytes; list lookup is reserved for a lost upload response or missing local checkpoint. Keep the `GITEE_TOKEN` Actions secret configured on GitHub; the desktop app never receives that credential.
 ## Upgrade Detection
 
 The application first requests the latest stable release from Gitee's public API, reads its `latest.json` attachment, and falls back to this GitHub URL if that request or manifest validation fails:

@@ -1,6 +1,6 @@
 # Approved work items / 已批准待办
 
-本文件是待办状态的唯一来源；任务正文位于 `tasks/`，完成证据进入 [FEATURE_CHANGELOG.md](FEATURE_CHANGELOG.md)。2026-09-23 已整体批准 T01～T15 并建立任务入口；T16、T17 于 2026-09-25 经用户批准后加入；T18 记录 Gitee 分发实现及正式附件验收。后续按表中顺序推进，只有明确授权“发布/release”才能提交、推送或发布。
+本文件是待办状态的唯一来源；任务正文位于 `tasks/`，完成证据进入 [FEATURE_CHANGELOG.md](FEATURE_CHANGELOG.md)。2026-09-23 已整体批准 T01～T15 并建立任务入口；T16、T17 于 2026-09-25 经用户批准后加入；T18 记录 Gitee 分发与客户端测速；T19 跟进正式发布链路的自托管 Runner 迁移和幂等验收。后续按表中顺序推进，只有明确授权“发布/release”才能提交、推送或发布。
 
 ## 阅读与执行入口
 
@@ -42,6 +42,7 @@
 | 16 | [T16 操作阶段进度与分段计时](tasks/T16.md) | 完成 | 启动、长操作、取消等待和正常退出恢复显示阶段及耗时；操作日志记录阶段/总时长。Release 全解决方案构建 0 警告/错误、MSTest 140/140、控制台 `OK`、非管理员 UI `UI_SMOKE_OK`、维护检查通过。强制结束进程后无法继续显示 UI 进度，恢复依赖已有恢复日志；详见 [变更日志](FEATURE_CHANGELOG.md)。 |
 | 17 | [T17 并行读取启动网络快照](tasks/T17.md) | 完成 | 两次新版实机启动发现分别为 2.75 秒和 3.29 秒，低于 T16 串行基线 4.44 秒；全量 5 个适配器和 57 条路由仍正常显示。Release 构建、140 项 MSTest、控制台/UI 烟测、维护检查及 Linux 物理客户端 DORA/续租/释放复用均通过；目标网卡、防火墙、UDP 端口和对端网络状态恢复。远端 CI 是后续发布门槛；详见任务页与[变更日志](FEATURE_CHANGELOG.md)。 |
 | 18 | [T18 Gitee 分发与自适应更新下载](tasks/T18.md) | 完成 | v1.0.14 Gitee Release 三附件、远端大小和双源清单已核验；Gitee/GitHub 完整归档 SHA-256 与本地一致。Windows CI、同步工作流和源码/标签同步通过。当前网络完整下载 Gitee 48.8 秒、GitHub 18.8 秒；客户端 64 KiB 探测中位数 Gitee 0.106、GitHub 0.392 MiB/s，因此保留按每次测速自动选择，并不固定指定 Gitee。详见[任务页](tasks/T18.md)与[变更日志](FEATURE_CHANGELOG.md)。 |
+| 19 | [T19 自托管正式发布与幂等恢复](tasks/T19.md) | 待验收 | GitHub-hosted 精确提交 CI 门禁、单次打包缓存、双端同包上传与 Gitee 附件 ID 检查点已实现；PowerShell 回归通过。当前仓库尚无 self-hosted runner，正式工作流未执行，远端端到端验收待 Runner 注册后完成。详见[任务页](tasks/T19.md)与[变更日志](FEATURE_CHANGELOG.md)。 |
 
 ## 共同完成门槛
 
