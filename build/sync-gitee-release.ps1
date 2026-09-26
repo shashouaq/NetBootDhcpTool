@@ -93,16 +93,17 @@ if ($releaseLookup.StatusCode -eq 200) {
     catch { throw 'Gitee Release lookup returned invalid JSON.' }
     if ($null -ne $giteeRelease -and $null -ne $giteeRelease.id -and [long]$giteeRelease.id -gt 0) {
         $releaseId = [long]$giteeRelease.id
-        $releaseUri = "$giteeApiRepository/releases/$releaseId"
-        $updateForm = @{
-            access_token = $token
-            tag_name = $Tag
-            name = if ([string]::IsNullOrWhiteSpace($githubRelease.name)) { "NetBoot DHCP Tool $Tag" } else { $githubRelease.name }
-            body = [string]$githubRelease.body
+        $releaseName = if ([string]::IsNullOrWhiteSpace($githubRelease.name)) { "NetBoot DHCP Tool $Tag" } else { $githubRelease.name }
+        $releaseBody = [string]$githubRelease.body
+        if ([string]$giteeRelease.name -cne $releaseName -or [string]$giteeRelease.body -cne $releaseBody) {
+            $releaseUri = "$giteeApiRepository/releases/$releaseId"
+            $updateForm = @{ access_token = $token; tag_name = $Tag; name = $releaseName; body = $releaseBody }
+            # Gitee accepts URL-encoded form fields for Release metadata updates; keep multipart encoding for file attachments only.
+            $releaseUpdate = Invoke-WebRequest -Uri $releaseUri -Method Patch -Body $updateForm -SkipHttpErrorCheck -TimeoutSec 30
+            if ($releaseUpdate.StatusCode -notin @(200, 201)) { throw "Gitee Release metadata update failed with HTTP $($releaseUpdate.StatusCode)." }
+        } else {
+            Write-Host "[Gitee] Existing Release metadata already matches GitHub; skipping update."
         }
-        # Gitee accepts URL-encoded form fields for Release metadata updates; keep multipart encoding for file attachments only.
-        $releaseUpdate = Invoke-WebRequest -Uri $releaseUri -Method Patch -Body $updateForm -SkipHttpErrorCheck -TimeoutSec 30
-        if ($releaseUpdate.StatusCode -notin @(200, 201)) { throw "Gitee Release metadata update failed with HTTP $($releaseUpdate.StatusCode)." }
     }
 } elseif ($releaseLookup.StatusCode -ne 404) {
     throw "Gitee Release lookup failed with HTTP $($releaseLookup.StatusCode)."
