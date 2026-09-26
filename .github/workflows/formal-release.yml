@@ -78,6 +78,13 @@ jobs:
           ref: ${{ inputs.release_tag }}
           fetch-depth: 0
 
+      - name: Set user-writable .NET SDK install path
+        shell: pwsh
+        run: |
+          $sdkRoot = Join-Path $env:LOCALAPPDATA 'NetBootDhcpTool\dotnet'
+          New-Item -ItemType Directory -Path $sdkRoot -Force | Out-Null
+          "DOTNET_INSTALL_DIR=$sdkRoot" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       - uses: actions/setup-dotnet@v5
         with:
           dotnet-version: 10.0.401

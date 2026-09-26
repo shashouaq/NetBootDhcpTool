@@ -89,6 +89,12 @@ try {
     if ($formalWorkflow -notmatch '(?ms)  verify-ci:.*?runs-on: windows-latest') { throw 'Exact-commit validation must remain on a GitHub-hosted runner.' }
     if ($formalWorkflow -notmatch '(?ms)  publish:.*?runs-on: \[self-hosted, windows, x64, netboot-release\]') { throw 'Release publication must use the dedicated Windows x64 release runner.' }
     if ($formalWorkflow -notmatch 'git cat-file -e "\$\{releaseCommit\}:\$requiredTagFile"') { throw 'The CI gate must reject legacy tags that do not contain the publisher used by the release job.' }
+    $sdkPathSetup = $formalWorkflow.IndexOf('DOTNET_INSTALL_DIR=$sdkRoot', [System.StringComparison]::Ordinal)
+    $dotnetAction = $formalWorkflow.IndexOf('uses: actions/setup-dotnet@v5', [System.StringComparison]::Ordinal)
+    if ($sdkPathSetup -lt 0 -or $dotnetAction -lt $sdkPathSetup -or
+        $formalWorkflow -notmatch "LOCALAPPDATA 'NetBootDhcpTool\\dotnet'") {
+        throw 'The self-hosted runner must install the pinned SDK into its persistent user-writable directory before setup-dotnet runs.'
+    }
     if ($formalWorkflow -notmatch 'build[\\/]publish-release\.ps1') { throw 'Formal Release must invoke the idempotent local publisher.' }
     if ($windowsWorkflow -notmatch '(?m)^    runs-on: windows-latest') { throw 'Day-to-day CI must remain on GitHub-hosted Windows.' }
     $publisher = Get-Content -Raw -LiteralPath (Join-Path $repoRoot 'build\publish-release.ps1')
