@@ -71,6 +71,96 @@ public sealed class StaticRouteOwnershipTests
     }
 
     [TestMethod]
+    public async Task PlanningSnapshotRunsTheGeneratedReadOnlyScriptOnceAndPreservesIpv4Ipv6Projection()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "netboot-route-snapshot-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var tracePath = Path.Combine(root, "cmdlets.txt");
+        var interfaces = JsonSerializer.Serialize(new[]
+        {
+            new { AddressFamily = "IPv4", InterfaceIndex = 17, InterfaceMetric = 10, ConnectionState = "Connected" },
+            new { AddressFamily = "IPv6", InterfaceIndex = 17, InterfaceMetric = 5, ConnectionState = "Connected" }
+        });
+        var routes = JsonSerializer.Serialize(new[]
+        {
+            new { AddressFamily = "IPv4", InterfaceIndex = 17, DestinationPrefix = "192.0.2.0/24", NextHop = "0.0.0.0", RouteMetric = 11, Protocol = 3, PolicyStore = "ActiveStore", Store = "ActiveStore", InstanceId = "existing-v4" }
+        });
+        var service = Service(async (script, _, token, _) =>
+        {
+            var wrapped = WrapRoutePlanningScript(script, tracePath, interfaces, routes, "[]");
+            var execution = await RunPowerShellAsync(wrapped, token);
+            Assert.AreEqual(0, execution.ExitCode, execution.Error);
+            return execution.Output;
+        });
+
+        try
+        {
+            var plan = await service.PreviewAsync([Target(), Target("ipv6", "2001:db8:abcd::/64")]);
+
+            Assert.AreEqual(2, plan.Count);
+            Assert.IsFalse(plan[0].ShouldCreate, "The existing IPv4 route on the same path remains an already-present route.");
+            Assert.AreEqual(11, plan[0].Target.Route.RouteMetric);
+            Assert.AreEqual(10, plan[0].InterfaceMetric);
+            Assert.IsTrue(plan[1].ShouldCreate);
+            Assert.AreEqual(5, plan[1].InterfaceMetric);
+            Assert.AreEqual(1, plan[1].Target.Route.RouteMetric);
+
+            var generated = StaticRouteService.BuildRoutePlanningSnapshotScript();
+            Assert.AreEqual(1, Regex.Matches(generated, @"\bGet-NetIPInterface\b").Count);
+            Assert.AreEqual(1, Regex.Matches(generated, @"\bGet-NetRoute\b").Count);
+            Assert.AreEqual(1, Regex.Matches(generated, @"\bGet-NetIPAddress\b").Count);
+            var calls = File.ReadAllLines(tracePath);
+            CollectionAssert.AreEqual(new[] { "Get-NetIPInterface", "Get-NetRoute", "Get-NetIPAddress" }, calls);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [TestMethod]
+    public async Task ApplyReplansFromFreshSnapshotAndRejectsAConflictAddedAfterPreview()
+    {
+        var reads = 0;
+        var createCalls = 0;
+        var service = Service((_, summary, _, _) =>
+        {
+            if (!summary.Contains("read route planning snapshot", StringComparison.Ordinal))
+            {
+                if (summary.Contains("create IPv4 static route", StringComparison.Ordinal)) createCalls++;
+                Assert.Fail($"Unexpected PowerShell call: {summary}");
+            }
+
+            reads++;
+            IReadOnlyList<CurrentStaticRoute> routes = reads == 1
+                ? []
+                : [new CurrentStaticRoute
+                {
+                    AddressFamily = "IPv4", InterfaceIndex = "18", DestinationPrefix = "192.0.2.128/25",
+                    NextHop = "0.0.0.0", RouteMetric = 1, InterfaceMetric = 10, Protocol = "3",
+                    PolicyStore = "ActiveStore", InstanceId = "new-conflict"
+                }];
+            return Task.FromResult(RoutePlanningSnapshotJson(routes));
+        });
+
+        var preview = await service.PreviewAsync([Target()]);
+        Assert.IsTrue(preview[0].ShouldCreate);
+
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => service.ApplyAsync([Target()]));
+
+        Assert.AreEqual(2, reads, "Preview and Apply must each read a fresh planning snapshot.");
+        Assert.AreEqual(0, createCalls, "Apply must reject the newly observed conflict before any write.");
+    }
+
+    [TestMethod]
+    public async Task IncompletePlanningSnapshotFailsClosedInsteadOfMeaningNoRoutes()
+    {
+        var service = Service((_, _, _, _) => Task.FromResult("{\"Routes\":[]}"));
+
+        await Assert.ThrowsExactlyAsync<InvalidDataException>(() => service.PreviewAsync([Target()]));
+    }
+
+    [TestMethod]
     public async Task RemovalLeavesSamePrefixRouteOnAnotherAdapterUntouched()
     {
         var routes = new[]
@@ -129,10 +219,8 @@ public sealed class StaticRouteOwnershipTests
         var service = Service((script, summary, _, _) =>
         {
             calls.Add(summary);
-            if (summary.Contains("read current IPv4/IPv6 routes", StringComparison.Ordinal)) return Task.FromResult("[]");
-            if (summary.Contains("read IPv4/IPv6 interface metrics", StringComparison.Ordinal)) return Task.FromResult("[{\"AddressFamily\":\"IPv4\",\"InterfaceIndex\":\"17\",\"InterfaceMetric\":10}]");
-            if (summary.Contains("read IPv4/IPv6 interface states", StringComparison.Ordinal)) return Task.FromResult("[{\"AddressFamily\":\"IPv4\",\"InterfaceIndex\":\"17\",\"ConnectionState\":\"Connected\"}]");
-            if (summary.Contains("read interface addresses", StringComparison.Ordinal)) return Task.FromResult("[]");
+            var planOutput = PlanReadOutput(summary);
+            if (planOutput != null) return Task.FromResult(planOutput);
             if (summary.Contains("create IPv4 static route", StringComparison.Ordinal)) throw new IOException("injected failure after New-NetRoute may have changed system state");
             Assert.Fail($"Unexpected PowerShell call: {summary}\n{script}");
             return Task.FromResult("");
@@ -158,10 +246,8 @@ public sealed class StaticRouteOwnershipTests
         var service = Service((script, summary, _, _) =>
         {
             calls.Add(summary);
-            if (summary.Contains("read current IPv4/IPv6 routes", StringComparison.Ordinal)) return Task.FromResult("[]");
-            if (summary.Contains("read IPv4/IPv6 interface metrics", StringComparison.Ordinal)) return Task.FromResult("[{\"AddressFamily\":\"IPv4\",\"InterfaceIndex\":\"17\",\"InterfaceMetric\":10}]");
-            if (summary.Contains("read IPv4/IPv6 interface states", StringComparison.Ordinal)) return Task.FromResult("[{\"AddressFamily\":\"IPv4\",\"InterfaceIndex\":\"17\",\"ConnectionState\":\"Connected\"}]");
-            if (summary.Contains("read interface addresses", StringComparison.Ordinal)) return Task.FromResult("[]");
+            var planOutput = PlanReadOutput(summary);
+            if (planOutput != null) return Task.FromResult(planOutput);
             if (summary.Contains("create IPv4 static route", StringComparison.Ordinal))
                 return Task.FromResult("{\"AddressFamily\":\"IPv4\",\"DestinationPrefix\":\"192.0.2.0/24\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":1,\"InterfaceIndex\":17,\"InterfaceAlias\":\"Ethernet\",\"PolicyStore\":\"ActiveStore\",\"InstanceId\":\"created-instance\"}");
             Assert.Fail($"Unexpected PowerShell call: {summary}\n{script}");
@@ -437,11 +523,67 @@ Write-Output ('__CREATED__' + [bool]$global:routeCreated)
 
     private static string? PlanReadOutput(string summary)
     {
-        if (summary.Contains("read current IPv4/IPv6 routes", StringComparison.Ordinal)) return "[]";
-        if (summary.Contains("read IPv4/IPv6 interface metrics", StringComparison.Ordinal)) return "[{\"AddressFamily\":\"IPv4\",\"InterfaceIndex\":\"17\",\"InterfaceMetric\":10}]";
-        if (summary.Contains("read IPv4/IPv6 interface states", StringComparison.Ordinal)) return "[{\"AddressFamily\":\"IPv4\",\"InterfaceIndex\":\"17\",\"ConnectionState\":\"Connected\"}]";
-        if (summary.Contains("read interface addresses", StringComparison.Ordinal)) return "[]";
+        if (summary.Contains("read route planning snapshot", StringComparison.Ordinal))
+            return """{"Routes":[],"InterfaceMetrics":[{"AddressFamily":"IPv4","InterfaceIndex":"17","InterfaceMetric":10},{"AddressFamily":"IPv6","InterfaceIndex":"17","InterfaceMetric":10}],"InterfaceStates":[{"AddressFamily":"IPv4","InterfaceIndex":"17","ConnectionState":"Connected"},{"AddressFamily":"IPv6","InterfaceIndex":"17","ConnectionState":"Connected"}],"InterfaceAddresses":[]}""";
         return null;
+    }
+
+    private static string RoutePlanningSnapshotJson(IReadOnlyList<CurrentStaticRoute> routes) => JsonSerializer.Serialize(new
+    {
+        Routes = routes,
+        InterfaceMetrics = new[]
+        {
+            new InterfaceMetricInfo { AddressFamily = "IPv4", InterfaceIndex = "17", InterfaceMetric = 10 },
+            new InterfaceMetricInfo { AddressFamily = "IPv6", InterfaceIndex = "17", InterfaceMetric = 10 }
+        },
+        InterfaceStates = new[]
+        {
+            new InterfaceStateInfo { AddressFamily = "IPv4", InterfaceIndex = "17", ConnectionState = "Connected" },
+            new InterfaceStateInfo { AddressFamily = "IPv6", InterfaceIndex = "17", ConnectionState = "Connected" }
+        },
+        InterfaceAddresses = Array.Empty<InterfaceAddressInfo>()
+    });
+
+    private static string WrapRoutePlanningScript(string script, string tracePath, string interfacesJson, string routesJson, string addressesJson)
+    {
+        var escapedTracePath = tracePath.Replace("'", "''", StringComparison.Ordinal);
+        return $$"""
+$global:mockTracePath = '{{escapedTracePath}}'
+$global:mockInterfaces = @'
+{{interfacesJson}}
+'@ | ConvertFrom-Json
+$global:mockRoutes = @'
+{{routesJson}}
+'@ | ConvertFrom-Json
+$global:mockAddresses = @'
+{{addressesJson}}
+'@ | ConvertFrom-Json
+function Add-MockTrace([string]$name) { [IO.File]::AppendAllText($global:mockTracePath, $name + [Environment]::NewLine) }
+function Get-NetIPInterface {
+  param([string[]]$AddressFamily)
+  if (($AddressFamily -join ',') -ne 'IPv4,IPv6') { throw 'Unexpected address-family query.' }
+  Add-MockTrace 'Get-NetIPInterface'
+  $global:mockInterfaces
+}
+function Get-NetRoute {
+  param([string[]]$AddressFamily)
+  if (($AddressFamily -join ',') -ne 'IPv4,IPv6') { throw 'Unexpected address-family query.' }
+  Add-MockTrace 'Get-NetRoute'
+  $global:mockRoutes
+}
+function Get-NetIPAddress {
+  param([string[]]$AddressFamily)
+  if (($AddressFamily -join ',') -ne 'IPv4,IPv6') { throw 'Unexpected address-family query.' }
+  Add-MockTrace 'Get-NetIPAddress'
+  $global:mockAddresses
+}
+try {
+{{script}}
+} catch {
+  [Console]::Error.WriteLine($_.Exception.ToString())
+  exit 23
+}
+""";
     }
 
     private static StaticRouteService Service(PowerShellScriptExecutor executor) => new(NullLogger.Instance, executor, () => true);

@@ -24,6 +24,8 @@ namespace NetBootDhcpTool.App;
 
 public partial class MainWindow : Window
 {
+    private sealed record AdapterStatusRefreshRequest(string AdapterId, string InterfaceIndex, long SelectionGeneration, long WorkflowGeneration);
+
     private static readonly Version CurrentVersion = typeof(MainWindow).Assembly.GetName().Version ?? new Version(1, 0, 8);
     private readonly AppPaths _paths;
     private readonly FileLogger _logger;
@@ -35,11 +37,9 @@ public partial class MainWindow : Window
     private readonly ExistingDhcpDetector _dhcpDetector;
     private readonly DhcpServer _dhcpServer;
     private readonly MainWindowViewModel _viewModel;
-    private readonly VersionUpdateService _updateService;
-    private readonly CancellationTokenSource _updateCts = new();
-    private CancellationTokenSource? _updateDownloadCts;
-    private Task? _updateDownloadTask;
-    private readonly SemaphoreSlim _leaseUpdateGate = new(1, 1);
+    private readonly UpdateController _updateController;
+    private UpdateControllerState _updateState;
+    private readonly Dictionary<LeaseProbeBindingKey, long> _leaseProbeGenerations = [];
     private readonly NetworkWorkflowCoordinator _networkWorkflows = new();
     private readonly List<string> _startupDataWarnings = [];
     private AppSettings _settings;
@@ -48,11 +48,26 @@ public partial class MainWindow : Window
     private List<AdapterMacBackup> _savedMacBackups = [];
     private DhcpLeaseJournal _dhcpLeaseJournal = new();
     private List<OperationHistoryItem> _operationHistory = [];
+    private readonly CoalescingSnapshotWriter<OperationHistoryItem> _operationHistoryWriter;
+    private int _pendingScanHistoryCount;
+    private bool _scanHistoryFlushInProgress;
+    private bool _operationHistoryWritable = true;
+    private bool _operationHistorySaveFailed;
+    private ScanProgressAccumulator? _scanProgressAccumulator;
+    private long _scanProgressGeneration;
+    private readonly Queue<string> _logDisplayQueue = new();
+    private readonly object _logDisplaySync = new();
+    private long _logDisplayOmitted;
+    private int _logDisplayScrollCount;
     private List<NetworkProfile> _allProfiles = [];
     private CancellationTokenSource? _scanCts;
     private CancellationTokenSource? _leaseHintCts;
     private readonly DispatcherTimer _leasePingTimer = new() { Interval = TimeSpan.FromSeconds(2) };
     private readonly DispatcherTimer _adapterStatusTimer = new() { Interval = TimeSpan.FromSeconds(3) };
+    private readonly DispatcherTimer _scanProgressTimer = new() { Interval = TimeSpan.FromMilliseconds(100) };
+    private readonly DispatcherTimer _scanHistoryFlushTimer = new() { Interval = TimeSpan.FromMilliseconds(500) };
+    private readonly DispatcherTimer _adapterNetworkChangeTimer = new() { Interval = TimeSpan.FromMilliseconds(250) };
+    private readonly DispatcherTimer _logDisplayTimer = new() { Interval = TimeSpan.FromMilliseconds(100) };
     private readonly DispatcherTimer _feedbackTimer = new() { Interval = TimeSpan.FromSeconds(6) };
     private readonly DispatcherTimer _busyProgressTimer = new() { Interval = TimeSpan.FromSeconds(1) };
     private Stopwatch? _busyOperationStopwatch;
@@ -62,7 +77,7 @@ public partial class MainWindow : Window
     private int _busyPhaseNumber;
     private int _busyCompletedPhaseCount;
     private int? _busyTotalPhaseCount;
-    private bool _leaseProbeInProgress;
+    private int _leaseProbeRefreshCursor;
     private bool _closingCleanupStarted;
     private bool _waitingForOperationBeforeClose;
     private bool _unsavedSettingsExitConfirmed;
@@ -75,12 +90,12 @@ public partial class MainWindow : Window
     private readonly Dictionary<string, AdapterMacBackup> _originalAdapterMacs = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<AppliedStaticRoute> _appliedStaticRoutes = [];
     private readonly List<DhcpFirewallRuleLease> _dhcpFirewallRecoveries = [];
+    private readonly LeaseProbeCoordinator _leaseProbeCoordinator;
+    private readonly CoalescedRefreshCoordinator<AdapterStatusRefreshRequest, NetworkAdapterInfo> _adapterStatusCoordinator;
     private TabItem? _lastBusinessTab;
-    private bool _adapterStatusRefreshInProgress;
+    private bool _adapterStatusRefreshDirty;
     private bool _adapterRefreshInProgress;
     private bool _adapterActionInProgress;
-    private bool _updateDownloadInProgress;
-    private bool _updateSlowWarningShown;
     private bool _darkTheme;
     private bool _safetyOnboardingCompleted;
     private bool _settingsWritable = true;
@@ -96,9 +111,6 @@ public partial class MainWindow : Window
     private string? _businessConfigurationFingerprint;
     private DhcpFirewallRuleLease? _dhcpFirewallRules;
     private string? _activeDhcpUiSessionId;
-    private UpdateCheckResult? _lastUpdateResult;
-    private IReadOnlyList<UpdateSourceSpeed> _updateSourceSpeeds = [];
-    private bool _updateCheckStarted;
     private string? _activeOperationText;
     private CancellationTokenSource? _operationCts;
     private NetworkWorkflowLease? _activeNetworkWorkflow;
@@ -110,6 +122,12 @@ public partial class MainWindow : Window
     private string _scanPhase = "";
     private int _cleanupFailureCount;
     private bool _compactLayout;
+    private bool _logDisplayClosed;
+    private long _adapterSelectionGeneration;
+    private long _adapterWorkflowGeneration;
+    private long _adapterNetworkChangeVersion;
+    private long _adapterNetworkChangeObservedVersion;
+    private int _adapterNetworkChangeDispatchPending;
 
     public ObservableCollection<NetworkAdapterInfo> Adapters => _viewModel.Adapters;
     public ObservableCollection<ScanResult> ScanResults => _viewModel.ScanResults;
@@ -121,7 +139,23 @@ public partial class MainWindow : Window
     public ObservableCollection<OperationHistoryItem> OperationHistory => _viewModel.OperationHistory;
     public ObservableCollection<NetworkProfile> Profiles => _viewModel.Profiles;
 
-    public MainWindow(AppPaths paths, FileLogger? logger = null)
+    public MainWindow(AppPaths paths, FileLogger? logger = null) : this(paths, logger, null, null)
+    {
+    }
+
+    internal MainWindow(
+        AppPaths paths,
+        FileLogger? logger,
+        Func<LeaseProbeRequest, CancellationToken, Task<LeaseProbeResult>>? leaseProbeAsync)
+        : this(paths, logger, leaseProbeAsync, null)
+    {
+    }
+
+    internal MainWindow(
+        AppPaths paths,
+        FileLogger? logger,
+        Func<LeaseProbeRequest, CancellationToken, Task<LeaseProbeResult>>? leaseProbeAsync,
+        UpdateController? updateController)
     {
         ArgumentNullException.ThrowIfNull(paths);
         var initializationStopwatch = Stopwatch.StartNew();
@@ -138,11 +172,12 @@ public partial class MainWindow : Window
         CollectionViewSource.GetDefaultView(ScanResults).Filter = ScanResultFilter;
         _paths = paths;
         _logger = logger ?? new FileLogger(_paths);
+        _operationHistoryWriter = new CoalescingSnapshotWriter<OperationHistoryItem>(snapshot =>
+            Task.Run(() => JsonStore.Save(_paths.OperationHistoryFile, snapshot)));
         foreach (var warning in _paths.MigrationWarnings) _logger.Warn($"Legacy data migration warning: {warning}");
-        _logger.LineWritten += line => Dispatcher.BeginInvoke(() =>
-        {
-            AppendLogLine(line);
-        });
+        _logger.LineWritten += Logger_LineWritten;
+        _logDisplayTimer.Tick += (_, _) => DrainLogDisplayQueue();
+        _logDisplayTimer.Start();
         var settingsLoad = JsonStore.Load<AppSettings>(_paths.SettingsFile, _logger);
         _settings = settingsLoad.Value ?? new AppSettings();
         _settingsWritable = settingsLoad.Status is not DataLoadStatus.Failed and not DataLoadStatus.Missing;
@@ -150,21 +185,35 @@ public partial class MainWindow : Window
         _lang = new LanguageService(_paths);
         _lang.Load(_settings.Language);
         _adapterService = new NetworkAdapterService(_logger);
+        _adapterStatusCoordinator = new CoalescedRefreshCoordinator<AdapterStatusRefreshRequest, NetworkAdapterInfo>(
+            (request, ct) => Task.Run(() => _adapterService.GetAdapterByIdentity(request.AdapterId, request.InterfaceIndex), ct),
+            (request, adapter) => Dispatcher.InvokeAsync(
+                () => CommitSelectedAdapterStatus(request, adapter), DispatcherPriority.DataBind).Task,
+            (request, ex) => _logger.Warn($"Adapter status refresh failed: adapterId={request.AdapterId} index={request.InterfaceIndex} reason={ex.Message}"));
         _routeService = new StaticRouteService(_logger);
         _probe = new HttpProbeService();
         _scanner = new PingScanner(_logger, _probe);
+        _leaseProbeCoordinator = new LeaseProbeCoordinator(
+            leaseProbeAsync ?? ProbeLeaseAsync,
+            ApplyLeaseProbeResultAsync,
+            (identity, ex) => _logger.Error($"DHCP lease probe failed: session={identity.SessionId} client={identity.ClientKey} ip={identity.IpAddress}", ex));
         _dhcpDetector = new ExistingDhcpDetector(_logger);
         _dhcpServer = new DhcpServer(_logger);
-        _updateService = new VersionUpdateService();
+        _updateController = updateController ?? new UpdateController(new VersionUpdateService(), CurrentVersion);
+        _updateState = _updateController.State;
+        _updateController.StateChanged += UpdateController_StateChanged;
         _dhcpServer.LeaseChanged += lease =>
         {
-            lease.SessionId = _activeDhcpUiSessionId ?? "";
+            lease.SessionId = Volatile.Read(ref _activeDhcpUiSessionId) ?? "";
             lease.IsCurrentSession = !string.IsNullOrWhiteSpace(lease.SessionId);
-            Dispatcher.BeginInvoke(() => _ = UpdateLeaseAsync(lease));
+            Dispatcher.BeginInvoke(() => ProcessLeaseEvent(lease));
         };
         _dhcpServer.StoppedUnexpectedly += reason => Dispatcher.BeginInvoke(() => _ = HandleUnexpectedDhcpStopAsync(reason));
-        _leasePingTimer.Tick += (_, _) => _ = RefreshLeasePingAsync();
+        _leasePingTimer.Tick += (_, _) => RefreshLeasePing();
         _adapterStatusTimer.Tick += (_, _) => RefreshSelectedAdapterStatus();
+        _adapterNetworkChangeTimer.Tick += (_, _) => AdapterNetworkChangeDebounceTick();
+        _scanProgressTimer.Tick += (_, _) => DrainScanProgressBatch();
+        _scanHistoryFlushTimer.Tick += async (_, _) => await FlushScanHistoryAsync(force: true);
         _feedbackTimer.Tick += (_, _) =>
         {
             _feedbackTimer.Stop();
@@ -185,6 +234,7 @@ public partial class MainWindow : Window
         LoadDhcpLeaseJournal();
         var operationHistoryLoad = JsonStore.Load<List<OperationHistoryItem>>(_paths.OperationHistoryFile, _logger);
         _operationHistory = operationHistoryLoad.HasData ? operationHistoryLoad.Value! : [];
+        _operationHistoryWritable = operationHistoryLoad.Status != DataLoadStatus.Failed;
         RecordStorageLoad("Operation history / 操作历史", operationHistoryLoad.Status, operationHistoryLoad.SourcePath, operationHistoryLoad.Error, missingIsExpected: true);
         foreach (var item in _operationHistory.OrderByDescending(x => x.Time).Take(500)) OperationHistory.Add(item);
         var profilesLoad = ProfileStore.LoadWithStatus(_paths.ProfilesFile, _logger);
@@ -298,16 +348,33 @@ public partial class MainWindow : Window
         NetworkChange.NetworkAddressChanged -= NetworkChanged;
         NetworkChange.NetworkAvailabilityChanged -= NetworkAvailabilityChanged;
         _adapterStatusTimer.Stop();
+        _adapterNetworkChangeTimer.Stop();
+        await _adapterStatusCoordinator.DisposeAsync();
+        _logDisplayTimer.Stop();
+        lock (_logDisplaySync) _logDisplayClosed = true;
+        _logger.LineWritten -= Logger_LineWritten;
+        DrainLogDisplayQueue(force: true);
         _feedbackTimer.Stop();
-        _updateCts.Cancel();
-        _updateDownloadCts?.Cancel();
+        _updateController.StateChanged -= UpdateController_StateChanged;
         IsEnabled = false;
-        if (_updateDownloadTask is not null) await _updateDownloadTask;
+        await _updateController.DisposeAsync();
         SetBusy(true, IsChineseUi() ? "正在保存恢复信息并停止 DHCP..." : "Saving recovery state and stopping DHCP...");
         await CleanupWorkEnvironmentAsync();
         SetBusy(false);
-        _updateService.Dispose();
-        _updateCts.Dispose();
+        _scanProgressTimer.Stop();
+        _scanHistoryFlushTimer.Stop();
+        if (_operationHistoryWritable)
+        {
+            try { await _operationHistoryWriter.SaveAsync(_operationHistory.ToArray()); }
+            catch (Exception ex)
+            {
+                _operationHistorySaveFailed = true;
+                _logger.Error("Final operation-history save failed; the in-memory snapshot is retained until process exit", ex);
+            }
+        }
+        await _operationHistoryWriter.DisposeAsync();
+        await _leaseProbeCoordinator.DisposeAsync();
+        await _probe.DisposeAsync();
         _closeAfterCleanup = true;
         await Dispatcher.InvokeAsync(Close, DispatcherPriority.Background);
     }
@@ -473,42 +540,29 @@ public partial class MainWindow : Window
 
     private async Task CheckForUpdatesAsync()
     {
-        if (_updateCheckStarted) return;
-        _updateCheckStarted = true;
-        _updateSourceSpeeds = [];
-        UpdateVersionPresentation();
+        if (_updateState.CheckStarted) return;
         try
         {
-            var speedProgress = new Progress<UpdateSourceSpeed>(source =>
-            {
-                if (_lastUpdateResult != null) return;
-                _updateSourceSpeeds = _updateSourceSpeeds
-                    .Where(existing => !existing.Url.Equals(source.Url, StringComparison.OrdinalIgnoreCase))
-                    .Append(source)
-                    .ToArray();
-                UpdateVersionPresentation();
-            });
-            _lastUpdateResult = await _updateService.CheckAsync(CurrentVersion, _updateCts.Token, speedProgress);
-            _updateSourceSpeeds = _lastUpdateResult.DownloadSpeeds;
-            _logger.Info(_lastUpdateResult.Succeeded
-                ? $"Update check completed: current={CurrentVersionText} latest={_lastUpdateResult.LatestVersion} new={_lastUpdateResult.IsNewVersion}"
-                : "Update check failed: " + _lastUpdateResult.Error);
+            var result = await _updateController.CheckAsync();
+            if (result == null) return;
+            _logger.Info(result.Succeeded
+                ? $"Update check completed: current={CurrentVersionText} latest={result.LatestVersion} new={result.IsNewVersion}"
+                : "Update check failed: " + result.Error);
         }
-        catch (OperationCanceledException) when (_updateCts.IsCancellationRequested)
+        catch (OperationCanceledException) when (_closingCleanupStarted)
         {
             return;
         }
         catch (Exception ex)
         {
-            _lastUpdateResult = new UpdateCheckResult { CurrentVersion = CurrentVersion, Succeeded = false, Error = ex.Message };
             _logger.Error("Update check failed", ex);
         }
-        UpdateVersionPresentation();
     }
 
     private void UpdateVersionPresentation()
     {
-        if (!_updateCheckStarted)
+        var result = _updateState.CheckResult;
+        if (!_updateState.CheckStarted)
         {
             TxtUpdateStatus.Text = "";
             TxtUpdateLink.Visibility = Visibility.Collapsed;
@@ -516,27 +570,27 @@ public partial class MainWindow : Window
             return;
         }
 
-        if (_lastUpdateResult == null)
+        if (result == null)
         {
-            var speedSummary = FormatUpdateSpeedSummary(_updateSourceSpeeds);
+            var speedSummary = FormatUpdateSpeedSummary(_updateState.SourceSpeeds);
             TxtUpdateStatus.Text = string.IsNullOrWhiteSpace(speedSummary)
                 ? _lang.T("checking.update")
                 : IsChineseUi() ? $"检查更新 · {speedSummary}" : $"Checking updates · {speedSummary}";
-            TxtUpdateStatus.ToolTip = FormatUpdateSpeedDetails(_updateSourceSpeeds);
+            TxtUpdateStatus.ToolTip = FormatUpdateSpeedDetails(_updateState.SourceSpeeds);
             TxtUpdateLink.Visibility = Visibility.Collapsed;
             UpdateLink.IsEnabled = false;
             return;
         }
 
-        if (_lastUpdateResult.Succeeded && _lastUpdateResult.IsNewVersion)
+        if (result.Succeeded && result.IsNewVersion)
         {
-            var speedSummary = FormatUpdateSpeedSummary(_lastUpdateResult.DownloadSpeeds, _lastUpdateResult.DownloadUrl);
+            var speedSummary = FormatUpdateSpeedSummary(result.DownloadSpeeds, result.DownloadUrl);
             TxtUpdateStatus.Text = speedSummary;
-            var speedDetails = FormatUpdateSpeedDetails(_lastUpdateResult.DownloadSpeeds, _lastUpdateResult.DownloadUrl);
+            var speedDetails = FormatUpdateSpeedDetails(result.DownloadSpeeds, result.DownloadUrl);
             TxtUpdateStatus.ToolTip = speedDetails;
             UpdateLink.Inlines.Clear();
-            UpdateLink.Inlines.Add(new Run($"{_lang.T("new.version")} v{_lastUpdateResult.LatestVersion}"));
-            UpdateLink.ToolTip = $"{speedDetails}{Environment.NewLine}{_lastUpdateResult.DownloadUrl}";
+            UpdateLink.Inlines.Add(new Run($"{_lang.T("new.version")} v{result.LatestVersion}"));
+            UpdateLink.ToolTip = $"{speedDetails}{Environment.NewLine}{result.DownloadUrl}";
             TxtUpdateLink.Visibility = Visibility.Visible;
             UpdateLink.IsEnabled = true;
             return;
@@ -544,8 +598,8 @@ public partial class MainWindow : Window
 
         TxtUpdateLink.Visibility = Visibility.Collapsed;
         UpdateLink.IsEnabled = false;
-        TxtUpdateStatus.Text = _lastUpdateResult.Succeeded ? _lang.T("latest.version") : _lang.T("update.failed");
-        TxtUpdateStatus.ToolTip = _lastUpdateResult.Succeeded ? null : _lastUpdateResult.Error;
+        TxtUpdateStatus.Text = result.Succeeded ? _lang.T("latest.version") : _lang.T("update.failed");
+        TxtUpdateStatus.ToolTip = result.Succeeded ? null : result.Error;
     }
 
     private string FormatUpdateSpeedSummary(IReadOnlyList<UpdateSourceSpeed> speeds, string? selectedUrl = null)
@@ -760,6 +814,8 @@ public partial class MainWindow : Window
             if (ownsBusyState) SetBusy(false);
             UpdateAdapterActionButtons();
             UpdateSessionStatus();
+            if (_adapterStatusRefreshDirty && !_closingCleanupStarted && _activeNetworkWorkflow is null)
+                RefreshSelectedAdapterStatus();
             if (!_closingCleanupStarted) _adapterStatusTimer.Start();
         }
     }
@@ -1115,7 +1171,7 @@ public partial class MainWindow : Window
         var measuredDuration = durationMs > 0 || _operationStartedTimestamp == 0
             ? durationMs
             : (long)Stopwatch.GetElapsedTime(_operationStartedTimestamp).TotalMilliseconds;
-        var item = new OperationHistoryItem
+        InsertOperationHistory(new OperationHistoryItem
         {
             Type = type,
             Scope = string.IsNullOrWhiteSpace(scope) ? (SelectedAdapter?.Name ?? "") : scope,
@@ -1125,14 +1181,94 @@ public partial class MainWindow : Window
             Detail = detail,
             DurationMs = measuredDuration,
             RollbackAvailable = rollbackAvailable
-        };
-        _operationHistory.Insert(0, item);
-        while (_operationHistory.Count > 500) _operationHistory.RemoveAt(_operationHistory.Count - 1);
-        try { JsonStore.Save(_paths.OperationHistoryFile, _operationHistory); }
-        catch (Exception ex) { _logger.Error("Save operation history failed; existing files were retained", ex); }
+        });
+        PersistOperationHistoryImmediately();
         RefreshOperationHistoryView();
         UpdateLastOperationPresentation();
         UpdateRecoveryBanner();
+    }
+
+    private void InsertOperationHistory(OperationHistoryItem item)
+    {
+        _operationHistory.Insert(0, item);
+        while (_operationHistory.Count > 500) _operationHistory.RemoveAt(_operationHistory.Count - 1);
+    }
+
+    private void PersistOperationHistoryImmediately()
+    {
+        if (!_operationHistoryWritable)
+        {
+            _operationHistorySaveFailed = true;
+            UpdateHistorySummary();
+            return;
+        }
+        try
+        {
+            _operationHistoryWriter.SaveAsync(_operationHistory.ToArray()).GetAwaiter().GetResult();
+            _operationHistorySaveFailed = false;
+        }
+        catch (Exception ex)
+        {
+            _operationHistorySaveFailed = true;
+            _logger.Error("Save operation history failed; the in-memory snapshot is retained for retry", ex);
+        }
+        UpdateHistorySummary();
+    }
+
+    private void AddScanOperationHistory(ScanResult result)
+    {
+        InsertOperationHistory(new OperationHistoryItem
+        {
+            Type = "Scan",
+            Scope = SelectedAdapter?.Name ?? "",
+            IpAddress = result.IpAddress,
+            MacAddress = result.MacAddress,
+            Status = result.StatusText,
+            Detail = result.Remark
+        });
+        _pendingScanHistoryCount++;
+        if (!_scanHistoryFlushTimer.IsEnabled) _scanHistoryFlushTimer.Start();
+        if (_pendingScanHistoryCount >= 128) _ = FlushScanHistoryAsync();
+    }
+
+    private async Task<bool> FlushScanHistoryAsync(bool force = false)
+    {
+        if (_pendingScanHistoryCount == 0 || (!force && _pendingScanHistoryCount < 128)) return !_operationHistorySaveFailed;
+        if (_scanHistoryFlushInProgress) return false;
+        if (!_operationHistoryWritable)
+        {
+            _operationHistorySaveFailed = true;
+            UpdateHistorySummary();
+            return false;
+        }
+
+        _scanHistoryFlushInProgress = true;
+        var countBeingCommitted = _pendingScanHistoryCount;
+        _pendingScanHistoryCount = 0;
+        try
+        {
+            await _operationHistoryWriter.SaveAsync(_operationHistory.ToArray());
+            _operationHistorySaveFailed = false;
+            if (_pendingScanHistoryCount == 0) _scanHistoryFlushTimer.Stop();
+            UpdateHistorySummary();
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _pendingScanHistoryCount += countBeingCommitted;
+            _operationHistorySaveFailed = true;
+            _logger.Error("Commit scan history batch failed; the in-memory snapshot is retained for retry", ex);
+            UpdateHistorySummary();
+            return false;
+        }
+        finally
+        {
+            _scanHistoryFlushInProgress = false;
+            if (_pendingScanHistoryCount >= 128 && !_operationHistorySaveFailed)
+                await FlushScanHistoryAsync(force: false);
+            else if (force && _pendingScanHistoryCount > 0 && !_operationHistorySaveFailed)
+                await FlushScanHistoryAsync(force: true);
+        }
     }
 
     private void UpdateLastOperationPresentation()
@@ -1188,18 +1324,21 @@ public partial class MainWindow : Window
     private void RefreshOperationHistoryView()
     {
         if (HistoryGrid == null) return;
+        var selected = HistoryGrid.SelectedItems.OfType<OperationHistoryItem>().ToHashSet();
         var q = HistoryFilterBox.Text?.Trim() ?? "";
         OperationHistory.Clear();
-        foreach (var item in _operationHistory.Where(x => string.IsNullOrWhiteSpace(q)
+        var visible = _operationHistory.Where(x => string.IsNullOrWhiteSpace(q)
             || x.Type.Contains(q, StringComparison.OrdinalIgnoreCase)
             || x.Scope.Contains(q, StringComparison.OrdinalIgnoreCase)
             || x.Status.Contains(q, StringComparison.OrdinalIgnoreCase)
             || x.Detail.Contains(q, StringComparison.OrdinalIgnoreCase)
             || x.IpAddress.Contains(q, StringComparison.OrdinalIgnoreCase)
-            || x.MacAddress.Contains(q, StringComparison.OrdinalIgnoreCase)))
+            || x.MacAddress.Contains(q, StringComparison.OrdinalIgnoreCase)).ToArray();
+        foreach (var item in visible)
         {
             OperationHistory.Add(item);
         }
+        foreach (var item in visible.Where(selected.Contains)) HistoryGrid.SelectedItems.Add(item);
         UpdateHistorySummary();
     }
 
@@ -1209,6 +1348,8 @@ public partial class MainWindow : Window
         TxtHistorySummary.Text = IsChineseUi()
             ? $"显示 {OperationHistory.Count}/{_operationHistory.Count} 条"
             : $"Showing {OperationHistory.Count}/{_operationHistory.Count}";
+        if (!_operationHistoryWritable || _operationHistorySaveFailed)
+            TxtHistorySummary.Text += IsChineseUi() ? "（未保存，保留内存记录并等待重试）" : " (not saved; retained in memory for retry)";
         UpdateEmptyStates();
     }
 
@@ -1567,7 +1708,7 @@ public partial class MainWindow : Window
             SetBusyPhase(IsChineseUi() ? "检查 WLAN 并创建、核对防火墙规则..." : "Checking WLAN and creating/verifying firewall rules...");
             await _adapterService.LogReadonlyWlanStateAsync("after DHCP start", OperationToken);
             _dhcpFirewallRules = await _adapterService.EnsureDhcpFirewallRulesAsync(adapter.Name, TrackActiveDhcpFirewallLease, OperationToken);
-            _activeDhcpUiSessionId = Guid.NewGuid().ToString("N");
+            Volatile.Write(ref _activeDhcpUiSessionId, Guid.NewGuid().ToString("N"));
             SetBusyPhase(IsChineseUi() ? "启动 DHCP 服务..." : "Starting the DHCP service...");
             await _dhcpServer.StartAsync(settings, leaseScope.Bindings, leaseScope.DeclinedAddresses,
                 snapshot => PersistDhcpLeaseTable(leaseScope, snapshot));
@@ -1596,7 +1737,9 @@ public partial class MainWindow : Window
             if (!serverStarted)
             {
                 _activeDhcpSession = null;
-                _activeDhcpUiSessionId = null;
+                var failedUiSessionId = _activeDhcpUiSessionId;
+                Volatile.Write(ref _activeDhcpUiSessionId, null);
+                await EndLeaseProbeSessionAsync(failedUiSessionId);
             }
             if (!_closingCleanupStarted)
                 AppDialog.Show(this, _lang.T("start.dhcp"), IsChineseUi() ? "操作已取消，已完成的网卡变更已尝试回滚。" : "The operation was canceled; completed adapter changes were rolled back where possible.");
@@ -1623,7 +1766,9 @@ public partial class MainWindow : Window
             if (!serverStarted)
             {
                 _activeDhcpSession = null;
-                _activeDhcpUiSessionId = null;
+                var failedUiSessionId = _activeDhcpUiSessionId;
+                Volatile.Write(ref _activeDhcpUiSessionId, null);
+                await EndLeaseProbeSessionAsync(failedUiSessionId);
             }
             if (!_closingCleanupStarted)
                 AppDialog.Show(this, _lang.T("start.dhcp"), ExplainFailure(ex, _lang.T("help.start.dhcp")), danger: true);
@@ -1647,13 +1792,14 @@ public partial class MainWindow : Window
                 IsChineseUi() ? "停止 DHCP 服务..." : "Stopping the DHCP service...",
                 totalPhases: restoreAdapter ? 4 : 3);
             await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.Render);
+            _leasePingTimer.Stop();
+            var stoppedUiSessionId = _activeDhcpUiSessionId;
             _dhcpServer.Stop();
-            MarkLeaseSessionHistorical(_activeDhcpUiSessionId);
-            _activeDhcpUiSessionId = null;
+            Volatile.Write(ref _activeDhcpUiSessionId, null);
+            await EndLeaseProbeSessionAsync(stoppedUiSessionId);
             BtnCancelOperation.IsEnabled = false;
             SetBusyPhase(IsChineseUi() ? "清理本工具创建的防火墙规则..." : "Removing firewall rules owned by this app...");
             var firewallCleanupSucceeded = await RemoveDhcpFirewallRulesAsync(CancellationToken.None);
-            _leasePingTimer.Stop();
             _leaseHintCts?.Cancel();
             if (restoreAdapter)
             {
@@ -1718,8 +1864,9 @@ public partial class MainWindow : Window
             _logger.Error("DHCP stopped unexpectedly: " + reason);
             _leasePingTimer.Stop();
             _leaseHintCts?.Cancel();
-            MarkLeaseSessionHistorical(_activeDhcpUiSessionId);
-            _activeDhcpUiSessionId = null;
+            var stoppedUiSessionId = _activeDhcpUiSessionId;
+            Volatile.Write(ref _activeDhcpUiSessionId, null);
+            await EndLeaseProbeSessionAsync(stoppedUiSessionId);
 
             var firewallCleanupSucceeded = await RemoveDhcpFirewallRulesAsync(CancellationToken.None);
             var adapterRestored = false;
@@ -1776,6 +1923,8 @@ public partial class MainWindow : Window
         var workflow = TryBeginNetworkWorkflow("Manual configuration and scan");
         if (workflow is null) return;
         NetworkAdapterInfo? operationAdapter = null;
+        ScanProgressAccumulator? progressAccumulator = null;
+        long scanGeneration = 0;
         try
         {
             var adapter = operationAdapter = SelectedAdapter ?? throw new InvalidOperationException("No adapter selected");
@@ -1816,20 +1965,11 @@ public partial class MainWindow : Window
             MarkAdapterIp(adapter, ManualIp.Text);
             SetBusy(false);
             _scanPhase = IsChineseUi() ? "正在扫描" : "Scanning";
-            var progress = new Progress<(int done, int total, ScanResult? result)>(p =>
-            {
-                ScanProgress.Maximum = p.total;
-                ScanProgress.Value = p.done;
-                if (p.result != null)
-                {
-                    ScanResults.Add(p.result);
-                    _scanLastHitAt = DateTime.Now;
-                }
-                if (p.result != null) AddOperationHistory("Scan", p.result.IpAddress, p.result.MacAddress, p.result.StatusText, p.result.Remark);
-                ScanStatus.Text = $"{p.done}/{p.total} Found={ScanResults.Count}";
-                UpdateScanTiming(p.done, p.total);
-                UpdateScanSummary();
-            });
+            scanGeneration = Interlocked.Increment(ref _scanProgressGeneration);
+            progressAccumulator = new ScanProgressAccumulator(scanPlan!.TargetCount);
+            _scanProgressAccumulator = progressAccumulator;
+            _scanProgressTimer.Start();
+            IProgress<(int done, int total, ScanResult? result)> progress = progressAccumulator;
             if (scanPlan!.IsSingleTarget)
             {
                 await ProbeTargetUntilOnlineAsync(scanPlan.TargetIp!, progress, scanToken);
@@ -1838,26 +1978,32 @@ public partial class MainWindow : Window
             {
                 await _scanner.ScanPlanAsync(scanPlan, _settings.PingConcurrency, _settings.PingTimeoutMs, _settings.HttpTimeoutMs, progress, scanToken);
             }
+            await FinishScanProgressAsync(progressAccumulator, scanGeneration);
             _scanPhase = IsChineseUi() ? "扫描完成" : "Scan complete";
             UpdateScanTiming((int)ScanProgress.Value, (int)ScanProgress.Maximum);
             AddOperationHistory("Scan", ManualTargetIp.Text.Trim(), adapter.MacAddress, "Completed / 已完成",
                 $"{ScanResults.Count} result(s) / {ScanResults.Count} 条结果", scope: adapter.Name,
                 durationMs: _scanStopwatch?.ElapsedMilliseconds ?? 0,
                 rollbackAvailable: _originalAdapterConfigs.ContainsKey(AdapterSnapshotKey(adapter)));
-            ShowActionFeedback("扫描已完成。", "Scan completed.");
+            if (_operationHistorySaveFailed)
+                ShowActionFeedback("扫描完成，但操作历史未能保存；记录仍保留在内存中等待重试。", "Scan completed, but operation history was not saved; records remain in memory for retry.", error: true);
+            else ShowActionFeedback("扫描已完成。", "Scan completed.");
         }
         catch (OperationCanceledException)
         {
+            if (progressAccumulator != null) await FinishScanProgressAsync(progressAccumulator, scanGeneration);
             CompleteCanceledScan(operationAdapter);
         }
         catch (Exception ex)
         {
+            if (progressAccumulator != null) await FinishScanProgressAsync(progressAccumulator, scanGeneration);
             _logger.Error("Apply and scan failed", ex);
             if (!_closingCleanupStarted)
                 AppDialog.Show(this, _lang.T("apply.scan"), ExplainFailure(ex, _lang.T("help.apply.scan")), danger: true);
         }
         finally
         {
+            if (progressAccumulator != null) await FinishScanProgressAsync(progressAccumulator, scanGeneration);
             _scanStopwatch?.Stop();
             SetBusy(false);
             _scanRunning = false;
@@ -1866,6 +2012,50 @@ public partial class MainWindow : Window
             EndNetworkWorkflow(workflow);
             UpdateManualScanButtons();
             UpdateFavoriteButtons();
+        }
+    }
+
+    private void DrainScanProgressBatch()
+    {
+        var accumulator = _scanProgressAccumulator;
+        if (accumulator == null || !accumulator.TryTakeBatch(128, out var batch)) return;
+        ApplyScanProgressBatch(accumulator, _scanProgressGeneration, batch);
+    }
+
+    private void ApplyScanProgressBatch(ScanProgressAccumulator accumulator, long generation, ScanProgressBatch batch)
+    {
+        if (generation != _scanProgressGeneration || !ReferenceEquals(accumulator, _scanProgressAccumulator)) return;
+        ScanProgress.Maximum = Math.Max(1, batch.Total);
+        ScanProgress.Value = Math.Max(ScanProgress.Value, Math.Clamp(batch.Done, 0, (int)ScanProgress.Maximum));
+        foreach (var result in batch.Results)
+        {
+            ScanResults.Add(result);
+            AddScanOperationHistory(result);
+            _scanLastHitAt = DateTime.Now;
+        }
+        ScanStatus.Text = $"{batch.Done}/{batch.Total} Found={ScanResults.Count}";
+        UpdateScanTiming(batch.Done, batch.Total);
+        UpdateScanSummary();
+        if (batch.Results.Count > 0)
+        {
+            RefreshOperationHistoryView();
+            UpdateLastOperationPresentation();
+        }
+    }
+
+    private async Task FinishScanProgressAsync(ScanProgressAccumulator accumulator, long generation)
+    {
+        accumulator.Complete();
+        _scanProgressTimer.Stop();
+        if (generation == _scanProgressGeneration && ReferenceEquals(accumulator, _scanProgressAccumulator))
+        {
+            while (accumulator.TryTakeBatch(128, out var batch))
+            {
+                ApplyScanProgressBatch(accumulator, generation, batch);
+                await Dispatcher.Yield(DispatcherPriority.Background);
+            }
+            _scanProgressAccumulator = null;
+            _ = await FlushScanHistoryAsync(force: true);
         }
     }
 
@@ -1948,11 +2138,11 @@ public partial class MainWindow : Window
 
             if (result.PingOk)
             {
-                result.Hostname = await ResolveHostAsync(ip, ct);
-                var probes = await _probe.ProbeAsync(ip, _settings.HttpTimeoutMs, ct);
+                var details = await _scanner.ProbeReachableDetailsAsync(targetIp, _settings.HttpTimeoutMs, ct);
                 ct.ThrowIfCancellationRequested();
-                result.HttpOk = probes.http;
-                result.HttpsOk = probes.https;
+                result.Hostname = details.Hostname;
+                result.HttpOk = details.HttpOk;
+                result.HttpsOk = details.HttpsOk;
                 ScanGrid.Items.Refresh();
                 UpdateScanSummary();
                 progress.Report((1, 1, null));
@@ -4017,19 +4207,41 @@ public partial class MainWindow : Window
             _logger.Info($"Operation history copied: count={rows.Count}");
     }
 
-    private void ClearHistory_Click(object sender, RoutedEventArgs e)
+    private async void ClearHistory_Click(object sender, RoutedEventArgs e)
     {
+        if (_scanRunning)
+        {
+            ShowActionFeedback("扫描进行中，完成后再清空操作历史。", "Clear operation history after the active scan completes.", error: true);
+            return;
+        }
+        if (!_operationHistoryWritable)
+        {
+            ShowStorageWriteBlocked("操作历史");
+            return;
+        }
         if (_operationHistory.Count == 0) return;
         if (!AppDialog.Show(this, IsChineseUi() ? "清空操作历史" : "Clear Operation History",
             IsChineseUi() ? "只清空本地操作历史，不会删除运行日志，也不会撤销网络配置。是否继续？" : "Only local operation history will be cleared. Runtime logs and network configuration will not be changed. Continue?",
             confirm: true, danger: true)) return;
+        if (!await FlushScanHistoryAsync(force: true))
+        {
+            ShowActionFeedback("历史尚未成功保存，未执行清空。", "History could not be saved, so it was not cleared.", error: true);
+            return;
+        }
         var previous = _operationHistory.ToList();
         _operationHistory.Clear();
-        try { JsonStore.Save(_paths.OperationHistoryFile, _operationHistory); }
+        try
+        {
+            await _operationHistoryWriter.SaveAsync(_operationHistory.ToArray());
+            _operationHistorySaveFailed = false;
+            _scanHistoryFlushTimer.Stop();
+            _pendingScanHistoryCount = 0;
+        }
         catch (Exception ex)
         {
             _operationHistory.AddRange(previous);
-            _logger.Error("Clear operation history failed; existing history was retained", ex);
+            _operationHistorySaveFailed = true;
+            _logger.Error("Clear operation history failed; the in-memory snapshot was retained", ex);
             RefreshOperationHistoryView();
             UpdateLastOperationPresentation();
             ShowActionFeedback("操作历史未能清空，原文件和记录已保留。", "Operation history was not cleared; the source file and rows were retained.", error: true);
@@ -4050,6 +4262,7 @@ public partial class MainWindow : Window
     private void AdapterBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         if (SelectedAdapter == null) return;
+        Interlocked.Increment(ref _adapterSelectionGeneration);
         UpdateAdapterIpText(SelectedAdapter);
         TxtMac.Text = SelectedAdapter.MacAddress;
         TxtGateway.Text = SelectedAdapter.Gateway;
@@ -4061,6 +4274,7 @@ public partial class MainWindow : Window
         UpdateFavoriteButtons();
         UpdateAdapterActionButtons();
         UpdateSessionStatus();
+        RefreshSelectedAdapterStatus();
     }
 
     private async void RefreshAdapters_Click(object sender, RoutedEventArgs e) => await RefreshAdaptersAsync();
@@ -4293,6 +4507,9 @@ public partial class MainWindow : Window
         if (!TryBeginStandaloneOperation("Creating support package... / 正在生成支持包...")) return;
         try
         {
+            if (!await FlushScanHistoryAsync(force: true) || !_operationHistoryWritable)
+                throw new IOException("Operation history could not be committed, so the support package was not created.");
+            await _operationHistoryWriter.SaveAsync(_operationHistory.ToArray());
             var cancellationToken = OperationToken;
             var manifest = IsChineseUi()
                 ? $"本支持包不包含收藏夹凭据。包含运行日志、设置、网卡备份、配置方案和操作历史。网络地址脱敏：{(redact ? "是" : "否")}。\n"
@@ -4330,17 +4547,20 @@ public partial class MainWindow : Window
         }
     }
 
-    private static void AddSupportFile(ZipArchive archive, string sourcePath, string entryName, bool redact)
+    internal static void AddSupportFile(ZipArchive archive, string sourcePath, string entryName, bool redact)
     {
+        using var source = new FileStream(sourcePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
         if (!redact)
         {
-            archive.CreateEntryFromFile(sourcePath, entryName);
+            using var target = archive.CreateEntry(entryName).Open();
+            source.CopyTo(target);
             return;
         }
 
         var entry = archive.CreateEntry(entryName);
         using var writer = new StreamWriter(entry.Open(), new UTF8Encoding(false));
-        writer.Write(RedactSupportText(File.ReadAllText(sourcePath)));
+        using var reader = new StreamReader(source, Encoding.UTF8, detectEncodingFromByteOrderMarks: true, leaveOpen: true);
+        writer.Write(RedactSupportText(reader.ReadToEnd()));
     }
 
     private static string RedactSupportText(string text)
@@ -4492,6 +4712,11 @@ public partial class MainWindow : Window
 
     private void ClearLog_Click(object sender, RoutedEventArgs e)
     {
+        lock (_logDisplaySync)
+        {
+            _logDisplayQueue.Clear();
+            _logDisplayOmitted = 0;
+        }
         LogBox.Document.Blocks.Clear();
         UpdateLogSummary();
         ShowActionFeedback("日志已清空。", "Log view cleared.");
@@ -4574,95 +4799,181 @@ public partial class MainWindow : Window
         }
     }
 
-    private async Task UpdateLeaseAsync(DhcpLease incoming)
+    internal void ProcessLeaseEvent(DhcpLease incoming)
     {
-        await _leaseUpdateGate.WaitAsync();
-        try
+        if (_closingCleanupStarted) return;
+        incoming.IsCurrentSession = !string.IsNullOrWhiteSpace(incoming.SessionId)
+            && string.Equals(incoming.SessionId, _activeDhcpUiSessionId, StringComparison.Ordinal);
+        var clientKey = GetLeaseClientKey(incoming);
+        var existing = Leases.LastOrDefault(x => x.IsActiveLease
+            && GetLeaseClientKey(x).Equals(clientKey, StringComparison.OrdinalIgnoreCase)
+            && x.SessionId.Equals(incoming.SessionId, StringComparison.Ordinal));
+        if (existing == null)
         {
-            incoming.IsCurrentSession = !string.IsNullOrWhiteSpace(incoming.SessionId)
-                && string.Equals(incoming.SessionId, _activeDhcpUiSessionId, StringComparison.Ordinal);
-            var clientKey = string.IsNullOrWhiteSpace(incoming.ClientKey) ? "MAC:" + incoming.MacAddress : incoming.ClientKey;
-            var existing = Leases.LastOrDefault(x => x.IsActiveLease
-                && x.ClientKey.Equals(clientKey, StringComparison.OrdinalIgnoreCase)
-                && x.SessionId.Equals(incoming.SessionId, StringComparison.Ordinal));
-            if (existing == null)
+            existing = incoming;
+            Leases.Add(existing);
+            _logger.Info($"UI lease added: {existing.MacAddress} {existing.IpAddress} {existing.Status}");
+        }
+        else
+        {
+            var addressChanged = !existing.IpAddress.Equals(incoming.IpAddress, StringComparison.OrdinalIgnoreCase);
+            existing.IpAddress = incoming.IpAddress;
+            existing.ClientKey = incoming.ClientKey;
+            existing.ClientIdentifier = incoming.ClientIdentifier;
+            existing.SessionId = incoming.SessionId;
+            existing.IsCurrentSession = incoming.IsCurrentSession;
+            existing.Hostname = incoming.Hostname;
+            existing.LeaseStart = incoming.LeaseStart;
+            existing.LeaseEnd = incoming.LeaseEnd;
+            existing.Status = incoming.Status;
+            existing.IsActiveLease = incoming.IsActiveLease;
+            if (addressChanged)
             {
-                existing = incoming;
-                Leases.Add(existing);
-                _logger.Info($"UI lease added: {existing.MacAddress} {existing.IpAddress} {existing.Status}");
-            }
-            else
-            {
-                var addressChanged = !existing.IpAddress.Equals(incoming.IpAddress, StringComparison.OrdinalIgnoreCase);
-                existing.IpAddress = incoming.IpAddress;
-                existing.Hostname = incoming.Hostname;
-                existing.LeaseStart = incoming.LeaseStart;
-                existing.LeaseEnd = incoming.LeaseEnd;
-                existing.Status = incoming.Status;
-                existing.IsActiveLease = incoming.IsActiveLease;
-                existing.ClientIdentifier = incoming.ClientIdentifier;
-                if (addressChanged) { existing.Time = DateTime.MinValue; existing.PingLatencyMs = -1; }
-                _logger.Info($"UI lease updated: {existing.MacAddress} {existing.IpAddress} {existing.Status}");
-            }
-
-            if (incoming.Status is "Released" or "Declined" or "Expired")
-            {
-                existing.IsActiveLease = false;
+                existing.Time = DateTime.MinValue;
                 existing.PingLatencyMs = -1;
                 existing.HttpOk = false;
                 existing.HttpsOk = false;
             }
-            if (existing.IsCurrentSession && existing.IsActiveLease && existing.LeaseEnd > DateTime.Now)
-            {
-                await ProbeLeaseConnectivityAsync(existing);
-                var probes = await _probe.ProbeAsync(existing.IpAddress, _settings.HttpTimeoutMs);
-                existing.HttpOk = probes.http;
-                existing.HttpsOk = probes.https;
-            }
-            AddOperationHistory("DHCP Lease", existing.IpAddress, existing.MacAddress, existing.Status, existing.Hostname);
-            _logger.Info($"UI lease probe: {existing.IpAddress} ping={existing.PingLatencyMs} http={existing.HttpOk} https={existing.HttpsOk}");
-            LeaseGrid.Items.Refresh();
-            UpdateEmptyStates();
+            _logger.Info($"UI lease updated: {existing.MacAddress} {existing.IpAddress} {existing.Status}");
         }
-        finally
+
+        var bindingKey = new LeaseProbeBindingKey(existing.SessionId, clientKey);
+        var generation = NextLeaseProbeGeneration(bindingKey);
+        if (incoming.Status is "Released" or "Declined" or "Expired")
         {
-            _leaseUpdateGate.Release();
+            existing.IsActiveLease = false;
+            existing.PingLatencyMs = -1;
+            existing.HttpOk = false;
+            existing.HttpsOk = false;
+            _leaseProbeCoordinator.InvalidateBinding(bindingKey);
         }
+        else if (existing.IsCurrentSession && existing.IsActiveLease && existing.LeaseEnd > DateTime.Now)
+        {
+            var identity = new LeaseProbeIdentity(existing.SessionId, clientKey, existing.IpAddress, generation);
+            var scheduled = _leaseProbeCoordinator.Schedule(new LeaseProbeRequest(identity, IncludeWeb: true));
+            if (scheduled == LeaseProbeScheduleResult.QueueFull)
+                _logger.Warn($"DHCP lease event probe deferred because the bounded queue is full: session={identity.SessionId} client={identity.ClientKey}");
+        }
+        else
+        {
+            _leaseProbeCoordinator.InvalidateBinding(bindingKey);
+        }
+
+        AddOperationHistory("DHCP Lease", existing.IpAddress, existing.MacAddress, existing.Status, existing.Hostname);
+        LeaseGrid.Items.Refresh();
+        UpdateEmptyStates();
     }
 
-    private async Task RefreshLeasePingAsync()
+    private long NextLeaseProbeGeneration(LeaseProbeBindingKey bindingKey)
     {
-        if (_leaseProbeInProgress) return;
-        if (!Leases.Any(x => x.IsCurrentSession && x.IsActiveLease && x.LeaseEnd > DateTime.Now)) return;
-        _leaseProbeInProgress = true;
+        var generation = _leaseProbeGenerations.TryGetValue(bindingKey, out var previous)
+            ? checked(previous + 1)
+            : 1;
+        _leaseProbeGenerations[bindingKey] = generation;
+        return generation;
+    }
+
+    private static string GetLeaseClientKey(DhcpLease lease) =>
+        string.IsNullOrWhiteSpace(lease.ClientKey) ? "MAC:" + lease.MacAddress : lease.ClientKey;
+
+    private void RefreshLeasePing()
+    {
+        if (_closingCleanupStarted) return;
+        var activeLeases = Leases.Where(lease => lease.IsCurrentSession && lease.IsActiveLease && lease.LeaseEnd > DateTime.Now).ToArray();
+        if (activeLeases.Length == 0)
+        {
+            _leaseProbeRefreshCursor = 0;
+            return;
+        }
+
+        var start = Math.Abs(_leaseProbeRefreshCursor % activeLeases.Length);
+        var rotation = Math.Min(LeaseProbeCoordinator.DefaultMaximumConcurrency + LeaseProbeCoordinator.DefaultMaximumQueued, activeLeases.Length);
+        _leaseProbeRefreshCursor = (start + rotation) % activeLeases.Length;
+        var deferred = 0;
+        for (var offset = 0; offset < activeLeases.Length; offset++)
+        {
+            var lease = activeLeases[(start + offset) % activeLeases.Length];
+            var key = new LeaseProbeBindingKey(lease.SessionId, GetLeaseClientKey(lease));
+            if (!_leaseProbeGenerations.TryGetValue(key, out var generation))
+                _leaseProbeGenerations[key] = generation = 1;
+            var identity = new LeaseProbeIdentity(key.SessionId, key.ClientKey, lease.IpAddress, generation);
+            if (_leaseProbeCoordinator.Schedule(new LeaseProbeRequest(identity, IncludeWeb: false)) == LeaseProbeScheduleResult.QueueFull)
+                deferred++;
+        }
+
+        if (deferred > 0)
+            _logger.Info($"DHCP lease probe cycle deferred {deferred} binding(s); active={_leaseProbeCoordinator.ActiveCount} queued={_leaseProbeCoordinator.PendingCount}");
+    }
+
+    private async Task<LeaseProbeResult> ProbeLeaseAsync(LeaseProbeRequest request, CancellationToken cancellationToken)
+    {
+        var latency = await PingLatencyAsync(request.Identity.IpAddress, 800, cancellationToken).ConfigureAwait(false);
+        bool? http = null;
+        bool? https = null;
+        if (request.IncludeWeb)
+        {
+            var result = await _probe.ProbeAsync(request.Identity.IpAddress, _settings.HttpTimeoutMs, cancellationToken).ConfigureAwait(false);
+            http = result.http;
+            https = result.https;
+        }
+        return new LeaseProbeResult(request.Identity, latency, http, https);
+    }
+
+    private async Task ApplyLeaseProbeResultAsync(LeaseProbeResult result, CancellationToken cancellationToken)
+    {
+        if (Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished) return;
         try
         {
-            foreach (var lease in Leases.Where(x => x.IsCurrentSession && x.IsActiveLease && x.LeaseEnd > DateTime.Now).ToList())
-            {
-                await ProbeLeaseConnectivityAsync(lease);
-            }
+            await Dispatcher.InvokeAsync(() => ApplyLeaseProbeResult(result), DispatcherPriority.Background, cancellationToken);
         }
-        finally
+        catch (InvalidOperationException) when (Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished)
         {
-            _leaseProbeInProgress = false;
         }
     }
 
-    private async Task ProbeLeaseConnectivityAsync(DhcpLease lease)
+    private void ApplyLeaseProbeResult(LeaseProbeResult result)
     {
-        if (!lease.IsCurrentSession || !lease.IsActiveLease || lease.LeaseEnd <= DateTime.Now) return;
-        var latency = await PingLatencyAsync(lease.IpAddress);
+        var identity = result.Identity;
+        if (_closingCleanupStarted) return;
+        var bindingKey = identity.BindingKey;
+        if (!_leaseProbeGenerations.TryGetValue(bindingKey, out var generation) || generation != identity.Generation) return;
+        var lease = Leases.LastOrDefault(item => item.IsCurrentSession && item.IsActiveLease
+            && item.LeaseEnd > DateTime.Now
+            && item.SessionId.Equals(identity.SessionId, StringComparison.Ordinal)
+            && GetLeaseClientKey(item).Equals(identity.ClientKey, StringComparison.OrdinalIgnoreCase)
+            && item.IpAddress.Equals(identity.IpAddress, StringComparison.OrdinalIgnoreCase));
+        if (lease is null) return;
+
         var wasReachable = lease.PingLatencyMs >= 0;
-        lease.PingLatencyMs = latency;
-        if (latency >= 0 && !wasReachable) lease.Time = DateTime.Now;
+        lease.PingLatencyMs = result.PingLatencyMs;
+        if (result.PingLatencyMs >= 0 && !wasReachable) lease.Time = DateTime.Now;
+        if (result.HttpOk.HasValue) lease.HttpOk = result.HttpOk.Value;
+        if (result.HttpsOk.HasValue) lease.HttpsOk = result.HttpsOk.Value;
+        LeaseGrid.Items.Refresh();
     }
+
+    internal Task WaitForLeaseProbesAsync() => _leaseProbeCoordinator.WaitForIdleAsync();
+    internal int ActiveLeaseProbeCount => _leaseProbeCoordinator.ActiveCount;
 
     private void MarkLeaseSessionHistorical(string? sessionId)
     {
         if (string.IsNullOrWhiteSpace(sessionId)) return;
         foreach (var lease in Leases.Where(x => x.SessionId.Equals(sessionId, StringComparison.Ordinal)))
+        {
             lease.IsCurrentSession = false;
+            _leaseProbeCoordinator.InvalidateBinding(new LeaseProbeBindingKey(sessionId, GetLeaseClientKey(lease)));
+        }
         LeaseGrid.Items.Refresh();
+    }
+
+    private async Task EndLeaseProbeSessionAsync(string? sessionId)
+    {
+        if (string.IsNullOrWhiteSpace(sessionId)) return;
+        MarkLeaseSessionHistorical(sessionId);
+        await _leaseProbeCoordinator.CancelSessionAsync(sessionId);
+        foreach (var key in _leaseProbeGenerations.Keys.Where(key => key.SessionId.Equals(sessionId, StringComparison.Ordinal)).ToArray())
+            _leaseProbeGenerations.Remove(key);
+        _logger.Info($"DHCP lease probe session canceled and drained: session={sessionId}");
     }
 
     private static async Task<long> PingLatencyAsync(string ip, int timeoutMs = 800, CancellationToken cancellationToken = default)
@@ -4678,15 +4989,6 @@ public partial class MainWindow : Window
         {
             return -1;
         }
-    }
-
-    private static async Task<string> ResolveHostAsync(string ip, CancellationToken cancellationToken)
-    {
-        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeout.CancelAfter(TimeSpan.FromSeconds(1.5));
-        try { return (await Dns.GetHostEntryAsync(ip, AddressFamily.Unspecified, timeout.Token)).HostName; }
-        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested) { return ""; }
-        catch (SocketException) { return ""; }
     }
 
     private async Task ShowLeaseTimeoutHintAsync(CancellationToken ct)
@@ -5150,7 +5452,7 @@ public partial class MainWindow : Window
 
     private void UpdateLink_Click(object sender, RoutedEventArgs e)
     {
-        if (_lastUpdateResult is not { Succeeded: true, IsNewVersion: true } result || string.IsNullOrWhiteSpace(result.DownloadUrl)) return;
+        if (_updateState.CheckResult is not { Succeeded: true, IsNewVersion: true } result || string.IsNullOrWhiteSpace(result.DownloadUrl)) return;
         var changes = result.Changes.Count > 0
             ? string.Join(Environment.NewLine, result.Changes.Select(x => "• " + x))
             : result.ReleaseNotes;
@@ -5162,75 +5464,46 @@ public partial class MainWindow : Window
             ? $"版本 v{result.LatestVersion}\n\n更新内容：\n{changes}\n\n下载源测速：\n{sourceDetails}\n\n确认后将在后台下载更新包，不会自动安装。下载文件会保存到“下载”文件夹；下载过程中可随时点击“取消”停止。"
             : $"Version v{result.LatestVersion}\n\nChanges:\n{changes}\n\nDownload source speed:\n{sourceDetails}\n\nAfter confirmation the package will download in the background and will not be installed automatically. It will be saved to your Downloads folder; click Cancel at any time to stop the download.";
         if (!AppDialog.Show(this, IsChineseUi() ? "发现新版本" : "New Version", message, confirm: true)) return;
-        if (_updateDownloadInProgress)
+        if (_updateState.DownloadInProgress)
         {
             AppDialog.Show(this, IsChineseUi() ? "更新下载" : "Update Download", IsChineseUi() ? "更新已在后台下载中。" : "The update is already downloading.");
             return;
         }
-        _updateDownloadTask = DownloadUpdateAsync(result);
+        _ = DownloadUpdateAsync(result);
     }
 
     private void CancelUpdateDownload_Click(object sender, RoutedEventArgs e)
     {
-        if (!_updateDownloadInProgress || _updateDownloadCts is not { IsCancellationRequested: false } cancellation) return;
-        cancellation.Cancel();
-        BtnCancelUpdateDownload.IsEnabled = false;
-        TxtUpdateStatus.Text = IsChineseUi() ? "正在取消更新下载..." : "Canceling update download...";
+        if (!_updateState.DownloadInProgress || _updateState.DownloadCancellationRequested) return;
+        _updateController.CancelDownload();
     }
 
     private async Task DownloadUpdateAsync(UpdateCheckResult result)
     {
-        _updateDownloadInProgress = true;
-        using var cancellation = new CancellationTokenSource();
-        _updateDownloadCts = cancellation;
-        BtnCancelUpdateDownload.IsEnabled = true;
-        BtnCancelUpdateDownload.Visibility = Visibility.Visible;
-        _updateSlowWarningShown = false;
+        var fileName = string.IsNullOrWhiteSpace(result.ArchiveName) ? $"NetBootDhcpTool-v{result.LatestVersion}.7z" : Path.GetFileName(result.ArchiveName);
+        if (string.IsNullOrWhiteSpace(fileName)) fileName = $"NetBootDhcpTool-v{result.LatestVersion}.7z";
+        var downloads = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
+        var destination = Path.Combine(downloads, fileName);
+        if (File.Exists(destination)) destination = Path.Combine(downloads, Path.GetFileNameWithoutExtension(fileName) + $"-{DateTime.Now:yyyyMMdd-HHmmss}" + Path.GetExtension(fileName));
         try
         {
-            var fileName = string.IsNullOrWhiteSpace(result.ArchiveName) ? $"NetBootDhcpTool-v{result.LatestVersion}.7z" : Path.GetFileName(result.ArchiveName);
-            if (string.IsNullOrWhiteSpace(fileName)) fileName = $"NetBootDhcpTool-v{result.LatestVersion}.7z";
-            var downloads = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
-            var destination = Path.Combine(downloads, fileName);
-            if (File.Exists(destination)) destination = Path.Combine(downloads, Path.GetFileNameWithoutExtension(fileName) + $"-{DateTime.Now:yyyyMMdd-HHmmss}" + Path.GetExtension(fileName));
             _logger.Info($"Update background download started: version={result.LatestVersion} destination={destination}");
-            TxtUpdateStatus.Text = IsChineseUi()
-                ? $"正在从 {GetUpdateSourceName(result.DownloadUrl)} 下载更新..."
-                : $"Downloading update from {GetUpdateSourceName(result.DownloadUrl)}...";
-            var progress = new Progress<UpdateDownloadProgress>(item =>
-            {
-                if (ReferenceEquals(_updateDownloadCts, cancellation)) UpdateDownloadProgressPresentation(item);
-            });
-            var downloaded = await Task.Run(() => _updateService.DownloadAsync(result, destination, progress, cancellation.Token));
+            var downloaded = await _updateController.DownloadAsync(result, destination);
             _logger.Info($"Update background download completed: version={result.LatestVersion} path={downloaded.FilePath} sha256={downloaded.Sha256}");
-            TxtUpdateStatus.Text = IsChineseUi()
-                ? $"更新包已从 {GetUpdateSourceName(downloaded.DownloadUrl)} 下载（未安装）：{downloaded.FilePath}"
-                : $"Update downloaded from {GetUpdateSourceName(downloaded.DownloadUrl)} (not installed): {downloaded.FilePath}";
-            TxtUpdateStatus.ToolTip = FormatUpdateSpeedDetails(result.DownloadSpeeds, downloaded.DownloadUrl);
         }
-        catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+        catch (OperationCanceledException) when (_updateController.State.DownloadCanceled)
         {
             _logger.Info("Update background download canceled");
-            TxtUpdateStatus.Text = _lang.T("update.download.canceled");
         }
         catch (Exception ex)
         {
             _logger.Error("Update background download failed", ex);
-            TxtUpdateStatus.Text = IsChineseUi() ? "更新下载失败，请查看日志或联系作者" : "Update download failed; see logs or contact the author";
-            if (!_closingCleanupStarted)
-                AppDialog.Show(this, IsChineseUi() ? "更新下载失败" : "Update Download Failed", ex.Message + "\n\n1406829360@qq.com", danger: true);
-        }
-        finally
-        {
-            _updateDownloadInProgress = false;
-            _updateDownloadCts = null;
-            BtnCancelUpdateDownload.Visibility = Visibility.Collapsed;
         }
     }
 
     private void UpdateDownloadProgressPresentation(UpdateDownloadProgress progress)
     {
-        if (!_updateDownloadInProgress || _closingCleanupStarted) return;
+        if (!_updateState.DownloadInProgress || _closingCleanupStarted) return;
         var sourceName = GetUpdateSourceName(progress.DownloadUrl);
         if (progress.BytesReceived == 0 && progress.BytesPerSecond == 0)
         {
@@ -5250,17 +5523,65 @@ public partial class MainWindow : Window
                 ? $"{prefix}{size}，速度 {FormatBytesPerSecond(progress.BytesPerSecond)}"
                 : $"{prefix}{size}, {FormatBytesPerSecond(progress.BytesPerSecond)}";
         }
-        TxtUpdateStatus.ToolTip = FormatUpdateSpeedDetails(_lastUpdateResult?.DownloadSpeeds ?? [], progress.DownloadUrl);
-        if (!_updateSlowWarningShown && progress.LowSpeedDuration >= TimeSpan.FromSeconds(10))
+        TxtUpdateStatus.ToolTip = FormatUpdateSpeedDetails(_updateState.CheckResult?.DownloadSpeeds ?? [], progress.DownloadUrl);
+    }
+
+    private void UpdateController_StateChanged(UpdateControllerState state) => ApplyUpdateControllerState(state);
+
+    internal void ApplyUpdateControllerState(UpdateControllerState state)
+    {
+        ArgumentNullException.ThrowIfNull(state);
+        if (!Dispatcher.CheckAccess())
         {
-            _updateSlowWarningShown = true;
-            _logger.Warn($"Update download speed below 3 KB/s for {progress.LowSpeedDuration.TotalSeconds:0} seconds");
+            try { Dispatcher.BeginInvoke(() => ApplyUpdateControllerState(state), DispatcherPriority.DataBind); }
+            catch (InvalidOperationException) { }
+            return;
+        }
+        if (_closingCleanupStarted || state.Revision < _updateState.Revision) return;
+        var prior = _updateState;
+        if (state.CheckResult == null && prior.CheckResult != null)
+        {
+            state = state with
+            {
+                CheckStarted = prior.CheckStarted,
+                CheckResult = prior.CheckResult,
+                SourceSpeeds = prior.SourceSpeeds
+            };
+        }
+        _updateState = state;
+        UpdateVersionPresentation();
+        BtnCancelUpdateDownload.Visibility = state.DownloadInProgress ? Visibility.Visible : Visibility.Collapsed;
+        BtnCancelUpdateDownload.IsEnabled = state.DownloadInProgress && !state.DownloadCancellationRequested;
+        if (state.DownloadCancellationRequested)
+            TxtUpdateStatus.Text = IsChineseUi() ? "正在取消更新下载..." : "Canceling update download...";
+        else if (state.DownloadProgress is { } progress) UpdateDownloadProgressPresentation(progress);
+        else if (state.DownloadedResult is { } downloaded)
+        {
+            TxtUpdateStatus.Text = IsChineseUi()
+                ? $"更新包已从 {GetUpdateSourceName(downloaded.DownloadUrl)} 下载（未安装）：{downloaded.FilePath}"
+                : $"Update downloaded from {GetUpdateSourceName(downloaded.DownloadUrl)} (not installed): {downloaded.FilePath}";
+            TxtUpdateStatus.ToolTip = FormatUpdateSpeedDetails(state.CheckResult?.DownloadSpeeds ?? [], downloaded.DownloadUrl);
+        }
+        else if (state.DownloadCanceled) TxtUpdateStatus.Text = _lang.T("update.download.canceled");
+        else if (state.DownloadError is { } error)
+        {
+            TxtUpdateStatus.Text = IsChineseUi() ? "更新下载失败，请查看日志或联系作者" : "Update download failed; see logs or contact the author";
+            if (!_closingCleanupStarted)
+                AppDialog.Show(this, IsChineseUi() ? "更新下载失败" : "Update Download Failed", error + "\n\n1406829360@qq.com", danger: true);
+        }
+        if (!prior.LowSpeedWarningRaised && state.LowSpeedWarningRaised)
+        {
+            var progress = state.DownloadProgress;
+            _logger.Warn($"Update download speed below 3 KB/s for {progress?.LowSpeedDuration.TotalSeconds ?? 10:0} seconds");
             AppDialog.Show(this,
                 IsChineseUi() ? "下载速度过慢" : "Download Too Slow",
                 IsChineseUi() ? "下载速度连续 10 秒低于 3 KB/s，可以通过邮件向作者获取更新包：1406829360@qq.com" : "Download speed stayed below 3 KB/s for 10 seconds. You can email the author for the update package: 1406829360@qq.com",
                 danger: true);
         }
     }
+
+    internal Task<UpdateDownloadResult> StartUpdateDownloadForUiTest(UpdateCheckResult result, string destinationPath) =>
+        _updateController.DownloadAsync(result, destinationPath);
 
     private static string GetUpdateSourceName(string? url) => new UpdateSourceSpeed(url ?? "", null).SourceName;
 
@@ -5523,6 +5844,8 @@ public partial class MainWindow : Window
         }
 
         _activeNetworkWorkflow = lease;
+        Interlocked.Increment(ref _adapterWorkflowGeneration);
+        _adapterStatusRefreshDirty = true;
         _activeOperationText = name;
         _operationStartedTimestamp = Stopwatch.GetTimestamp();
         UpdateManualScanButtons();
@@ -5537,11 +5860,13 @@ public partial class MainWindow : Window
         if (ReferenceEquals(_activeNetworkWorkflow, lease))
         {
             _activeNetworkWorkflow = null;
+            Interlocked.Increment(ref _adapterWorkflowGeneration);
             lease.Dispose();
             _activeOperationText = null;
             _operationStartedTimestamp = 0;
             if (_operationCts is null) BtnCancelOperation.Visibility = Visibility.Collapsed;
             SetDhcpRunningState(_dhcpServer.IsRunning);
+            if (_adapterStatusRefreshDirty && !_closingCleanupStarted) RefreshSelectedAdapterStatus();
         }
         else
         {
@@ -5650,6 +5975,7 @@ public partial class MainWindow : Window
         LogBox.Visibility = expanded ? Visibility.Visible : Visibility.Collapsed;
         LogPanel.Height = expanded ? 150 : 36;
         BtnToggleLog.Content = expanded ? _lang.T("hide.log") : _lang.T("show.log");
+        if (expanded) DrainLogDisplayQueue(force: true);
         UpdateLogSummary();
     }
 
@@ -5657,7 +5983,10 @@ public partial class MainWindow : Window
     {
         if (TxtLogSummary == null) return;
         var count = LogBox.Document.Blocks.Count;
-        TxtLogSummary.Text = IsChineseUi() ? $"当前显示 {count} 条" : $"{count} visible line(s)";
+        var omitted = Interlocked.Read(ref _logDisplayOmitted);
+        TxtLogSummary.Text = omitted > 0
+            ? IsChineseUi() ? $"当前显示 {count} 条，省略 {omitted} 条" : $"{count} visible line(s), {omitted} omitted"
+            : IsChineseUi() ? $"当前显示 {count} 条" : $"{count} visible line(s)";
     }
 
     private void UpdateSessionStatus()
@@ -5716,7 +6045,56 @@ public partial class MainWindow : Window
         AppDialog.Show(this, _lang.T("help.title"), GetHelpText(helpKey));
     }
 
-    private void AppendLogLine(string line)
+    private void Logger_LineWritten(string line)
+    {
+        lock (_logDisplaySync)
+        {
+            if (_logDisplayClosed) return;
+            while (_logDisplayQueue.Count >= 500)
+            {
+                _logDisplayQueue.Dequeue();
+                Interlocked.Increment(ref _logDisplayOmitted);
+            }
+            _logDisplayQueue.Enqueue(line);
+        }
+    }
+
+    internal int PendingLogDisplayCount
+    {
+        get { lock (_logDisplaySync) return _logDisplayQueue.Count; }
+    }
+
+    internal long LogDisplayOmittedCount => Interlocked.Read(ref _logDisplayOmitted);
+    internal int LogDisplayScrollCount => Volatile.Read(ref _logDisplayScrollCount);
+
+    internal int DrainLogDisplayQueueForUiTest(bool force = true) => DrainLogDisplayQueue(force);
+
+    private int DrainLogDisplayQueue(bool force = false)
+    {
+        if (!force && (LogBox.Visibility != Visibility.Visible || _logDisplayClosed)) return 0;
+        var lines = new List<string>(128);
+        lock (_logDisplaySync)
+        {
+            var limit = force ? int.MaxValue : 128;
+            while (lines.Count < limit && _logDisplayQueue.Count > 0) lines.Add(_logDisplayQueue.Dequeue());
+        }
+        if (lines.Count == 0) return 0;
+        foreach (var line in lines) AppendLogLineCore(line);
+        while (LogBox.Document.Blocks.Count > 500)
+        {
+            LogBox.Document.Blocks.Remove(LogBox.Document.Blocks.FirstBlock);
+            Interlocked.Increment(ref _logDisplayOmitted);
+        }
+        if (ChkLogAutoScroll?.IsChecked != false)
+        {
+            LogBox.ScrollToEnd();
+            Interlocked.Increment(ref _logDisplayScrollCount);
+        }
+        UpdateLogSummary();
+        return lines.Count;
+    }
+
+    private void AppendLogLineCore(string line)
     {
         var paragraph = new Paragraph { Margin = new Thickness(0), LineHeight = 18 };
         var level = line.Contains("[ERROR]", StringComparison.OrdinalIgnoreCase) ? "ERROR"
@@ -5734,9 +6112,6 @@ public partial class MainWindow : Window
             Foreground = Resources["TextBrush"] as Brush ?? Brushes.Black
         });
         LogBox.Document.Blocks.Add(paragraph);
-        while (LogBox.Document.Blocks.Count > 500) LogBox.Document.Blocks.Remove(LogBox.Document.Blocks.FirstBlock);
-        if (ChkLogAutoScroll?.IsChecked != false) LogBox.ScrollToEnd();
-        UpdateLogSummary();
     }
 
     private async Task<(AdapterConfigBackup Backup, AdapterIpv4Snapshot Snapshot)> RememberAdapterConfigAsync(
@@ -5882,51 +6257,103 @@ public partial class MainWindow : Window
         return adapter == null ? "" : string.Join("|", adapter.InterfaceIndex, adapter.Status, adapter.IPv4Address, adapter.Gateway, adapter.MacAddress);
     }
 
-    private void NetworkChanged(object? sender, EventArgs e) => Dispatcher.BeginInvoke(RefreshSelectedAdapterStatus, DispatcherPriority.Send);
+    private void NetworkChanged(object? sender, EventArgs e) => QueueAdapterNetworkChangeRefresh();
 
-    private void NetworkAvailabilityChanged(object? sender, NetworkAvailabilityEventArgs e) => Dispatcher.BeginInvoke(RefreshSelectedAdapterStatus, DispatcherPriority.Send);
+    private void NetworkAvailabilityChanged(object? sender, NetworkAvailabilityEventArgs e) => QueueAdapterNetworkChangeRefresh();
 
-    private async void RefreshSelectedAdapterStatus()
+    private void QueueAdapterNetworkChangeRefresh()
     {
-        if (_adapterStatusRefreshInProgress || SelectedAdapter == null || _activeNetworkWorkflow is not null || _closingCleanupStarted) return;
-        _adapterStatusRefreshInProgress = true;
+        Interlocked.Increment(ref _adapterNetworkChangeVersion);
+        if (Interlocked.Exchange(ref _adapterNetworkChangeDispatchPending, 1) != 0) return;
         try
         {
-            var selectedIndex = SelectedAdapter.InterfaceIndex;
-            var latest = await Task.Run(() => _adapterService.GetAdapters(logAdapters: false).FirstOrDefault(x => x.InterfaceIndex == selectedIndex));
-            if (latest == null) return;
-            var adapter = SelectedAdapter;
-            if (adapter == null || adapter.InterfaceIndex != selectedIndex) return;
-            var changed = !adapter.Status.Equals(latest.Status, StringComparison.OrdinalIgnoreCase)
-                || !adapter.IPv4Address.Equals(latest.IPv4Address, StringComparison.OrdinalIgnoreCase)
-                || !adapter.Gateway.Equals(latest.Gateway, StringComparison.OrdinalIgnoreCase);
-            if (!changed) return;
-            var previousIp = adapter.IPv4Address;
-            var previousStatus = adapter.Status;
-            adapter.Status = latest.Status;
-            adapter.IPv4Address = latest.IPv4Address;
-            adapter.Gateway = latest.Gateway;
-            adapter.MacAddress = latest.MacAddress;
-            adapter.LinkSpeedMbps = latest.LinkSpeedMbps;
-            AddIpHistory(previousIp, latest.IPv4Address);
-            AdapterBox.Items.Refresh();
-            UpdateAdapterIpText(adapter);
-            TxtManualAdapterIp.Text = BuildAdapterIpDisplay(adapter);
-            TxtMac.Text = adapter.MacAddress;
-            TxtGateway.Text = adapter.Gateway;
-            TxtStatus.Text = adapter.Status;
-            TxtStatus.Foreground = adapter.Status.Equals("Up", StringComparison.OrdinalIgnoreCase) ? Brushes.ForestGreen : Brushes.Firebrick;
-            if (!previousStatus.Equals(adapter.Status, StringComparison.OrdinalIgnoreCase)) SystemSounds.Exclamation.Play();
-            _logger.Info($"Adapter status changed: {adapter.DisplayName} status={adapter.Status} ip={adapter.IPv4Address} gateway={adapter.Gateway}");
+            Dispatcher.BeginInvoke(() =>
+            {
+                if (_closingCleanupStarted)
+                {
+                    Interlocked.Exchange(ref _adapterNetworkChangeDispatchPending, 0);
+                    return;
+                }
+                _adapterNetworkChangeObservedVersion = Interlocked.Read(ref _adapterNetworkChangeVersion);
+                _adapterNetworkChangeTimer.Stop();
+                _adapterNetworkChangeTimer.Start();
+            }, DispatcherPriority.Send);
         }
-        catch (Exception ex)
+        catch (InvalidOperationException)
         {
-            _logger.Warn("Adapter status refresh failed: " + ex.Message);
+            Interlocked.Exchange(ref _adapterNetworkChangeDispatchPending, 0);
         }
-        finally
+    }
+
+    private void AdapterNetworkChangeDebounceTick()
+    {
+        var currentVersion = Interlocked.Read(ref _adapterNetworkChangeVersion);
+        if (currentVersion != _adapterNetworkChangeObservedVersion)
         {
-            _adapterStatusRefreshInProgress = false;
+            _adapterNetworkChangeObservedVersion = currentVersion;
+            _adapterNetworkChangeTimer.Stop();
+            _adapterNetworkChangeTimer.Start();
+            return;
         }
+        _adapterNetworkChangeTimer.Stop();
+        Interlocked.Exchange(ref _adapterNetworkChangeDispatchPending, 0);
+        _adapterStatusRefreshDirty = true;
+        RefreshSelectedAdapterStatus();
+    }
+
+    private void RefreshSelectedAdapterStatus()
+    {
+        if (_closingCleanupStarted) return;
+        var adapter = SelectedAdapter;
+        if (adapter == null || _adapterRefreshInProgress) return;
+        if (_activeNetworkWorkflow is not null)
+        {
+            _adapterStatusRefreshDirty = true;
+            return;
+        }
+        _adapterStatusRefreshDirty = false;
+        _adapterStatusCoordinator.Request(new AdapterStatusRefreshRequest(
+            adapter.Id,
+            adapter.InterfaceIndex,
+            Volatile.Read(ref _adapterSelectionGeneration),
+            Volatile.Read(ref _adapterWorkflowGeneration)));
+    }
+
+    private bool CommitSelectedAdapterStatus(AdapterStatusRefreshRequest request, NetworkAdapterInfo latest)
+    {
+        var adapter = SelectedAdapter;
+        if (_closingCleanupStarted || _activeNetworkWorkflow is not null
+            || request.SelectionGeneration != _adapterSelectionGeneration
+            || request.WorkflowGeneration != _adapterWorkflowGeneration
+            || adapter == null
+            || !adapter.Id.Equals(request.AdapterId, StringComparison.OrdinalIgnoreCase)
+            || !adapter.InterfaceIndex.Equals(request.InterfaceIndex, StringComparison.OrdinalIgnoreCase)
+            || !latest.Id.Equals(request.AdapterId, StringComparison.OrdinalIgnoreCase)
+            || !latest.InterfaceIndex.Equals(request.InterfaceIndex, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        if (!AdapterStatusComparer.HasChanges(adapter, latest)) return true;
+
+        var previousIp = adapter.IPv4Address;
+        var previousStatus = adapter.Status;
+        adapter.Status = latest.Status;
+        adapter.IPv4Address = latest.IPv4Address;
+        adapter.SubnetMask = latest.SubnetMask;
+        adapter.Gateway = latest.Gateway;
+        adapter.Dns = latest.Dns;
+        adapter.MacAddress = latest.MacAddress;
+        adapter.LinkSpeedMbps = latest.LinkSpeedMbps;
+        if (!previousIp.Equals(latest.IPv4Address, StringComparison.OrdinalIgnoreCase)) AddIpHistory(previousIp, latest.IPv4Address);
+        AdapterBox.Items.Refresh();
+        UpdateAdapterIpText(adapter);
+        TxtManualAdapterIp.Text = BuildAdapterIpDisplay(adapter);
+        TxtMac.Text = adapter.MacAddress;
+        TxtGateway.Text = adapter.Gateway;
+        TxtStatus.Text = adapter.Status;
+        TxtStatus.Foreground = adapter.Status.Equals("Up", StringComparison.OrdinalIgnoreCase) ? Brushes.ForestGreen : Brushes.Firebrick;
+        if (!previousStatus.Equals(adapter.Status, StringComparison.OrdinalIgnoreCase)) SystemSounds.Exclamation.Play();
+        _logger.Info($"Adapter status changed: {adapter.DisplayName} status={adapter.Status} ip={adapter.IPv4Address} gateway={adapter.Gateway} speedMbps={adapter.LinkSpeedMbps}");
+        return true;
     }
 
     private async Task<NetworkAdapterInfo> RefreshAdapterByIdentityAsync(NetworkAdapterInfo adapter, CancellationToken ct)

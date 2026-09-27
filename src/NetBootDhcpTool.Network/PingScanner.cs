@@ -6,6 +6,8 @@ using NetBootDhcpTool.Core;
 
 namespace NetBootDhcpTool.Network;
 
+public sealed record NetworkProbeDetails(string Hostname, bool HttpOk, bool HttpsOk);
+
 public interface IScanTargetProbe
 {
     Task<ScanResult?> ProbeAsync(IPAddress ip, int pingTimeoutMs, int httpTimeoutMs, CancellationToken cancellationToken);
@@ -41,19 +43,28 @@ public sealed class NetworkScanTargetProbe : IScanTargetProbe
         var ping = await _pingAsync(ip, TimeSpan.FromMilliseconds(Math.Max(1, pingTimeoutMs)), cancellationToken).ConfigureAwait(false);
         if (!ping.success) return null;
 
-        var result = new ScanResult
+        var details = await ProbeReachableDetailsAsync(ip, httpTimeoutMs, cancellationToken).ConfigureAwait(false);
+        return new ScanResult
         {
             IpAddress = ip.ToString(),
             PingOk = true,
             LatencyMs = ping.roundTripTime,
-            Hostname = await ResolveHostBoundedAsync(ip, cancellationToken).ConfigureAwait(false),
+            Hostname = details.Hostname,
+            HttpOk = details.HttpOk,
+            HttpsOk = details.HttpsOk,
             LastSeen = DateTime.Now
         };
-        var probes = await _httpProbeAsync(ip.ToString(), httpTimeoutMs, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<NetworkProbeDetails> ProbeReachableDetailsAsync(IPAddress ip, int httpTimeoutMs, CancellationToken cancellationToken)
+    {
         cancellationToken.ThrowIfCancellationRequested();
-        result.HttpOk = probes.http;
-        result.HttpsOk = probes.https;
-        return result;
+        var dnsTask = ResolveHostBoundedAsync(ip, cancellationToken);
+        var webTask = _httpProbeAsync(ip.ToString(), httpTimeoutMs, cancellationToken);
+        await Task.WhenAll(dnsTask, webTask).ConfigureAwait(false);
+        cancellationToken.ThrowIfCancellationRequested();
+        var web = await webTask.ConfigureAwait(false);
+        return new NetworkProbeDetails(await dnsTask.ConfigureAwait(false), web.http, web.https);
     }
 
     private async Task<string> ResolveHostBoundedAsync(IPAddress ip, CancellationToken cancellationToken)
@@ -121,6 +132,13 @@ public sealed class PingScanner
             ? plan.TargetIp!.ToString()
             : $"{plan.LocalIp}/{plan.PrefixLength}";
         return ScanHostsAsync(plan.EnumerateTargets(), plan.TargetCount, scope, concurrency, pingTimeoutMs, httpTimeoutMs, progress, ct);
+    }
+
+    public Task<NetworkProbeDetails> ProbeReachableDetailsAsync(IPAddress ip, int httpTimeoutMs, CancellationToken ct)
+    {
+        if (_targetProbe is not NetworkScanTargetProbe networkProbe)
+            throw new InvalidOperationException("Reachability details are available only when the scanner uses the network probe.");
+        return networkProbe.ProbeReachableDetailsAsync(ip, httpTimeoutMs, ct);
     }
 
     public Task<IReadOnlyList<ScanResult>> ScanTargetsAsync(IReadOnlyList<IPAddress> targets, int concurrency, int pingTimeoutMs,

@@ -16,7 +16,7 @@ The 2026-09-23 audit baseline and unperformed real-network checks are recorded i
 - Gitee distribution repository: `https://gitee.com/joel20230302/NetBootDhcpTool`
 - Default branch: `main`
 - Release tag format: `v<version>`
-- Current application version: `1.0.16`
+- Current application version: `1.0.17`
 - Target framework: .NET 10; the repository pins SDK `10.0.401` in `global.json` with `latestFeature` roll-forward.
 - Resolve the SDK through `build/resolve-dotnet.ps1`; it honors the repository pin and bootstraps that SDK when needed. The first run may need network access.
 - GitHub fallback manifest URL:
@@ -101,9 +101,28 @@ For static-route changes, also run the elevated isolated route smoke when Hyper-
 
 Count the route smoke as passed only when it exits successfully and prints `ROUTE_SMOKE_OK interfaces=<index>,<index>`. It creates and removes only its uniquely named Hyper-V Internal switches. If elevation or Hyper-V is unavailable, record the check as skipped; do not describe it as passed. Do not substitute tests against a physical adapter.
 
+For the combined T21/T22 administrator acceptance, run `build/admin-acceptance.ps1` from an elevated PowerShell after the Release solution build. It runs the Hyper-V route smoke first and only proceeds to cancellation and independent compensation on the specifically designated isolated Intel X722 adapter after the route gate succeeds. The machine-readable report is `artifacts\acceptance\admin-acceptance.json`; require `passed=true`, `routeSmoke=true`, `routeResourcesClean=true`, and `physicalAdapterCancelCompensation=true`. The wrapper checks for newly retained route-smoke switches, vEthernet adapters, and test-prefix routes even when the route smoke fails; a clean failure report proves cleanup only, not acceptance.
+
+## Runtime Responsibility Map
+
+Keep background work with the narrow owner that can cancel it, observe it, and enforce its state boundary:
+
+| Responsibility | Owner | Boundary |
+|---|---|---|
+| PowerShell process start, timeout, cancellation, output drain, and child cleanup | `PowerShellProcessRunner` | Services keep their own scripts, ordering, ownership checks, and compensation. |
+| Fresh route-planning reads | `StaticRouteService` snapshot reader | Refresh for every preview/apply; preserve per-write identity and ownership checks. |
+| HTTP/HTTPS reachability | `HttpProbeService` | Reuse its owned transport, bound and cancel requests, preserve system TLS validation. |
+| Lease connectivity work | `LeaseProbeCoordinator` | Cap active probes at 8 and pending bindings at 64; validate session/client/IP/generation before applying results. |
+| Scan progress and ordinary operation history | `ScanProgressAccumulator`, `CoalescingSnapshotWriter` | Batch display and history only; critical recovery and DHCP persistence stay immediate. |
+| Session log file and display | `FileLogger`, MainWindow log queue | Keep every file row, bound display backlog at 500, and let support-package reads share an active log. |
+| Selected-adapter status refresh | `CoalescedRefreshCoordinator` and MainWindow request identity | Coalesce refresh work and reject stale adapter/workflow generations; never use display data to authorize a write. |
+| Update check/download lifecycle | `UpdateController` | Own tasks and cancellation; MainWindow handles confirmation and presentation. |
+
 ## Verification Evidence
 
 Use the [standard change workflow](#standard-change-workflow) commands where applicable, then select the task-specific checks. These checks prove different boundaries:
+
+Run `build/measure-performance.ps1` for the T20 fixtures. It writes five raw samples per fixture plus environment and per-sample CPU/allocation data to ignored `artifacts/performance/`. Current coverage includes controlled 254/4096-target scans, 64 HTTP targets, 10,000 session-log rows, 4,096 history hits persisted in 128-row batches, 128 lease bindings with the 8/64 scheduler caps, a 100-event refresh burst, a no-change adapter-field comparison, read-only full-list/selected-identity adapter reads, and old four-query/new one-snapshot route-planning reads. Scanner elapsed time excludes real ICMP/DNS/HTTP and UI. Host adapter and route timings are observations, not stable timing gates; route measurements execute only read-only Windows queries. T21/T22 designated isolated-interface and administrator Hyper-V acceptance remains separate from these results.
 
 | Check | Establishes | Does not establish |
 |---|---|---|

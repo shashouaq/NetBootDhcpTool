@@ -18,7 +18,7 @@ public sealed class NetworkAdapterService
     public const int DhcpHostAdapterMetric = 9000;
 
     private readonly ILogger _logger;
-    private readonly PowerShellScriptExecutor? _powerShellScriptExecutor;
+    private readonly PowerShellProcessRunner _powerShellProcessRunner;
     private readonly Func<TimeSpan, CancellationToken, Task> _delayAsync;
 
     public NetworkAdapterService(
@@ -27,7 +27,7 @@ public sealed class NetworkAdapterService
         Func<TimeSpan, CancellationToken, Task>? delayAsync = null)
     {
         _logger = logger;
-        _powerShellScriptExecutor = powerShellScriptExecutor;
+        _powerShellProcessRunner = new PowerShellProcessRunner(logger, powerShellScriptExecutor);
         _delayAsync = delayAsync ?? Task.Delay;
     }
 
@@ -47,29 +47,8 @@ public sealed class NetworkAdapterService
                 if (ni.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
                 var props = ni.GetIPProperties();
                 var ipv4Props = TryGetIPv4Properties(props, ni.Name);
-                if (ipv4Props == null && TryFindNetAdapterIndex(ni.Name) <= 0) continue;
-
-                var ip = props.UnicastAddresses.FirstOrDefault(x => x.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork);
-                var gateway = props.GatewayAddresses
-                    .FirstOrDefault(x => x.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork && x.Address.ToString() != "0.0.0.0")
-                    ?.Address.ToString() ?? "";
-                var dns = string.Join(", ", props.DnsAddresses.Where(x => x.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork).Select(x => x.ToString()));
-                var info = new NetworkAdapterInfo
-                {
-                    Id = ni.Id,
-                    Name = ni.Name,
-                    Description = ni.Description,
-                    InterfaceIndex = (ipv4Props?.Index ?? TryFindNetAdapterIndex(ni.Name)).ToString(),
-                    MacAddress = FormatMac(ni.GetPhysicalAddress()),
-                    IPv4Address = ip?.Address.ToString() ?? "",
-                    SubnetMask = ip?.IPv4Mask?.ToString() ?? "",
-                    Gateway = gateway,
-                    Dns = dns,
-                    Status = ni.OperationalStatus.ToString(),
-                    LinkSpeedMbps = ni.Speed > 0 ? (long)Math.Round(ni.Speed / 1_000_000d) : 0,
-                    IsWifi = IsWifiLike(ni.Name, ni.Description, ni.NetworkInterfaceType),
-                    IsVirtual = IsVirtual(ni.Name, ni.Description)
-                };
+                if (ipv4Props == null || ipv4Props.Index <= 0) continue;
+                var info = BuildAdapterInfo(ni, props, ipv4Props);
                 adapters.Add(info);
                 if (logAdapters) _logger.Info($"Adapter: {info.Name} {info.Description} IP={info.IPv4Address} MAC={info.MacAddress} Gateway={info.Gateway}");
             }
@@ -79,6 +58,55 @@ public sealed class NetworkAdapterService
             }
         }
         return adapters;
+    }
+
+    public NetworkAdapterInfo? GetAdapterByIdentity(string adapterId, string interfaceIndex)
+    {
+        if (string.IsNullOrWhiteSpace(adapterId) || !int.TryParse(interfaceIndex, out var expectedIndex) || expectedIndex <= 0)
+            return null;
+        foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
+        {
+            if (!ni.Id.Equals(adapterId, StringComparison.OrdinalIgnoreCase)
+                || ni.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+            try
+            {
+                var props = ni.GetIPProperties();
+                var ipv4Props = TryGetIPv4Properties(props, ni.Name);
+                if (ipv4Props == null || ipv4Props.Index != expectedIndex) return null;
+                return BuildAdapterInfo(ni, props, ipv4Props);
+            }
+            catch (Exception ex)
+            {
+                _logger.Warn($"Skip selected adapter {ni.Name}: {ex.Message}");
+                return null;
+            }
+        }
+        return null;
+    }
+
+    private static NetworkAdapterInfo BuildAdapterInfo(NetworkInterface ni, IPInterfaceProperties props, IPv4InterfaceProperties ipv4Props)
+    {
+        var ip = props.UnicastAddresses.FirstOrDefault(x => x.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork);
+        var gateway = props.GatewayAddresses
+            .FirstOrDefault(x => x.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork && x.Address.ToString() != "0.0.0.0")
+            ?.Address.ToString() ?? "";
+        var dns = string.Join(", ", props.DnsAddresses.Where(x => x.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork).Select(x => x.ToString()));
+        return new NetworkAdapterInfo
+        {
+            Id = ni.Id,
+            Name = ni.Name,
+            Description = ni.Description,
+            InterfaceIndex = ipv4Props.Index.ToString(),
+            MacAddress = FormatMac(ni.GetPhysicalAddress()),
+            IPv4Address = ip?.Address.ToString() ?? "",
+            SubnetMask = ip?.IPv4Mask?.ToString() ?? "",
+            Gateway = gateway,
+            Dns = dns,
+            Status = ni.OperationalStatus.ToString(),
+            LinkSpeedMbps = ni.Speed > 0 ? (long)Math.Round(ni.Speed / 1_000_000d) : 0,
+            IsWifi = IsWifiLike(ni.Name, ni.Description, ni.NetworkInterfaceType),
+            IsVirtual = IsVirtual(ni.Name, ni.Description)
+        };
     }
 
     public async Task<AdapterRestartResult> RestartAdapterAsync(NetworkAdapterInfo adapter, bool allowAnyAdapter, CancellationToken ct = default, bool? expectedEnabledBefore = null)
@@ -670,88 +698,8 @@ $policyEvent = Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-WLAN-A
         _ = await RunPowerShellOutputAsync(script, summary, ct, true);
     }
 
-    private async Task<string> RunPowerShellOutputAsync(string script, string summary, CancellationToken ct, bool logOutput)
-    {
-        _logger.Info(summary);
-        if (_powerShellScriptExecutor is not null)
-        {
-            var testOutput = await _powerShellScriptExecutor(script, summary, ct, logOutput);
-            if (logOutput) _logger.Info($"{summary} result: exit=0 detail={SummarizePowerShellMessage(testOutput.Trim())}");
-            return testOutput;
-        }
-
-        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        timeoutCts.CancelAfter(TimeSpan.FromSeconds(30));
-        var operationToken = timeoutCts.Token;
-        using var process = new Process();
-        process.StartInfo = new ProcessStartInfo
-        {
-            FileName = ResolvePowerShellPath(),
-            Arguments = "-NoProfile -ExecutionPolicy Bypass -EncodedCommand " + Convert.ToBase64String(Encoding.Unicode.GetBytes(script)),
-            UseShellExecute = false,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            StandardOutputEncoding = Encoding.UTF8,
-            StandardErrorEncoding = Encoding.UTF8,
-            CreateNoWindow = true
-        };
-        process.Start();
-        try
-        {
-            var (output, error) = await PowerShellProcessOutput.ReadStandardStreamsAsync(process, operationToken);
-            await process.WaitForExitAsync(operationToken);
-
-            var trimmedOutput = output.Trim();
-            var trimmedError = error.Trim();
-            if (process.ExitCode != 0)
-            {
-                var detail = SummarizePowerShellMessage(trimmedError);
-                _logger.Warn($"{summary} failed: exit={process.ExitCode} detail={detail}");
-                throw new InvalidOperationException(string.IsNullOrWhiteSpace(trimmedError) ? $"PowerShell exit {process.ExitCode}" : trimmedError);
-            }
-
-            if (logOutput)
-            {
-                var detail = SummarizePowerShellMessage(trimmedOutput);
-                _logger.Info($"{summary} result: exit={process.ExitCode} detail={detail}");
-            }
-            return trimmedOutput;
-        }
-        catch (OperationCanceledException)
-        {
-            try
-            {
-                if (!process.HasExited) process.Kill(entireProcessTree: true);
-            }
-            catch { }
-            _logger.Warn($"{summary} aborted or timed out");
-            throw;
-        }
-        catch
-        {
-            try
-            {
-                if (!process.HasExited) process.Kill(entireProcessTree: true);
-            }
-            catch { }
-            throw;
-        }
-    }
-
-    private static string SummarizePowerShellMessage(string text)
-    {
-        if (string.IsNullOrWhiteSpace(text)) return "OK";
-        var normalized = string.Join(" | ", text.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
-        if (normalized.Length > 240) normalized = normalized[..240] + "...";
-        return normalized;
-    }
-
-    private static string ResolvePowerShellPath()
-    {
-        var systemPowerShell = Path.Combine(Environment.SystemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe");
-        if (!File.Exists(systemPowerShell)) throw new InvalidOperationException("Windows PowerShell was not found / 未找到 Windows PowerShell");
-        return systemPowerShell;
-    }
+    private Task<string> RunPowerShellOutputAsync(string script, string summary, CancellationToken ct, bool logOutput) =>
+        _powerShellProcessRunner.RunAsync(script, summary, ct, logOutput);
 
     private static void EnsureAllowedTargetAdapter(NetworkAdapterInfo adapter)
     {
@@ -828,20 +776,6 @@ $policyEvent = Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-WLAN-A
         {
             _logger.Warn($"Adapter {adapterName} has no usable IPv4 properties: {ex.Message}");
             return null;
-        }
-    }
-
-    private static int TryFindNetAdapterIndex(string name)
-    {
-        try
-        {
-            var all = NetworkInterface.GetAllNetworkInterfaces();
-            var match = all.FirstOrDefault(x => x.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
-            return match?.GetIPProperties().GetIPv4Properties().Index ?? 0;
-        }
-        catch
-        {
-            return 0;
         }
     }
 

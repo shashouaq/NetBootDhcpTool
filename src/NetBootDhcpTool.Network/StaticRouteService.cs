@@ -96,13 +96,13 @@ public sealed class StaticRoutePlanItem
 public sealed class StaticRouteService
 {
     private readonly ILogger _logger;
-    private readonly PowerShellScriptExecutor? _powerShellScriptExecutor;
+    private readonly PowerShellProcessRunner _powerShellProcessRunner;
     private readonly Func<bool> _isAdministrator;
 
     public StaticRouteService(ILogger logger, PowerShellScriptExecutor? powerShellScriptExecutor = null, Func<bool>? isAdministrator = null)
     {
         _logger = logger;
-        _powerShellScriptExecutor = powerShellScriptExecutor;
+        _powerShellProcessRunner = new PowerShellProcessRunner(logger, powerShellScriptExecutor);
         _isAdministrator = isAdministrator ?? IsAdministrator;
     }
 
@@ -195,6 +195,63 @@ ConvertTo-Json -InputObject $addresses -Compress -Depth 3
         return ParseJsonList<InterfaceAddressInfo>(output);
     }
 
+    internal static string BuildRoutePlanningSnapshotScript() => """
+$interfaces = @(Get-NetIPInterface -AddressFamily IPv4,IPv6 -ErrorAction Stop |
+  ForEach-Object {
+    [pscustomobject]@{
+      AddressFamily = [string]$_.AddressFamily
+      InterfaceIndex = [string]$_.InterfaceIndex
+      InterfaceMetric = [int]$_.InterfaceMetric
+      ConnectionState = [string]$_.ConnectionState
+    }
+  })
+$metrics = @($interfaces | ForEach-Object {
+  [pscustomobject]@{ AddressFamily = $_.AddressFamily; InterfaceIndex = $_.InterfaceIndex; InterfaceMetric = $_.InterfaceMetric }
+})
+$states = @($interfaces | ForEach-Object {
+  [pscustomobject]@{ AddressFamily = $_.AddressFamily; InterfaceIndex = $_.InterfaceIndex; ConnectionState = $_.ConnectionState }
+})
+$metricByInterface = @{}
+foreach ($item in $interfaces) {
+  $metricByInterface["{0}|{1}" -f $item.AddressFamily,$item.InterfaceIndex] = [int]$item.InterfaceMetric
+}
+$routes = @(Get-NetRoute -AddressFamily IPv4,IPv6 -ErrorAction Stop |
+  Sort-Object AddressFamily,InterfaceIndex,DestinationPrefix,RouteMetric,NextHop |
+  ForEach-Object {
+    $family = [string]$_.AddressFamily
+    $index = [int]$_.InterfaceIndex
+    $key = "{0}|{1}" -f $family,$index
+    [pscustomobject]@{
+      AddressFamily = $family
+      InterfaceIndex = [string]$index
+      DestinationPrefix = [string]$_.DestinationPrefix
+      NextHop = [string]$_.NextHop
+      RouteMetric = [int]$_.RouteMetric
+      InterfaceMetric = if ($metricByInterface.ContainsKey($key)) { [int]$metricByInterface[$key] } else { 0 }
+      Protocol = [string]$_.Protocol
+      PolicyStore = if ($_.PolicyStore) { [string]$_.PolicyStore } elseif ($_.Store) { [string]$_.Store } else { '' }
+      InstanceId = [string]$_.InstanceId
+    }
+  })
+$addresses = @(Get-NetIPAddress -AddressFamily IPv4,IPv6 -ErrorAction Stop |
+  Where-Object { $_.IPAddress -notin @('0.0.0.0','::','::1','127.0.0.1') } |
+  ForEach-Object {
+    [pscustomobject]@{
+      AddressFamily = [string]$_.AddressFamily
+      InterfaceIndex = [string]$_.InterfaceIndex
+      IpAddress = [string]$_.IPAddress
+      PrefixLength = [int]$_.PrefixLength
+    }
+  })
+$snapshot = [pscustomobject]@{
+  Routes = $routes
+  InterfaceMetrics = $metrics
+  InterfaceStates = $states
+  InterfaceAddresses = $addresses
+}
+ConvertTo-Json -InputObject $snapshot -Compress -Depth 5
+""";
+
     public async Task<IReadOnlyList<StaticRoutePlanItem>> PreviewAsync(
         IReadOnlyList<StaticRouteTarget> targets,
         IReadOnlyCollection<AppliedStaticRoute>? ignoredOwnedRoutes = null,
@@ -279,16 +336,17 @@ ConvertTo-Json -InputObject $addresses -Compress -Depth 3
         IReadOnlyCollection<AppliedStaticRoute>? ignoredOwnedRoutes,
         CancellationToken ct)
     {
-        var currentRoutes = (await GetCurrentStaticRoutesAsync(ct)).Where(route =>
+        var snapshot = await GetRoutePlanningSnapshotAsync(ct);
+        var currentRoutes = snapshot.Routes.Where(route =>
             ignoredOwnedRoutes == null
             || !ignoredOwnedRoutes.Any(owned =>
                 !string.IsNullOrWhiteSpace(owned.InstanceId)
                 && owned.InstanceId.Equals(route.InstanceId, StringComparison.OrdinalIgnoreCase)
                 && (string.IsNullOrWhiteSpace(owned.PolicyStore)
                     || owned.PolicyStore.Equals(route.PolicyStore, StringComparison.OrdinalIgnoreCase)))).ToList();
-        var interfaceMetrics = await GetInterfaceMetricsAsync(ct);
-        var interfaceStates = await GetInterfaceStatesAsync(ct);
-        var interfaceAddresses = await GetInterfaceAddressesAsync(ct);
+        var interfaceMetrics = snapshot.InterfaceMetrics;
+        var interfaceStates = snapshot.InterfaceStates;
+        var interfaceAddresses = snapshot.InterfaceAddresses;
         var seenTargets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var seenAdapterPrefixes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var candidates = new List<RouteCandidate>();
@@ -751,86 +809,58 @@ ConvertTo-Json -InputObject $routes -Compress -Depth 4
         _ = await RunPowerShellOutputAsync(script, summary, ct, true);
     }
 
-    private async Task<string> RunPowerShellOutputAsync(string script, string summary, CancellationToken ct, bool logOutput)
+    private Task<string> RunPowerShellOutputAsync(string script, string summary, CancellationToken ct, bool logOutput) =>
+        _powerShellProcessRunner.RunAsync(script, summary, ct, logOutput);
+
+    private async Task<RoutePlanningSnapshot> GetRoutePlanningSnapshotAsync(CancellationToken ct)
     {
-        var started = Stopwatch.GetTimestamp();
-        _logger.Info(summary);
-        if (_powerShellScriptExecutor is not null)
+        var output = await RunPowerShellOutputAsync(BuildRoutePlanningSnapshotScript(),
+            "PowerShell action read route planning snapshot", ct, false);
+        return ParseRoutePlanningSnapshot(output);
+    }
+
+    private static RoutePlanningSnapshot ParseRoutePlanningSnapshot(string output)
+    {
+        if (string.IsNullOrWhiteSpace(output)) throw new InvalidDataException("Route planning snapshot was empty.");
+
+        using var document = JsonDocument.Parse(output);
+        if (document.RootElement.ValueKind != JsonValueKind.Object)
+            throw new InvalidDataException("Route planning snapshot must be a JSON object.");
+
+        static JsonElement RequireArray(JsonElement root, string name)
         {
-            var injectedOutput = await _powerShellScriptExecutor(script, summary, ct, logOutput);
-            _logger.Info($"{summary} completed by injected executor: elapsedMs={Stopwatch.GetElapsedTime(started).TotalMilliseconds:0}");
-            return injectedOutput;
+            if (!root.TryGetProperty(name, out var value) || value.ValueKind != JsonValueKind.Array)
+                throw new InvalidDataException($"Route planning snapshot is missing array '{name}'.");
+            return value;
         }
-        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        timeoutCts.CancelAfter(TimeSpan.FromSeconds(30));
-        var operationToken = timeoutCts.Token;
-        using var process = new Process
+
+        var options = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+        var snapshot = new RoutePlanningSnapshot
         {
-            StartInfo = new ProcessStartInfo
-            {
-                FileName = ResolvePowerShellPath(),
-                Arguments = "-NoProfile -ExecutionPolicy Bypass -EncodedCommand " + Convert.ToBase64String(Encoding.Unicode.GetBytes(script)),
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                StandardOutputEncoding = Encoding.UTF8,
-                StandardErrorEncoding = Encoding.UTF8,
-                CreateNoWindow = true
-            }
+            Routes = JsonSerializer.Deserialize<List<CurrentStaticRoute>>(RequireArray(document.RootElement, "Routes").GetRawText(), options) ?? throw new InvalidDataException("Route array was null."),
+            InterfaceMetrics = JsonSerializer.Deserialize<List<InterfaceMetricInfo>>(RequireArray(document.RootElement, "InterfaceMetrics").GetRawText(), options) ?? throw new InvalidDataException("Interface metric array was null."),
+            InterfaceStates = JsonSerializer.Deserialize<List<InterfaceStateInfo>>(RequireArray(document.RootElement, "InterfaceStates").GetRawText(), options) ?? throw new InvalidDataException("Interface state array was null."),
+            InterfaceAddresses = JsonSerializer.Deserialize<List<InterfaceAddressInfo>>(RequireArray(document.RootElement, "InterfaceAddresses").GetRawText(), options) ?? throw new InvalidDataException("Interface address array was null.")
         };
-        process.Start();
-        try
-        {
-            var outputTask = process.StandardOutput.ReadToEndAsync(operationToken);
-            var errorTask = process.StandardError.ReadToEndAsync(operationToken);
-            await Task.WhenAll(outputTask, errorTask);
-            await process.WaitForExitAsync(operationToken);
-            var output = outputTask.Result.Trim();
-            var error = errorTask.Result.Trim();
-            if (process.ExitCode != 0)
-            {
-                var detail = Summarize(error);
-                _logger.Warn($"{summary} failed: exit={process.ExitCode} elapsedMs={Stopwatch.GetElapsedTime(started).TotalMilliseconds:0} detail={detail}");
-                throw new InvalidOperationException(string.IsNullOrWhiteSpace(error) ? $"PowerShell exit {process.ExitCode}" : error);
-            }
-            _logger.Info(logOutput
-                ? $"{summary} completed: exit={process.ExitCode} elapsedMs={Stopwatch.GetElapsedTime(started).TotalMilliseconds:0} detail={Summarize(output)}"
-                : $"{summary} completed: exit={process.ExitCode} elapsedMs={Stopwatch.GetElapsedTime(started).TotalMilliseconds:0}");
-            return output;
-        }
-        catch (OperationCanceledException)
-        {
-            try
-            {
-                if (!process.HasExited) process.Kill(entireProcessTree: true);
-            }
-            catch { }
-            _logger.Warn($"{summary} aborted: elapsedMs={Stopwatch.GetElapsedTime(started).TotalMilliseconds:0}");
-            throw;
-        }
-        catch
-        {
-            try
-            {
-                if (!process.HasExited) process.Kill(entireProcessTree: true);
-            }
-            catch { }
-            throw;
-        }
-    }
 
-    private static string Summarize(string text)
-    {
-        if (string.IsNullOrWhiteSpace(text)) return "OK";
-        var normalized = string.Join(" | ", text.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
-        return normalized.Length > 240 ? normalized[..240] + "..." : normalized;
-    }
+        if (snapshot.Routes.Any(route => string.IsNullOrWhiteSpace(route.AddressFamily)
+                || string.IsNullOrWhiteSpace(route.InterfaceIndex)
+                || string.IsNullOrWhiteSpace(route.DestinationPrefix)
+                || string.IsNullOrWhiteSpace(route.NextHop)
+                || route.RouteMetric < 0
+                || route.InterfaceMetric < 0)
+            || snapshot.InterfaceMetrics.Any(item => string.IsNullOrWhiteSpace(item.AddressFamily)
+                || string.IsNullOrWhiteSpace(item.InterfaceIndex) || item.InterfaceMetric < 0)
+            || snapshot.InterfaceStates.Any(item => string.IsNullOrWhiteSpace(item.AddressFamily)
+                || string.IsNullOrWhiteSpace(item.InterfaceIndex) || string.IsNullOrWhiteSpace(item.ConnectionState))
+            || snapshot.InterfaceAddresses.Any(item => string.IsNullOrWhiteSpace(item.AddressFamily)
+                || string.IsNullOrWhiteSpace(item.InterfaceIndex) || string.IsNullOrWhiteSpace(item.IpAddress)
+                || item.PrefixLength < 0 || item.PrefixLength > (item.AddressFamily.Equals("IPv6", StringComparison.OrdinalIgnoreCase) ? 128 : 32)))
+        {
+            throw new InvalidDataException("Route planning snapshot contains incomplete or invalid rows.");
+        }
 
-    private static string ResolvePowerShellPath()
-    {
-        var systemPowerShell = Path.Combine(Environment.SystemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe");
-        if (!File.Exists(systemPowerShell)) throw new InvalidOperationException("Windows PowerShell was not found / 未找到 Windows PowerShell");
-        return systemPowerShell;
+        return snapshot;
     }
 
     private static List<T> ParseJsonList<T>(string output)
@@ -861,6 +891,14 @@ ConvertTo-Json -InputObject $routes -Compress -Depth 4
         public int RouteMetric { get; set; }
         public int InterfaceMetric { get; }
         public CurrentStaticRoute? ExistingRoute { get; }
+    }
+
+    private sealed class RoutePlanningSnapshot
+    {
+        public List<CurrentStaticRoute> Routes { get; init; } = [];
+        public List<InterfaceMetricInfo> InterfaceMetrics { get; init; } = [];
+        public List<InterfaceStateInfo> InterfaceStates { get; init; } = [];
+        public List<InterfaceAddressInfo> InterfaceAddresses { get; init; } = [];
     }
 
     private sealed class RouteSnapshot

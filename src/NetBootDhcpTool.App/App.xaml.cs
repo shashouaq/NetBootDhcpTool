@@ -95,6 +95,7 @@ public partial class App : Application
             Logger?.Info("Application exit");
         }
         catch { }
+        try { Logger?.Dispose(); } catch { }
         base.OnExit(e);
         _instanceLease?.Dispose();
         _instanceLease = null;

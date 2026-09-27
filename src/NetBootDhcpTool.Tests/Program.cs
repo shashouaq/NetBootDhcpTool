@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
+using System.Text.Json;
 using System.Text;
 using NetBootDhcpTool.Core;
 using NetBootDhcpTool.Dhcp;
@@ -26,6 +27,15 @@ if (routeSmokeIndex >= 0)
 {
     if (args.Length < routeSmokeIndex + 3) throw new ArgumentException("--route-smoke requires two interface indexes");
     await RunRouteSmokeAsync(args[routeSmokeIndex + 1], args[routeSmokeIndex + 2]);
+    return;
+}
+
+var isolatedAdapterCancelSmokeIndex = Array.IndexOf(args, "--isolated-adapter-cancel-smoke");
+if (isolatedAdapterCancelSmokeIndex >= 0)
+{
+    if (args.Length < isolatedAdapterCancelSmokeIndex + 3)
+        throw new ArgumentException("--isolated-adapter-cancel-smoke requires the designated adapter GUID and a result path");
+    await RunIsolatedAdapterCancelSmokeAsync(args[isolatedAdapterCancelSmokeIndex + 1], args[isolatedAdapterCancelSmokeIndex + 2]);
     return;
 }
 
@@ -53,6 +63,7 @@ var gatewayRoute = StaticRouteValidator.Normalize(new StaticRouteRule { Destinat
 Assert(gatewayRoute.NextHop == "10.20.0.1" && gatewayRoute.RouteMetric == 20, "gateway route normalization");
 var ipv6Route = StaticRouteValidator.Normalize(new StaticRouteRule { DestinationPrefix = "2001:db8:10::42/64", NextHop = "2001:db8:10::1", RouteMetric = 10 });
 Assert(ipv6Route.DestinationPrefix == "2001:db8:10::/64" && ipv6Route.NextHop == "2001:db8:10::1" && ipv6Route.AddressFamily == AddressFamily.InterNetworkV6, "IPv6 route normalization");
+TestRouteSmokeAdapterResolution();
 AssertThrows(() => StaticRouteValidator.Normalize(new StaticRouteRule { DestinationPrefix = "0.0.0.0/0", NextHop = "192.168.100.1", RouteMetric = 5 }), "IPv4 default route rejected");
 AssertThrows(() => StaticRouteValidator.Normalize(new StaticRouteRule { DestinationPrefix = "::/0", NextHop = "2001:db8::1", RouteMetric = 5 }), "IPv6 default route rejected");
 AssertThrows(() => StaticRouteValidator.Normalize(new StaticRouteRule { DestinationPrefix = "10.0.0.0/8", NextHop = "::1", RouteMetric = 10 }), "IPv6 next hop rejected for IPv4 route");
@@ -450,8 +461,10 @@ static async Task RunRouteSmokeAsync(string firstIndex, string secondIndex)
     var paths = new AppPaths(AppContext.BaseDirectory);
     var logger = new FileLogger(paths);
     var service = new StaticRouteService(logger);
-    var adapterA = new NetworkAdapterInfo { Id = "route-smoke-a", Name = "Route Smoke A", Description = "Test Ethernet", InterfaceIndex = first.ToString(), Status = "Up" };
-    var adapterB = new NetworkAdapterInfo { Id = "route-smoke-b", Name = "Route Smoke B", Description = "Test Ethernet", InterfaceIndex = second.ToString(), Status = "Up" };
+    var discoveredAdapters = new NetworkAdapterService(logger).GetAdapters(logAdapters: false);
+    var adapterA = ResolveRouteSmokeAdapter(discoveredAdapters, first, "first route-smoke", requireVirtual: true);
+    var adapterB = ResolveRouteSmokeAdapter(discoveredAdapters, second, "second route-smoke", requireVirtual: true);
+    var secondAdapterGuid = Guid.Parse(adapterB.Id).ToString("D");
     var ruleA = new StaticRouteRule { Id = "route-smoke-rule-a", DestinationPrefix = "10.250.10.0/24", AdapterId = adapterA.Id, RouteMetric = 10 };
     var ruleB = new StaticRouteRule { Id = "route-smoke-rule-b", DestinationPrefix = "10.250.20.0/24", AdapterId = adapterB.Id, NextHop = "198.18.251.254", RouteMetric = 20 };
     var conflictRule = new StaticRouteRule { Id = "route-smoke-rule-conflict", DestinationPrefix = "10.250.30.0/24", AdapterId = adapterA.Id, RouteMetric = 10 };
@@ -460,12 +473,6 @@ static async Task RunRouteSmokeAsync(string firstIndex, string secondIndex)
     var ipv6Rule = new StaticRouteRule { Id = "route-smoke-rule-ipv6", DestinationPrefix = "fd12:250:252::/64", AdapterId = adapterA.Id, RouteMetric = 10 };
     const string conflictDestination = "10.250.30.0/24";
     const string conflictNextHop = "198.18.251.254";
-    await RunPowerShellCommandAsync($"New-NetRoute -DestinationPrefix '{conflictDestination}' -InterfaceIndex {second} -AddressFamily IPv4 -NextHop '{conflictNextHop}' -RouteMetric 200 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null");
-    var conflictRoutes = (await service.GetCurrentStaticRoutesAsync())
-        .Where(route => route.DestinationPrefix.StartsWith("10.250.30.", StringComparison.OrdinalIgnoreCase))
-        .ToList();
-    foreach (var route in conflictRoutes)
-        Console.WriteLine($"ROUTE_SMOKE_SETUP prefix={route.DestinationPrefix} interface={route.InterfaceIndex} nextHop={route.NextHop} routeMetric={route.RouteMetric} interfaceMetric={route.InterfaceMetric} store={route.PolicyStore}");
     var targets = new List<StaticRouteTarget>
     {
         new(ruleA, adapterA, StaticRouteValidator.Normalize(ruleA)),
@@ -475,8 +482,26 @@ static async Task RunRouteSmokeAsync(string firstIndex, string secondIndex)
         new(samePrefixRuleB, adapterB, StaticRouteValidator.Normalize(samePrefixRuleB)),
         new(ipv6Rule, adapterA, StaticRouteValidator.Normalize(ipv6Rule))
     };
+    var seedRouteCreated = false;
     try
     {
+        var setupScript = $$"""
+$idx={{second}}
+$expectedGuid=[guid]'{{secondAdapterGuid}}'
+$netAdapter=Get-NetAdapter -InterfaceIndex $idx -ErrorAction Stop
+if ([guid]$netAdapter.InterfaceGuid -ne $expectedGuid) { throw 'Route-smoke adapter identity changed before setup' }
+$existing=@(Get-NetRoute -InterfaceIndex $idx -AddressFamily IPv4 -DestinationPrefix '{{conflictDestination}}' -ErrorAction SilentlyContinue | Where-Object { [string]$_.NextHop -eq '{{conflictNextHop}}' -and [int]$_.RouteMetric -eq 200 })
+if ($existing.Count -gt 0) { throw 'The isolated route-smoke seed route already exists; refusing to claim it' }
+New-NetRoute -DestinationPrefix '{{conflictDestination}}' -InterfaceIndex $idx -AddressFamily IPv4 -NextHop '{{conflictNextHop}}' -RouteMetric 200 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
+""";
+        await RunPowerShellCommandAsync(setupScript);
+        seedRouteCreated = true;
+        var conflictRoutes = (await service.GetCurrentStaticRoutesAsync())
+            .Where(route => route.DestinationPrefix.StartsWith("10.250.30.", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        foreach (var route in conflictRoutes)
+            Console.WriteLine($"ROUTE_SMOKE_SETUP prefix={route.DestinationPrefix} interface={route.InterfaceIndex} nextHop={route.NextHop} routeMetric={route.RouteMetric} interfaceMetric={route.InterfaceMetric} store={route.PolicyStore}");
+
         var results = await service.ApplyAsync(targets);
         var applied = results.Where(x => x.Created && x.Applied != null).Select(x => (x.Applied!, x.Rule.AdapterId == adapterA.Id ? adapterA : adapterB)).ToList();
         Assert(applied.Count == 6, "route smoke created IPv4, IPv6, and multi-adapter priority routes");
@@ -492,8 +517,255 @@ static async Task RunRouteSmokeAsync(string firstIndex, string secondIndex)
     }
     finally
     {
-        await RunPowerShellCommandAsync($"Get-NetRoute -InterfaceIndex {second} -AddressFamily IPv4 -DestinationPrefix '{conflictDestination}' -NextHop '{conflictNextHop}' -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue");
+        if (seedRouteCreated)
+        {
+            var cleanupScript = $$"""
+$idx={{second}}
+$expectedGuid=[guid]'{{secondAdapterGuid}}'
+$netAdapter=Get-NetAdapter -InterfaceIndex $idx -ErrorAction Stop
+if ([guid]$netAdapter.InterfaceGuid -ne $expectedGuid) { throw 'Route-smoke adapter identity changed before seed-route cleanup' }
+$owned=@(Get-NetRoute -InterfaceIndex $idx -AddressFamily IPv4 -DestinationPrefix '{{conflictDestination}}' -ErrorAction SilentlyContinue | Where-Object { [string]$_.NextHop -eq '{{conflictNextHop}}' -and [int]$_.RouteMetric -eq 200 })
+$owned | Remove-NetRoute -Confirm:$false -ErrorAction Stop
+$remaining=@(Get-NetRoute -InterfaceIndex $idx -AddressFamily IPv4 -DestinationPrefix '{{conflictDestination}}' -ErrorAction SilentlyContinue | Where-Object { [string]$_.NextHop -eq '{{conflictNextHop}}' -and [int]$_.RouteMetric -eq 200 })
+if ($remaining.Count -gt 0) { throw 'The route-smoke seed route remains after cleanup' }
+""";
+            await RunPowerShellCommandAsync(cleanupScript);
+        }
     }
+}
+
+static NetworkAdapterInfo ResolveRouteSmokeAdapter(
+    IReadOnlyList<NetworkAdapterInfo> discoveredAdapters,
+    int interfaceIndex,
+    string description,
+    bool requireVirtual)
+{
+    var matches = discoveredAdapters
+        .Where(adapter => int.TryParse(adapter.InterfaceIndex, out var candidateIndex) && candidateIndex == interfaceIndex)
+        .ToList();
+    if (matches.Count != 1)
+        throw new InvalidOperationException($"Expected exactly one {description} adapter at interface index {interfaceIndex}; found {matches.Count}.");
+
+    var adapter = matches[0];
+    if (!Guid.TryParse(adapter.Id, out _))
+        throw new InvalidOperationException($"The {description} adapter at interface index {interfaceIndex} has no stable GUID.");
+    if (requireVirtual && !adapter.IsVirtual)
+        throw new InvalidOperationException($"The {description} adapter at interface index {interfaceIndex} is not identified as a virtual adapter.");
+    return adapter;
+}
+
+static void TestRouteSmokeAdapterResolution()
+{
+    var virtualAdapter = new NetworkAdapterInfo
+    {
+        Id = Guid.NewGuid().ToString("B"),
+        Name = "vEthernet (Route Smoke Test)",
+        InterfaceIndex = "51001",
+        IsVirtual = true
+    };
+    var resolved = ResolveRouteSmokeAdapter([virtualAdapter], 51001, "test", requireVirtual: true);
+    Assert(resolved.Id == virtualAdapter.Id, "route smoke resolves the stable adapter GUID by interface index");
+    AssertThrowsAny(() => ResolveRouteSmokeAdapter([], 51001, "missing test", requireVirtual: true), "route smoke rejects missing adapter identity");
+    AssertThrowsAny(() => ResolveRouteSmokeAdapter([virtualAdapter, virtualAdapter], 51001, "ambiguous test", requireVirtual: true), "route smoke rejects ambiguous interface indexes");
+    AssertThrowsAny(() => ResolveRouteSmokeAdapter([new NetworkAdapterInfo { Id = "route-smoke-test", InterfaceIndex = "51001", IsVirtual = true }], 51001, "invalid GUID test", requireVirtual: true), "route smoke rejects non-GUID adapter identity");
+    AssertThrowsAny(() => ResolveRouteSmokeAdapter([new NetworkAdapterInfo { Id = Guid.NewGuid().ToString("B"), InterfaceIndex = "51001", IsVirtual = false }], 51001, "physical adapter test", requireVirtual: true), "route smoke rejects a physical adapter");
+}
+
+static async Task RunIsolatedAdapterCancelSmokeAsync(string adapterGuidText, string resultPath)
+{
+    var designatedGuid = Guid.Parse("863A3E86-475B-4BA1-AE14-8D7C654DF9C1");
+    if (!Guid.TryParse(adapterGuidText, out var requestedGuid) || requestedGuid != designatedGuid)
+        throw new InvalidOperationException($"The isolated adapter smoke only accepts the designated X722 GUID {designatedGuid:B}.");
+
+    var fullResultPath = Path.GetFullPath(resultPath);
+    Directory.CreateDirectory(Path.GetDirectoryName(fullResultPath)!);
+    var recoveryPath = fullResultPath + ".recovery.json";
+    if (File.Exists(recoveryPath))
+        throw new IOException($"A prior isolated adapter recovery record already exists: {recoveryPath}");
+
+    var logger = new TestLogger();
+    NetworkAdapterInfo? adapter = null;
+    AdapterIpv4Snapshot? originalSnapshot = null;
+    string? originalMacAddress = null;
+    var disabledReadbackObserved = false;
+    var cancellationRequested = false;
+    var delayInvocation = 0;
+    using var operationCancellation = new CancellationTokenSource();
+    NetworkAdapterService? service = null;
+    service = new NetworkAdapterService(logger, delayAsync: async (delay, cancellationToken) =>
+    {
+        if (delay == TimeSpan.FromMilliseconds(750) && Interlocked.Increment(ref delayInvocation) == 1)
+        {
+            var target = adapter ?? throw new InvalidOperationException("The designated adapter was not resolved before restart.");
+            if (await service!.IsAdapterEnabledAsync(target, CancellationToken.None).ConfigureAwait(false))
+                throw new InvalidOperationException("The adapter did not read back AdminStatus Down after the disable command.");
+
+            disabledReadbackObserved = true;
+            cancellationRequested = true;
+            operationCancellation.Cancel();
+        }
+
+        await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+    });
+
+    var cleanupRestored = false;
+    try
+    {
+        if (!service.IsAdministrator())
+            throw new InvalidOperationException("Run the isolated adapter smoke from an elevated PowerShell session.");
+
+        var matches = service.GetAdapters(logAdapters: false)
+            .Where(candidate => Guid.TryParse(candidate.Id, out var id) && id == designatedGuid)
+            .ToList();
+        if (matches.Count != 1)
+            throw new InvalidOperationException($"Expected exactly one adapter with designated GUID {designatedGuid:B}; found {matches.Count}.");
+
+        var selected = matches[0];
+        adapter = service.GetAdapterByIdentity(selected.Id, selected.InterfaceIndex)
+            ?? throw new InvalidOperationException("The selected adapter identity changed during preflight.");
+        if (adapter.IsWifi || adapter.IsVirtual
+            || !adapter.Description.Contains("X722", StringComparison.OrdinalIgnoreCase)
+            || !adapter.Status.Equals("Up", StringComparison.OrdinalIgnoreCase)
+            || adapter.HasGateway)
+            throw new InvalidOperationException("The designated X722 adapter failed its physical, connected, or no-gateway preflight.");
+
+        var interfaceIndex = int.Parse(adapter.InterfaceIndex, System.Globalization.CultureInfo.InvariantCulture);
+        var defaultRoutesBefore = await GetAdapterDefaultRouteCountAsync(interfaceIndex).ConfigureAwait(false);
+        if (defaultRoutesBefore != 0)
+            throw new InvalidOperationException($"The designated isolated adapter has {defaultRoutesBefore} default route(s); no write was attempted.");
+        if (!await service.IsAdapterEnabledAsync(adapter, CancellationToken.None).ConfigureAwait(false))
+            throw new InvalidOperationException("The designated adapter is not administratively enabled; no restart was attempted.");
+
+        originalSnapshot = await service.CaptureIPv4ConfigAsync(adapter, CancellationToken.None).ConfigureAwait(false);
+        if (originalSnapshot.AdapterEnabled != true)
+            throw new InvalidDataException("The adapter's original administrative state could not be captured as enabled.");
+        originalMacAddress = GetCurrentMacAddress(adapter.Id);
+        File.WriteAllText(recoveryPath, JsonSerializer.Serialize(new
+        {
+            adapterGuid = designatedGuid.ToString("B"),
+            interfaceIndex = adapter.InterfaceIndex,
+            originalMacAddress,
+            originalSnapshot,
+            createdUtc = DateTimeOffset.UtcNow
+        }, new JsonSerializerOptions { WriteIndented = true }));
+
+        var cancellationCaught = false;
+        try
+        {
+            await service.RestartAdapterAsync(
+                adapter,
+                allowAnyAdapter: true,
+                ct: operationCancellation.Token,
+                expectedEnabledBefore: true).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (operationCancellation.IsCancellationRequested && disabledReadbackObserved)
+        {
+            cancellationCaught = true;
+        }
+
+        if (!cancellationCaught || !cancellationRequested || !disabledReadbackObserved)
+            throw new InvalidOperationException("Cancellation was not observed after the real adapter disable readback.");
+
+        var enabledAfterCompensation = await service.IsAdapterEnabledAsync(adapter, CancellationToken.None).ConfigureAwait(false);
+        var restoredSnapshot = await service.CaptureIPv4ConfigAsync(adapter, CancellationToken.None).ConfigureAwait(false);
+        var restoredMacAddress = GetCurrentMacAddress(adapter.Id);
+        var defaultRoutesAfter = await GetAdapterDefaultRouteCountAsync(interfaceIndex).ConfigureAwait(false);
+        var snapshotEquivalent = AdapterIpv4SnapshotComparer.Equivalent(originalSnapshot, restoredSnapshot);
+        var macRestored = NetworkAdapterService.NormalizeMacAddress(originalMacAddress)
+            .Equals(NetworkAdapterService.NormalizeMacAddress(restoredMacAddress), StringComparison.OrdinalIgnoreCase);
+        if (!enabledAfterCompensation || !snapshotEquivalent || !macRestored || defaultRoutesAfter != 0)
+            throw new InvalidOperationException("The isolated adapter did not return to its complete pre-test state.");
+
+        File.Delete(recoveryPath);
+        WriteIsolatedAdapterSmokeResult(fullResultPath, new
+        {
+            passed = true,
+            adapterGuid = designatedGuid.ToString("B"),
+            interfaceIndex = adapter.InterfaceIndex,
+            cancellationRequestedAfterDisableReadback = true,
+            independentCompensationRestoredAdminStatus = enabledAfterCompensation,
+            ipv4SnapshotEquivalent = snapshotEquivalent,
+            macRestored,
+            defaultRoutesBefore,
+            defaultRoutesAfter,
+            recoveryRecordRemoved = !File.Exists(recoveryPath)
+        });
+        Console.WriteLine($"T21_PHYSICAL_CANCEL_SMOKE_OK interface={interfaceIndex} cancellation=after-disable-readback compensation=verified ipv4=unchanged recovery=cleared");
+    }
+    catch (Exception operationError)
+    {
+        Exception? cleanupError = null;
+        if (adapter is not null && originalSnapshot is not null && originalMacAddress is not null)
+        {
+            try
+            {
+                using var cleanupTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+                if (!await service.IsAdapterEnabledAsync(adapter, cleanupTimeout.Token).ConfigureAwait(false))
+                    await service.EnsureAdapterEnabledAsync(adapter, allowAnyAdapter: true, cleanupTimeout.Token).ConfigureAwait(false);
+                var currentMac = GetCurrentMacAddress(adapter.Id);
+                if (!NetworkAdapterService.NormalizeMacAddress(currentMac).Equals(
+                        NetworkAdapterService.NormalizeMacAddress(originalMacAddress), StringComparison.OrdinalIgnoreCase))
+                    await service.RestoreMacAddressAsync(adapter, originalMacAddress, cleanupTimeout.Token).ConfigureAwait(false);
+                var currentSnapshot = await service.CaptureIPv4ConfigAsync(adapter, cleanupTimeout.Token).ConfigureAwait(false);
+                if (!AdapterIpv4SnapshotComparer.Equivalent(originalSnapshot, currentSnapshot))
+                    await service.RestoreIPv4ConfigAsync(adapter, originalSnapshot, cleanupTimeout.Token).ConfigureAwait(false);
+                var finalSnapshot = await service.CaptureIPv4ConfigAsync(adapter, cleanupTimeout.Token).ConfigureAwait(false);
+                cleanupRestored = await service.IsAdapterEnabledAsync(adapter, cleanupTimeout.Token).ConfigureAwait(false)
+                    && AdapterIpv4SnapshotComparer.Equivalent(originalSnapshot, finalSnapshot)
+                    && NetworkAdapterService.NormalizeMacAddress(GetCurrentMacAddress(adapter.Id))
+                        .Equals(NetworkAdapterService.NormalizeMacAddress(originalMacAddress), StringComparison.OrdinalIgnoreCase)
+                    && await GetAdapterDefaultRouteCountAsync(int.Parse(adapter.InterfaceIndex, System.Globalization.CultureInfo.InvariantCulture)).ConfigureAwait(false) == 0;
+                if (!cleanupRestored) throw new InvalidOperationException("Fallback cleanup could not verify the original adapter state.");
+                if (File.Exists(recoveryPath)) File.Delete(recoveryPath);
+            }
+            catch (Exception ex)
+            {
+                cleanupError = ex;
+            }
+        }
+
+        WriteIsolatedAdapterSmokeResult(fullResultPath, new
+        {
+            passed = false,
+            adapterGuid = designatedGuid.ToString("B"),
+            interfaceIndex = adapter?.InterfaceIndex,
+            cancellationRequestedAfterDisableReadback = cancellationRequested && disabledReadbackObserved,
+            fallbackCleanupRestored = cleanupRestored,
+            recoveryRecord = File.Exists(recoveryPath) ? recoveryPath : null,
+            error = operationError.GetType().Name,
+            errorMessage = operationError.Message,
+            cleanupError = cleanupError?.GetType().Name
+        });
+        if (cleanupError is not null)
+            throw new AggregateException("Isolated adapter cancellation smoke failed and fallback cleanup could not be verified.", operationError, cleanupError);
+        throw;
+    }
+}
+
+static async Task<int> GetAdapterDefaultRouteCountAsync(int interfaceIndex)
+{
+    var script = $$"""
+$routes = @(Get-NetRoute -InterfaceIndex {{interfaceIndex}} -ErrorAction Stop | Where-Object { [string]$_.DestinationPrefix -in @('0.0.0.0/0', '::/0') })
+[Console]::WriteLine($routes.Count)
+""";
+    var result = await RunPowerShellCommandAsync(script).ConfigureAwait(false);
+    if (!int.TryParse(result, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var count) || count < 0)
+        throw new InvalidDataException("Could not read the adapter's IPv4/IPv6 default-route count.");
+    return count;
+}
+
+static string GetCurrentMacAddress(string adapterId)
+{
+    var networkInterface = NetworkInterface.GetAllNetworkInterfaces()
+        .SingleOrDefault(candidate => candidate.Id.Equals(adapterId, StringComparison.OrdinalIgnoreCase))
+        ?? throw new InvalidOperationException("The adapter identity disappeared during the isolated smoke.");
+    return NetworkAdapterService.NormalizeMacAddress(networkInterface.GetPhysicalAddress().ToString());
+}
+
+static void WriteIsolatedAdapterSmokeResult<T>(string resultPath, T result)
+{
+    Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(resultPath))!);
+    File.WriteAllText(resultPath, JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = true }), Encoding.UTF8);
 }
 
 static async Task RunVirtualRouteSmokeAsync(string interfaceIndexText, string resultPath)
@@ -508,15 +780,8 @@ static async Task RunVirtualRouteSmokeAsync(string interfaceIndexText, string re
         var paths = new AppPaths(AppContext.BaseDirectory);
         var logger = new FileLogger(paths);
         var service = new StaticRouteService(logger);
-        var adapter = new NetworkAdapterInfo
-        {
-            Id = "route-virtual-smoke",
-            Name = "Route Virtual Smoke",
-            Description = "Virtual adapter route test",
-            InterfaceIndex = interfaceIndex.ToString(),
-            Status = "Up",
-            IsVirtual = true,
-        };
+        var discoveredAdapters = new NetworkAdapterService(logger).GetAdapters(logAdapters: false);
+        var adapter = ResolveRouteSmokeAdapter(discoveredAdapters, interfaceIndex, "virtual route-smoke", requireVirtual: true);
         var ipv4Rule = new StaticRouteRule { Id = "route-virtual-smoke-v4", DestinationPrefix = ipv4Destination, AdapterId = adapter.Id };
         var ipv6Rule = new StaticRouteRule { Id = "route-virtual-smoke-v6", DestinationPrefix = ipv6Destination, AdapterId = adapter.Id };
         var targets = new List<StaticRouteTarget>

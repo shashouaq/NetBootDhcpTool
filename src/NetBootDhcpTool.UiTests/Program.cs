@@ -1,4 +1,8 @@
 using System.IO;
+using System.IO.Compression;
+using System.Diagnostics;
+using System.Net;
+using System.Net.Http;
 using System.Security.Principal;
 using System.Reflection;
 using System.Windows;
@@ -70,7 +74,83 @@ internal static class Program
         });
 
         var application = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown };
-        var window = new MainWindow(paths, new FileLogger(paths));
+        var slowLeaseProbeStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseSlowLeaseProbe = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var updateRequestStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var uiLogger = new FileLogger(paths);
+        var updateHttpClient = new HttpClient(new CancelableUpdateHandler(updateRequestStarted));
+        var updateController = new UpdateController(new VersionUpdateService(updateHttpClient), new Version(1, 0, 14));
+        var window = new MainWindow(paths, uiLogger, async (request, _) =>
+        {
+            if (request.Identity.ClientKey == "slow-client")
+            {
+                slowLeaseProbeStarted.TrySetResult();
+                await releaseSlowLeaseProbe.Task;
+            }
+            return new LeaseProbeResult(request.Identity, 18, request.IncludeWeb ? true : null, request.IncludeWeb ? true : null);
+        }, updateController);
+        ExerciseAdapterRefreshCommitGuards(window);
+        // Model an already-expanded log panel so the periodic (non-forced) 128-row drain is testable.
+        ((RichTextBox)window.FindName("LogBox")!).Visibility = Visibility.Visible;
+        var observedLogFloodRows = 0;
+        Action<string> observeLogFlood = line =>
+        {
+            if (line.Contains("UI smoke log fixture=", StringComparison.Ordinal)) Interlocked.Increment(ref observedLogFloodRows);
+        };
+        uiLogger.LineWritten += observeLogFlood;
+        Parallel.For(0, 1000, index => uiLogger.Info($"UI smoke log fixture={index}"));
+        if (!SpinWait.SpinUntil(() => Volatile.Read(ref observedLogFloodRows) == 1000, TimeSpan.FromSeconds(5)))
+            throw new InvalidOperationException("the ordered logger observer did not drain all flood-test rows");
+        uiLogger.LineWritten -= observeLogFlood;
+        if (window.PendingLogDisplayCount != 500 || window.LogDisplayOmittedCount < 500)
+            throw new InvalidOperationException($"log display queue was not bounded: pending={window.PendingLogDisplayCount} omitted={window.LogDisplayOmittedCount}");
+        var scrollCountBeforeBatches = window.LogDisplayScrollCount;
+        var displayBatches = 0;
+        var displayedRows = 0;
+        while (window.PendingLogDisplayCount > 0)
+        {
+            var pendingBefore = window.PendingLogDisplayCount;
+            var drained = window.DrainLogDisplayQueueForUiTest(force: false);
+            if (drained is < 1 or > 128 || pendingBefore - window.PendingLogDisplayCount != drained)
+                throw new InvalidOperationException($"a log UI batch did not honor the 128-row limit: drained={drained}, pendingBefore={pendingBefore}, pendingAfter={window.PendingLogDisplayCount}");
+            displayedRows += drained;
+            displayBatches++;
+        }
+        if (displayBatches != 4 || displayedRows != 500 || window.LogDisplayScrollCount != scrollCountBeforeBatches + displayBatches)
+            throw new InvalidOperationException($"log UI refresh batch count was unexpected: batches={displayBatches}, rows={displayedRows}");
+        Console.WriteLine($"LOG_UI_METRICS queuePeak=500 omitted={window.LogDisplayOmittedCount} batches={displayBatches} rowsPerBatchMax=128");
+        var autoScroll = (CheckBox)window.FindName("ChkLogAutoScroll")!;
+        autoScroll.IsChecked = false;
+        uiLogger.Info("UI smoke scroll hold fixture");
+        if (!SpinWait.SpinUntil(() => window.PendingLogDisplayCount > 0, TimeSpan.FromSeconds(3)))
+            throw new InvalidOperationException("the logger display queue did not receive the scroll-position fixture");
+        var scrollCountBeforePausedBatch = window.LogDisplayScrollCount;
+        if (window.DrainLogDisplayQueueForUiTest(force: false) != 1 || window.LogDisplayScrollCount != scrollCountBeforePausedBatch)
+            throw new InvalidOperationException("log auto-scroll moved the reader after automatic scrolling was disabled");
+        autoScroll.IsChecked = true;
+        var logBox = (RichTextBox)window.FindName("LogBox")!;
+        var logSummary = (TextBlock)window.FindName("TxtLogSummary")!;
+        if (logBox.Document.Blocks.Count > 500 || !logSummary.Text.Contains("omitted", StringComparison.OrdinalIgnoreCase)
+            || CountLogRowsWhileLoggerIsOpen(uiLogger.SessionLogPath, "UI smoke log fixture=") != 1000)
+            throw new InvalidOperationException("bounded log display dropped file rows or failed to report omitted display rows");
+        var supportArchivePath = Path.Combine(dataDirectory, "active-log-support-smoke.zip");
+        using (var archive = ZipFile.Open(supportArchivePath, ZipArchiveMode.Create))
+        {
+            MainWindow.AddSupportFile(archive, uiLogger.SessionLogPath, "logs/active.log", redact: false);
+            MainWindow.AddSupportFile(archive, uiLogger.SessionLogPath, "logs/active-redacted.log", redact: true);
+        }
+        using (var archive = ZipFile.OpenRead(supportArchivePath))
+        {
+            foreach (var entryName in new[] { "logs/active.log", "logs/active-redacted.log" })
+            {
+                using var entry = archive.GetEntry(entryName)!.Open();
+                using var text = new StreamReader(entry);
+                var rows = 0;
+                while (text.ReadLine() is { } line)
+                    if (line.Contains("UI smoke log fixture=", StringComparison.Ordinal)) rows++;
+                if (rows != 1000) throw new InvalidOperationException($"support package entry {entryName} did not include every active session log row");
+            }
+        }
         const string giteeArchiveUrl = "https://gitee.com/joel20230302/NetBootDhcpTool/attach_files/123456";
         const string githubArchiveUrl = "https://github.com/shashouaq/NetBootDhcpTool/releases/download/v1.0.15/NetBootDhcpTool-v1.0.15.7z";
         var syntheticUpdate = new UpdateCheckResult
@@ -91,9 +171,13 @@ internal static class Program
             ArchiveSha256 = new string('a', 64),
             Changes = ["Synthetic UI speed display check"]
         };
-        window.GetType().GetField("_updateCheckStarted", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(window, true);
-        window.GetType().GetField("_lastUpdateResult", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(window, syntheticUpdate);
-        InvokePrivate(window, "UpdateVersionPresentation");
+        window.ApplyUpdateControllerState(new UpdateControllerState
+        {
+            Revision = 1,
+            CheckStarted = true,
+            CheckResult = syntheticUpdate,
+            SourceSpeeds = syntheticUpdate.DownloadSpeeds
+        });
         var updateStatus = (TextBlock)window.FindName("TxtUpdateStatus")!;
         var updateLink = (Hyperlink)window.FindName("UpdateLink")!;
         if (!updateStatus.Text.Contains("Gitee 800.0 KB/s", StringComparison.Ordinal)
@@ -101,34 +185,45 @@ internal static class Program
             || !updateStatus.Text.Contains("Selected GitHub", StringComparison.Ordinal)
             || updateLink.ToolTip is not string updateTooltip || !updateTooltip.Contains(githubArchiveUrl, StringComparison.Ordinal))
             throw new InvalidOperationException("the update toolbar did not show both mirror speeds and the selected source");
-        var downloadInProgress = window.GetType().GetField("_updateDownloadInProgress", BindingFlags.Instance | BindingFlags.NonPublic)!;
-        var downloadCancellation = window.GetType().GetField("_updateDownloadCts", BindingFlags.Instance | BindingFlags.NonPublic)!;
         var cancelDownload = (Button)window.FindName("BtnCancelUpdateDownload")!;
-        using (var cancellation = new CancellationTokenSource())
+        var activeDownload = window.StartUpdateDownloadForUiTest(syntheticUpdate, Path.Combine(dataDirectory, "ui-update", "package.7z"));
+        updateRequestStarted.Task.WaitAsync(TimeSpan.FromSeconds(3)).GetAwaiter().GetResult();
+        InvokePrivate(window, "CancelUpdateDownload_Click", cancelDownload, new RoutedEventArgs());
+        if (!updateController.State.DownloadCancellationRequested || cancelDownload.IsEnabled
+            || !updateStatus.Text.Contains("Canceling update download", StringComparison.Ordinal))
+            throw new InvalidOperationException("the update toolbar did not cancel an active download");
+        try { activeDownload.WaitAsync(TimeSpan.FromSeconds(3)).GetAwaiter().GetResult(); }
+        catch (TaskCanceledException) { }
+        if (!updateController.State.DownloadCanceled)
+            throw new InvalidOperationException("the update controller did not observe cancellation");
+        var liveState = updateController.State with
         {
-            downloadInProgress.SetValue(window, true);
-            downloadCancellation.SetValue(window, cancellation);
-            cancelDownload.Visibility = Visibility.Visible;
-            InvokePrivate(window, "CancelUpdateDownload_Click", cancelDownload, new RoutedEventArgs());
-            if (!cancellation.IsCancellationRequested || cancelDownload.IsEnabled
-                || !updateStatus.Text.Contains("Canceling update download", StringComparison.Ordinal))
-                throw new InvalidOperationException("the update toolbar did not cancel an active download");
-            cancelDownload.Visibility = Visibility.Collapsed;
-            cancelDownload.IsEnabled = true;
-            downloadCancellation.SetValue(window, null);
-        }
-        InvokePrivate(window, "UpdateDownloadProgressPresentation", new UpdateDownloadProgress
-        {
-            BytesReceived = 512 * 1024,
-            TotalBytes = 2 * 1024 * 1024,
-            BytesPerSecond = 1536 * 1024,
-            DownloadUrl = githubArchiveUrl,
-            IsSourceFallback = true
-        });
+            Revision = updateController.State.Revision + 1,
+            CheckStarted = true,
+            CheckResult = syntheticUpdate,
+            SourceSpeeds = syntheticUpdate.DownloadSpeeds,
+            DownloadInProgress = true,
+            DownloadCancellationRequested = false,
+            DownloadCanceled = false,
+            DownloadProgress = new UpdateDownloadProgress
+            {
+                BytesReceived = 512 * 1024,
+                TotalBytes = 2 * 1024 * 1024,
+                BytesPerSecond = 1536 * 1024,
+                DownloadUrl = githubArchiveUrl,
+                IsSourceFallback = true
+            }
+        };
+        window.ApplyUpdateControllerState(liveState);
         if (!updateStatus.Text.Contains("Switched to GitHub", StringComparison.Ordinal)
             || !updateStatus.Text.Contains("1.5 MB/s", StringComparison.Ordinal))
             throw new InvalidOperationException("the live update status did not show the current mirror and transfer rate");
-        downloadInProgress.SetValue(window, false);
+        window.ApplyUpdateControllerState(liveState with
+        {
+            Revision = liveState.Revision + 1,
+            DownloadInProgress = false,
+            DownloadProgress = null
+        });
         var busyStageText = (TextBlock)window.FindName("BusyStageText")!;
         var busyElapsedText = (TextBlock)window.FindName("BusyElapsedText")!;
         var busyStageProgress = (ProgressBar)window.FindName("BusyStageProgress")!;
@@ -154,6 +249,7 @@ internal static class Program
         var completed = false;
         var failed = false;
         var closeRequested = false;
+        var manualAdapterRefreshRunning = false;
         var ownerReleased = false;
         var closed = false;
         var routeJournalWarningDismissed = false;
@@ -230,9 +326,9 @@ internal static class Program
         var timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(500) };
         var started = DateTime.UtcNow;
 
-        timer.Tick += (_, _) =>
+        timer.Tick += async (_, _) =>
         {
-            if (completed) return;
+            if (completed || manualAdapterRefreshRunning) return;
             try
             {
                 if (!routeJournalWarningDismissed)
@@ -404,30 +500,65 @@ internal static class Program
                     SessionId = "old-session", IsActiveLease = true, IsCurrentSession = false, Status = "Assigned", PingLatencyMs = 12, HttpOk = true, HttpsOk = true,
                     Time = DateTime.Now.AddMinutes(-1), LeaseEnd = DateTime.Now.AddHours(1)
                 };
-                ((Task)InvokePrivate(window, "UpdateLeaseAsync", oldLease)!).GetAwaiter().GetResult();
+                window.ProcessLeaseEvent(oldLease);
                 var renewal = new NetBootDhcpTool.Dhcp.DhcpLease
                 {
                     ClientKey = "MAC:" + leaseMac, MacAddress = leaseMac, IpAddress = "192.0.2.10", Hostname = "renewed",
                     SessionId = "old-session", IsActiveLease = true, Status = "Assigned", LeaseEnd = DateTime.Now.AddHours(1)
                 };
-                ((Task)InvokePrivate(window, "UpdateLeaseAsync", renewal)!).GetAwaiter().GetResult();
+                window.ProcessLeaseEvent(renewal);
                 var release = new NetBootDhcpTool.Dhcp.DhcpLease
                 {
                     ClientKey = "MAC:" + leaseMac, MacAddress = leaseMac, IpAddress = "192.0.2.10", Hostname = "renewed",
                     SessionId = "old-session", IsActiveLease = false, Status = "Released", LeaseEnd = DateTime.Now
                 };
-                ((Task)InvokePrivate(window, "UpdateLeaseAsync", release)!).GetAwaiter().GetResult();
+                window.ProcessLeaseEvent(release);
                 var reusedAddress = new NetBootDhcpTool.Dhcp.DhcpLease
                 {
                     ClientKey = "MAC:" + leaseMac, MacAddress = leaseMac, IpAddress = "192.0.2.10", Hostname = "new-session",
                     SessionId = "new-session", IsActiveLease = true, Status = "Assigned", LeaseEnd = DateTime.Now.AddHours(1)
                 };
-                ((Task)InvokePrivate(window, "UpdateLeaseAsync", reusedAddress)!).GetAwaiter().GetResult();
+                window.ProcessLeaseEvent(reusedAddress);
                 var leaseRows = window.Leases.Where(x => x.MacAddress == leaseMac).ToList();
                 if (leaseRows.Count != 2 || leaseRows.All(x => x.Hostname != "renewed" || x.Status != "Released" || x.PingLatencyMs != -1 || x.HttpOk || x.HttpsOk)
                     || leaseRows.All(x => x.Hostname != "new-session" || x.Status != "Assigned" || x.PingLatencyMs != -1))
                     throw new InvalidOperationException("lease renewal or IP reuse merged old Ping/status state into another session: "
                         + string.Join(";", leaseRows.Select(x => $"{x.SessionId}/{x.Hostname}/{x.Status}/{x.PingLatencyMs}/current={x.IsCurrentSession}/active={x.IsActiveLease}")));
+
+                const string probeSession = "lease-probe-session";
+                window.GetType().GetField("_activeDhcpUiSessionId", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(window, probeSession);
+                var slowLease = new NetBootDhcpTool.Dhcp.DhcpLease
+                {
+                    ClientKey = "slow-client", MacAddress = "02-11-22-33-44-77", IpAddress = "192.0.2.90",
+                    SessionId = probeSession, IsActiveLease = true, Status = "Assigned", LeaseEnd = DateTime.Now.AddHours(1)
+                };
+                window.ProcessLeaseEvent(slowLease);
+                slowLeaseProbeStarted.Task.WaitAsync(TimeSpan.FromSeconds(2)).GetAwaiter().GetResult();
+                var otherReleasedLease = new NetBootDhcpTool.Dhcp.DhcpLease
+                {
+                    ClientKey = "other-client", MacAddress = "02-11-22-33-44-78", IpAddress = "192.0.2.91",
+                    SessionId = probeSession, IsActiveLease = false, Status = "Released", LeaseEnd = DateTime.Now
+                };
+                var leaseEventTimer = Stopwatch.StartNew();
+                window.ProcessLeaseEvent(otherReleasedLease);
+                leaseEventTimer.Stop();
+                var slowRow = window.Leases.Single(x => x.ClientKey == "slow-client");
+                var otherRow = window.Leases.Single(x => x.ClientKey == "other-client");
+                if (slowRow.Status != "Assigned" || otherRow.Status != "Released" || otherRow.PingLatencyMs != -1)
+                    throw new InvalidOperationException("a slow lease probe blocked another lease state event from reaching the UI");
+                Console.WriteLine($"LEASE_EVENT_METRICS whileProbeBlockedMs={leaseEventTimer.Elapsed.TotalMilliseconds:0.0} activeProbes={window.ActiveLeaseProbeCount}");
+
+                var slowRelease = new NetBootDhcpTool.Dhcp.DhcpLease
+                {
+                    ClientKey = "slow-client", MacAddress = slowLease.MacAddress, IpAddress = slowLease.IpAddress,
+                    SessionId = probeSession, IsActiveLease = false, Status = "Released", LeaseEnd = DateTime.Now
+                };
+                window.ProcessLeaseEvent(slowRelease);
+                releaseSlowLeaseProbe.TrySetResult();
+                window.WaitForLeaseProbesAsync().WaitAsync(TimeSpan.FromSeconds(2)).GetAwaiter().GetResult();
+                if (slowRow.Status != "Released" || slowRow.PingLatencyMs != -1 || slowRow.HttpOk || slowRow.HttpsOk)
+                    throw new InvalidOperationException("a late probe result restored reachability after its lease was released");
+
                 var currentSessionMac = "02-11-22-33-44-66";
                 window.GetType().GetField("_activeDhcpUiSessionId", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(window, "current-session");
                 var currentExpired = new NetBootDhcpTool.Dhcp.DhcpLease
@@ -435,7 +566,7 @@ internal static class Program
                     ClientKey = "MAC:" + currentSessionMac, MacAddress = currentSessionMac, IpAddress = "192.0.2.10", Hostname = "current-session",
                     SessionId = "current-session", IsActiveLease = false, Status = "Expired", LeaseEnd = DateTime.Now
                 };
-                ((Task)InvokePrivate(window, "UpdateLeaseAsync", currentExpired)!).GetAwaiter().GetResult();
+                window.ProcessLeaseEvent(currentExpired);
                 if (!currentExpired.IsCurrentSession || !currentExpired.SessionText.Contains("Current", StringComparison.Ordinal))
                     throw new InvalidOperationException("current lease session was not presented separately from historical sessions.");
                 InvokePrivate(window, "MarkLeaseSessionHistorical", "current-session");
@@ -562,6 +693,32 @@ internal static class Program
                     || !window.ScanResults.Contains(retainedScanResult))
                     throw new InvalidOperationException("canceling a scan did not preserve partial results and record a canceled history item");
 
+                var operationHistory = (List<OperationHistoryItem>)window.GetType().GetField("_operationHistory", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(window)!;
+                var historyA = new OperationHistoryItem { Id = "ui-smoke-history-a", Time = DateTime.Now, Type = "Scan", Detail = "history-batch-fixture first row" };
+                var historyB = new OperationHistoryItem { Id = "ui-smoke-history-b", Time = DateTime.Now.AddSeconds(-1), Type = "Scan", Detail = "history-batch-fixture second row" };
+                operationHistory.Add(historyA);
+                operationHistory.Add(historyB);
+                InvokePrivate(window, "RefreshOperationHistoryView");
+                var historyFilter = (TextBox)window.FindName("HistoryFilterBox")!;
+                var historyGrid = (DataGrid)window.FindName("HistoryGrid")!;
+                historyFilter.Text = "history-batch-fixture";
+                if (window.OperationHistory.Count != 2)
+                    throw new InvalidOperationException("operation-history filtering dropped a matching row after batched refresh");
+                historyGrid.SelectedItems.Clear();
+                historyGrid.SelectedItems.Add(historyA);
+                InvokePrivate(window, "CopyHistory_Click", window.FindName("BtnCopyHistory"), new RoutedEventArgs());
+                var selectedHistoryCopy = Clipboard.GetText();
+                if (!selectedHistoryCopy.Contains("first row", StringComparison.Ordinal)
+                    || selectedHistoryCopy.Contains("second row", StringComparison.Ordinal))
+                    throw new InvalidOperationException("copy selected operation history included rows outside the selection");
+                historyGrid.SelectedItems.Clear();
+                InvokePrivate(window, "CopyHistory_Click", window.FindName("BtnCopyHistory"), new RoutedEventArgs());
+                var visibleHistoryCopy = Clipboard.GetText();
+                if (!visibleHistoryCopy.Contains("first row", StringComparison.Ordinal)
+                    || !visibleHistoryCopy.Contains("second row", StringComparison.Ordinal))
+                    throw new InvalidOperationException("copy visible operation history did not preserve the filtered rows");
+                historyFilter.Clear();
+
                 var allFavorites = (List<FavoriteConfig>)window.GetType().GetField("_allFavorites", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(window)!;
                 var smokeFavorite = new FavoriteConfig
                 {
@@ -686,7 +843,19 @@ internal static class Program
                     || profileComparisonMessage.Contains("no differences found", StringComparison.OrdinalIgnoreCase))
                     throw new InvalidOperationException("profile comparison did not report the changed DHCP gateway value");
 
-                InvokePrivate(window, "UpdateVersionPresentation");
+                window.ApplyUpdateControllerState(liveState with
+                {
+                    Revision = liveState.Revision + 2,
+                    CheckStarted = true,
+                    CheckResult = syntheticUpdate,
+                    SourceSpeeds = syntheticUpdate.DownloadSpeeds,
+                    DownloadInProgress = false,
+                    DownloadCancellationRequested = false,
+                    DownloadCanceled = false,
+                    DownloadProgress = null,
+                    DownloadError = null,
+                    DownloadedResult = null
+                });
                 captureUpdateDialog = true;
                 InvokePrivate(window, "UpdateLink_Click", updateLink, new RoutedEventArgs());
                 if (captureUpdateDialog
@@ -694,6 +863,10 @@ internal static class Program
                     || !updateConfirmationMessage.Contains("GitHub: 1.5 MB/s (selected)", StringComparison.Ordinal)
                     || !updateConfirmationMessage.Contains("click Cancel at any time", StringComparison.Ordinal))
                     throw new InvalidOperationException("the update confirmation did not explain the mirror selection and how to cancel the download");
+
+                manualAdapterRefreshRunning = true;
+                try { await ValidateManualAdapterRefreshCompletenessAsync(window, uiLogger); }
+                finally { manualAdapterRefreshRunning = false; }
 
                 completed = true;
                 closeRequested = true;
@@ -729,8 +902,10 @@ internal static class Program
                 timer.Stop();
                 Console.Error.WriteLine("UI_SMOKE_FAILED: window closed before its active operation released.");
             }
-            Console.WriteLine("UI_SMOKE_OK: non-admin WPF window, update mirror speeds/selection/live fallback/cancellation/confirmation, serialized unexpected DHCP stop cleanup, DHCP session restore fail-closed/unavailable recovery retention, static route cleanup failure detail/count, recovery journal safety, lease state/session/Ping separation and IP reuse, bounded scan-range validation, canceled-scan partial-result history, operation gate, refresh shortcuts, favorite cancel/re-entry/clear, profile DHCP field visibility and comparison, recovery handlers, and close wait verified.");
+            Console.WriteLine("UI_SMOKE_OK: non-admin WPF window, update mirror speeds/selection/live fallback/cancellation/confirmation, serialized unexpected DHCP stop cleanup, DHCP session restore fail-closed/unavailable recovery retention, static route cleanup failure detail/count, recovery journal safety, lease state/session/Ping separation, IP reuse, slow-probe event responsiveness and stale-result rejection, bounded scan-range validation, canceled-scan partial-result history, operation gate, refresh shortcuts, favorite cancel/re-entry/clear, profile DHCP field visibility and comparison, recovery handlers, and close wait verified.");
             timer.Stop();
+            uiLogger.Dispose();
+            updateHttpClient.Dispose();
             application.Shutdown();
         };
         timer.Tick += (_, _) =>
@@ -762,9 +937,262 @@ internal static class Program
     private static AutomationElement? FindByName(AutomationElement root, string name) =>
         root.FindFirst(TreeScope.Descendants, new PropertyCondition(AutomationElement.NameProperty, name));
 
+    private static int CountLogRowsWhileLoggerIsOpen(string path, string marker)
+    {
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        using var reader = new StreamReader(stream);
+        var count = 0;
+        while (reader.ReadLine() is { } line)
+            if (line.Contains(marker, StringComparison.Ordinal)) count++;
+        return count;
+    }
+
+    private static void ExerciseAdapterRefreshCommitGuards(MainWindow window)
+    {
+        var adapterBox = (ComboBox)window.FindName("AdapterBox")!;
+        var adapters = window.Adapters.ToArray();
+        var originalSource = adapterBox.ItemsSource;
+        var originalSelection = adapterBox.SelectedItem;
+        var refreshingField = window.GetType().GetField("_adapterRefreshInProgress", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var closingField = window.GetType().GetField("_closingCleanupStarted", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var dirtyField = window.GetType().GetField("_adapterStatusRefreshDirty", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var networkVersionField = window.GetType().GetField("_adapterNetworkChangeVersion", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var observedVersionField = window.GetType().GetField("_adapterNetworkChangeObservedVersion", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var dispatchPendingField = window.GetType().GetField("_adapterNetworkChangeDispatchPending", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var originalRefreshing = (bool)refreshingField.GetValue(window)!;
+        var originalClosing = (bool)closingField.GetValue(window)!;
+        var originalDirty = (bool)dirtyField.GetValue(window)!;
+        var originalNetworkVersion = (long)networkVersionField.GetValue(window)!;
+        var originalObservedVersion = (long)observedVersionField.GetValue(window)!;
+        var originalDispatchPending = (int)dispatchPendingField.GetValue(window)!;
+        var networkChangeTimer = (DispatcherTimer)window.GetType().GetField("_adapterNetworkChangeTimer", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(window)!;
+        var statusRefreshTimer = (DispatcherTimer)window.GetType().GetField("_adapterStatusTimer", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(window)!;
+        var originalNetworkTimerEnabled = networkChangeTimer.IsEnabled;
+        NetworkWorkflowLease? workflow = null;
+
+        var adapterA = new NetworkAdapterInfo
+        {
+            Id = "ui-smoke-adapter-A", Name = "UI smoke adapter A", InterfaceIndex = "17",
+            Status = "Up", IPv4Address = "192.0.2.17", MacAddress = "02-00-00-00-00-17"
+        };
+        var adapterB = new NetworkAdapterInfo
+        {
+            Id = "ui-smoke-adapter-B", Name = "UI smoke adapter B", InterfaceIndex = "18",
+            Status = "Up", IPv4Address = "192.0.2.18", MacAddress = "02-00-00-00-00-18"
+        };
+        var changedA = new NetworkAdapterInfo
+        {
+            Id = adapterA.Id, Name = adapterA.Name, InterfaceIndex = adapterA.InterfaceIndex,
+            Status = "Up", IPv4Address = "198.51.100.17", MacAddress = "02-00-00-00-00-99"
+        };
+        var changedMetadataA = new NetworkAdapterInfo
+        {
+            Id = adapterA.Id, Name = adapterA.Name, InterfaceIndex = adapterA.InterfaceIndex,
+            Status = "Up", IPv4Address = adapterA.IPv4Address, SubnetMask = adapterA.SubnetMask,
+            Gateway = adapterA.Gateway, Dns = adapterA.Dns, MacAddress = "02-00-00-00-00-88", LinkSpeedMbps = 1000
+        };
+        var reusedIndex = new NetworkAdapterInfo
+        {
+            Id = "ui-smoke-adapter-C", Name = "Reused interface index", InterfaceIndex = adapterA.InterfaceIndex,
+            Status = "Up", IPv4Address = "198.51.100.17", MacAddress = "02-00-00-00-00-99"
+        };
+
+        try
+        {
+            // Keep the real host enumeration out of this synthetic UI boundary test.
+            refreshingField.SetValue(window, true);
+            adapterBox.ItemsSource = null;
+            window.Adapters.Clear();
+            window.Adapters.Add(adapterA);
+            window.Adapters.Add(adapterB);
+            adapterBox.ItemsSource = window.Adapters;
+            adapterBox.SelectedItem = adapterA;
+            var staleSelectionRequest = CreateAdapterStatusRefreshRequest(window, adapterA);
+            var firstSelectionGeneration = (long)window.GetType().GetField("_adapterSelectionGeneration", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(window)!;
+
+            adapterBox.SelectedItem = adapterB;
+            adapterBox.SelectedItem = adapterA;
+            var latestSelectionGeneration = (long)window.GetType().GetField("_adapterSelectionGeneration", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(window)!;
+            if (latestSelectionGeneration <= firstSelectionGeneration)
+                throw new InvalidOperationException("adapter A→B→A selection did not advance the refresh generation");
+
+            var historyBefore = window.AdapterIpHistory.Count;
+            if (InvokePrivate<bool>(window, "CommitSelectedAdapterStatus", staleSelectionRequest, changedA)
+                || adapterA.IPv4Address != "192.0.2.17" || adapterA.MacAddress != "02-00-00-00-00-17"
+                || window.AdapterIpHistory.Count != historyBefore)
+                throw new InvalidOperationException("a delayed refresh from an earlier A selection changed the selected adapter or IP history");
+
+            var currentSelectionRequest = CreateAdapterStatusRefreshRequest(window, adapterA);
+            if (InvokePrivate<bool>(window, "CommitSelectedAdapterStatus", currentSelectionRequest, reusedIndex)
+                || adapterA.IPv4Address != "192.0.2.17")
+                throw new InvalidOperationException("a response from a different adapter reusing the same interface index was accepted");
+
+            var unchangedA = new NetworkAdapterInfo
+            {
+                Id = adapterA.Id, Name = adapterA.Name, InterfaceIndex = adapterA.InterfaceIndex,
+                Status = adapterA.Status, IPv4Address = adapterA.IPv4Address, SubnetMask = adapterA.SubnetMask,
+                Gateway = adapterA.Gateway, Dns = adapterA.Dns, MacAddress = adapterA.MacAddress,
+                LinkSpeedMbps = adapterA.LinkSpeedMbps
+            };
+            var noChangeRequest = CreateAdapterStatusRefreshRequest(window, adapterA);
+            var historyBeforeNoChange = window.AdapterIpHistory.Count;
+            var itemNotifications = 0;
+            var itemCollection = (System.Collections.Specialized.INotifyCollectionChanged)adapterBox.Items;
+            System.Collections.Specialized.NotifyCollectionChangedEventHandler itemChanged = (_, _) => itemNotifications++;
+            itemCollection.CollectionChanged += itemChanged;
+            bool noChangeAccepted;
+            try { noChangeAccepted = InvokePrivate<bool>(window, "CommitSelectedAdapterStatus", noChangeRequest, unchangedA); }
+            finally { itemCollection.CollectionChanged -= itemChanged; }
+            if (!noChangeAccepted || itemNotifications != 0
+                || window.AdapterIpHistory.Count != historyBeforeNoChange || adapterA.IPv4Address != "192.0.2.17")
+                throw new InvalidOperationException("an unchanged adapter snapshot should be accepted without adding IP history or changing displayed data");
+
+            var metadataRequest = CreateAdapterStatusRefreshRequest(window, adapterA);
+            if (!InvokePrivate<bool>(window, "CommitSelectedAdapterStatus", metadataRequest, changedMetadataA)
+                || adapterA.MacAddress != "02-00-00-00-00-88" || adapterA.LinkSpeedMbps != 1000
+                || ((TextBlock)window.FindName("TxtMac")!).Text != "02-00-00-00-00-88")
+                throw new InvalidOperationException("a valid selected-adapter refresh did not update displayed MAC and link speed fields");
+
+            if (networkChangeTimer.Interval != TimeSpan.FromMilliseconds(250)
+                || statusRefreshTimer.Interval != TimeSpan.FromSeconds(3))
+                throw new InvalidOperationException("adapter refresh debounce or three-second fallback interval changed unexpectedly");
+            for (var eventIndex = 0; eventIndex < 100; eventIndex++)
+                InvokePrivate(window, "QueueAdapterNetworkChangeRefresh");
+            // Pump only the queued Send-priority network-change dispatch. Do not drain the
+            // constructor's ApplicationIdle startup initialization before the window is shown.
+            var dispatchFrame = new DispatcherFrame();
+            window.Dispatcher.BeginInvoke(DispatcherPriority.Send, new Action(() => dispatchFrame.Continue = false));
+            Dispatcher.PushFrame(dispatchFrame);
+            if (!networkChangeTimer.IsEnabled || (int)dispatchPendingField.GetValue(window)! != 1)
+                throw new InvalidOperationException("a 100-event network-change burst did not start one debounced refresh window");
+            InvokePrivate(window, "QueueAdapterNetworkChangeRefresh");
+            InvokePrivate(window, "AdapterNetworkChangeDebounceTick");
+            var observedAfterTrailingEvent = (long)observedVersionField.GetValue(window)!;
+            if (!networkChangeTimer.IsEnabled || observedAfterTrailingEvent != (long)networkVersionField.GetValue(window)!)
+                throw new InvalidOperationException("a network-change event inside the debounce window did not restart the quiet-period timer");
+            InvokePrivate(window, "AdapterNetworkChangeDebounceTick");
+            if (networkChangeTimer.IsEnabled || (int)dispatchPendingField.GetValue(window)! != 0 || !(bool)dirtyField.GetValue(window)!)
+                throw new InvalidOperationException("the settled network-change burst did not schedule one latest status refresh");
+            networkChangeTimer.Stop();
+            if (originalNetworkTimerEnabled) networkChangeTimer.Start();
+
+            workflow = InvokePrivate<NetworkWorkflowLease?>(window, "TryBeginNetworkWorkflow", "T27 refresh UI boundary", false);
+            if (workflow == null) throw new InvalidOperationException("could not acquire the synthetic T27 UI workflow gate");
+            var workflowRequest = CreateAdapterStatusRefreshRequest(window, adapterA);
+            if (InvokePrivate<bool>(window, "CommitSelectedAdapterStatus", workflowRequest, changedA)
+                || adapterA.IPv4Address != "192.0.2.17")
+                throw new InvalidOperationException("a status refresh committed while a network workflow was active");
+            dirtyField.SetValue(window, false);
+            InvokePrivate(window, "EndNetworkWorkflow", workflow);
+            workflow = null;
+
+            var closingRequest = CreateAdapterStatusRefreshRequest(window, adapterA);
+            closingField.SetValue(window, true);
+            if (InvokePrivate<bool>(window, "CommitSelectedAdapterStatus", closingRequest, changedA)
+                || adapterA.IPv4Address != "192.0.2.17")
+                throw new InvalidOperationException("a status refresh committed while the window was closing");
+
+            Console.WriteLine("ADAPTER_REFRESH_UI_GUARDS burstEvents=101 debounced=1 quietPeriodMs=250 fallbackMs=3000 selectionA-B-A=discarded sameIndexNewId=discarded activeWorkflow=discarded closing=discarded noChangeHistory=unchanged");
+        }
+        finally
+        {
+            closingField.SetValue(window, originalClosing);
+            networkChangeTimer.Stop();
+            if (originalNetworkTimerEnabled) networkChangeTimer.Start();
+            networkVersionField.SetValue(window, originalNetworkVersion);
+            observedVersionField.SetValue(window, originalObservedVersion);
+            dispatchPendingField.SetValue(window, originalDispatchPending);
+            dirtyField.SetValue(window, false);
+            if (workflow != null) InvokePrivate(window, "EndNetworkWorkflow", workflow);
+            adapterBox.SelectedItem = null;
+            adapterBox.ItemsSource = null;
+            window.Adapters.Clear();
+            foreach (var adapter in adapters) window.Adapters.Add(adapter);
+            adapterBox.ItemsSource = originalSource;
+            if (originalSelection != null) adapterBox.SelectedItem = originalSelection;
+            refreshingField.SetValue(window, originalRefreshing);
+            dirtyField.SetValue(window, originalDirty);
+        }
+    }
+
+    private static async Task ValidateManualAdapterRefreshCompletenessAsync(MainWindow window, FileLogger logger)
+    {
+        var adapterService = new NetworkAdapterService(logger);
+        var routeService = new StaticRouteService(logger);
+        var beforeAdapters = adapterService.GetAdapters(logAdapters: false);
+        var beforeRoutes = await routeService.GetCurrentStaticRoutesAsync();
+
+        var refresh = (Task)InvokePrivate(window, "RefreshAdaptersAsync", true, CancellationToken.None)!;
+        await refresh.WaitAsync(TimeSpan.FromSeconds(20));
+
+        var afterAdapters = adapterService.GetAdapters(logAdapters: false);
+        var afterRoutes = await routeService.GetCurrentStaticRoutesAsync();
+        var beforeAdapterKeys = beforeAdapters.Select(AdapterIdentityKey).OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToArray();
+        var afterAdapterKeys = afterAdapters.Select(AdapterIdentityKey).OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToArray();
+        if (!beforeAdapterKeys.SequenceEqual(afterAdapterKeys, StringComparer.OrdinalIgnoreCase))
+            throw new InvalidOperationException("the host adapter set changed during the manual full-refresh acceptance; retrying the read-only comparison");
+
+        var uiAdapterKeys = window.Adapters.Select(AdapterIdentityKey).OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToArray();
+        if (!uiAdapterKeys.SequenceEqual(afterAdapterKeys, StringComparer.OrdinalIgnoreCase))
+            throw new InvalidOperationException("manual full refresh did not preserve every currently enumerable adapter ID/index");
+
+        var idByIndex = afterAdapters.ToDictionary(adapter => adapter.InterfaceIndex, adapter => adapter.Id, StringComparer.OrdinalIgnoreCase);
+        var beforeRouteKeys = beforeRoutes.Select(route => RouteDisplayKey(route, idByIndex)).OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToArray();
+        var afterRouteKeys = afterRoutes.Select(route => RouteDisplayKey(route, idByIndex)).OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToArray();
+        if (!beforeRouteKeys.SequenceEqual(afterRouteKeys, StringComparer.OrdinalIgnoreCase))
+            throw new InvalidOperationException("the host route set changed during the manual full-refresh acceptance; retrying the read-only comparison");
+
+        var uiRouteKeys = window.CurrentStaticRoutes.Select(route => string.Join("|", route.AddressFamily, route.AdapterId,
+            route.DestinationPrefix, route.NextHop, route.RouteMetric, route.InterfaceMetric))
+            .OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToArray();
+        if (!uiRouteKeys.SequenceEqual(afterRouteKeys, StringComparer.OrdinalIgnoreCase))
+            throw new InvalidOperationException("manual full refresh did not preserve the complete read-only IPv4/IPv6 route table");
+
+        Console.WriteLine($"ADAPTER_FULL_REFRESH_UI completeAdapters={uiAdapterKeys.Length} completeRoutes={uiRouteKeys.Length}");
+    }
+
+    private static string AdapterIdentityKey(NetworkAdapterInfo adapter) => $"{adapter.Id}|{adapter.InterfaceIndex}";
+
+    private static string RouteDisplayKey(CurrentStaticRoute route, IReadOnlyDictionary<string, string> adapterIdsByIndex)
+    {
+        var adapterId = adapterIdsByIndex.TryGetValue(route.InterfaceIndex, out var id) ? id : "";
+        var nextHop = route.NextHop.Equals("0.0.0.0", StringComparison.OrdinalIgnoreCase)
+            || route.NextHop.Equals("::", StringComparison.OrdinalIgnoreCase)
+            ? ""
+            : route.NextHop;
+        return string.Join("|", route.AddressFamily, adapterId, route.DestinationPrefix, nextHop,
+            route.RouteMetric, route.InterfaceMetric);
+    }
+
+    private static object CreateAdapterStatusRefreshRequest(MainWindow window, NetworkAdapterInfo adapter)
+    {
+        var requestType = typeof(MainWindow).GetNestedType("AdapterStatusRefreshRequest", BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("missing typed adapter status refresh request");
+        var constructor = requestType.GetConstructors(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+            .Single(candidate => candidate.GetParameters() is var parameters
+                && parameters.Length == 4
+                && parameters[0].ParameterType == typeof(string)
+                && parameters[1].ParameterType == typeof(string)
+                && parameters[2].ParameterType == typeof(long)
+                && parameters[3].ParameterType == typeof(long));
+        var selectionGeneration = (long)window.GetType().GetField("_adapterSelectionGeneration", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(window)!;
+        var workflowGeneration = (long)window.GetType().GetField("_adapterWorkflowGeneration", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(window)!;
+        return constructor.Invoke([adapter.Id, adapter.InterfaceIndex, selectionGeneration, workflowGeneration]);
+    }
+
     private static object? InvokePrivate(object target, string name, params object?[] arguments) =>
         target.GetType().GetMethod(name, BindingFlags.Instance | BindingFlags.NonPublic)?.Invoke(target, arguments);
 
     private static T InvokePrivate<T>(object target, string name, params object?[] arguments) =>
         (T)(InvokePrivate(target, name, arguments) ?? throw new InvalidOperationException("private UI test operation returned null: " + name));
+
+    private sealed class CancelableUpdateHandler(TaskCompletionSource requestStarted) : HttpMessageHandler
+    {
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            requestStarted.TrySetResult();
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            return new HttpResponseMessage(HttpStatusCode.OK);
+        }
+    }
 }

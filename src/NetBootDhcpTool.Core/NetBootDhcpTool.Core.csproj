@@ -4,4 +4,8 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
   </PropertyGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="NetBootDhcpTool.App" />
+    <InternalsVisibleTo Include="NetBootDhcpTool.UnitTests" />
+  </ItemGroup>
 </Project>
