@@ -61,6 +61,11 @@ try {
     [System.IO.File]::WriteAllBytes($archivePath, [System.Text.Encoding]::UTF8.GetBytes('release archive bytes'))
     $archiveHash = Get-ReleaseFileSha256 $archivePath
     [System.IO.File]::WriteAllText("$archivePath.sha256", "$archiveHash  $archiveName", [System.Text.Encoding]::ASCII)
+    $fullName = 'NetBootDhcpTool-full-v1.2.3.zip'
+    $fullPath = Join-Path $bundleDirectory $fullName
+    [System.IO.File]::WriteAllBytes($fullPath, [System.Text.Encoding]::UTF8.GetBytes('full package bytes'))
+    $fullHash = Get-ReleaseFileSha256 $fullPath
+    [System.IO.File]::WriteAllText("$fullPath.sha256", "$fullHash  $fullName", [System.Text.Encoding]::ASCII)
     $baseManifest = [ordered]@{
         version = '1.2.3'
         releasedAt = '2026-09-26T00:00:00Z'
@@ -71,6 +76,14 @@ try {
         minimumSupportedVersion = '1.0.6'
         releaseNotes = 'Test notes'
         changes = @('Test change')
+        packages = @(@{
+            kind = 'Full'
+            fileName = $fullName
+            sha256 = $fullHash
+            size = [long](Get-Item -LiteralPath $fullPath).Length
+            downloadUrl = "https://github.com/shashouaq/NetBootDhcpTool/releases/download/$tag/$fullName"
+            downloadMirrors = @()
+        })
     }
     $baseManifestPath = Join-Path $bundleDirectory 'latest.json'
     [System.IO.File]::WriteAllText($baseManifestPath, (ConvertTo-Json -InputObject $baseManifest -Depth 6), [System.Text.UTF8Encoding]::new($false))
@@ -96,11 +109,14 @@ try {
     Assert-Throws { Read-ReleaseState -Path $statePath -Tag $tag -SourceCommit ('f' * 40) -ArchiveSha256 $archiveHash } 'A release cache from another source commit must fail closed.'
 
     $dualManifestPath = Join-Path $bundleDirectory 'final-latest.json'
-    $dualManifest = New-DualSourceManifest -BaseManifestPath $baseManifestPath -Tag $tag -GitHubRepository 'shashouaq/NetBootDhcpTool' -GiteeReleasePageUrl "https://gitee.com/joel20230302/NetBootDhcpTool/releases/tag/$tag" -GiteeArchiveDownloadUrl 'https://gitee.com/download/archive' -OutputPath $dualManifestPath
+    $giteePackageUrl = 'https://gitee.com/joel20230302/NetBootDhcpTool/attach_files/12345/download'
+    $dualManifest = New-DualSourceManifest -BaseManifestPath $baseManifestPath -Tag $tag -GitHubRepository 'shashouaq/NetBootDhcpTool' -GiteeReleasePageUrl "https://gitee.com/joel20230302/NetBootDhcpTool/releases/tag/$tag" -GiteeArchiveDownloadUrl 'https://gitee.com/download/archive' -GiteeAssetUrls @{ $fullName=$giteePackageUrl } -OutputPath $dualManifestPath
     Assert-Equal 'https://gitee.com/download/archive' $dualManifest.downloadUrl 'Gitee must be the manifest primary source'
     Assert-Equal @("https://github.com/shashouaq/NetBootDhcpTool/releases/download/$tag/$archiveName") @($dualManifest.downloadMirrors) 'GitHub mirror URL was not preserved'
     Assert-Equal $archiveHash $dualManifest.archiveSha256 'Dual-source manifest changed the archive checksum'
     Assert-Equal "https://gitee.com/joel20230302/NetBootDhcpTool/releases/tag/$tag" $dualManifest.releasePageUrl 'Gitee release page link was not set'
+    Assert-Equal $giteePackageUrl $dualManifest.packages[0].downloadUrl 'Full package Gitee attachment URL was not included in the signed manifest'
+    Assert-Equal @("https://github.com/shashouaq/NetBootDhcpTool/releases/download/$tag/$fullName") @($dualManifest.packages[0].downloadMirrors) 'Full package GitHub mirror was not included in the signed manifest'
 
     $tamperedArchive = [System.IO.File]::ReadAllBytes($archivePath)
     [System.IO.File]::WriteAllBytes($archivePath, [System.Text.Encoding]::UTF8.GetBytes('different archive bytes'))
@@ -206,9 +222,14 @@ try {
         throw 'The Gitee access token must be streamed to curl and never saved in persistent release state.'
     }
     $cacheGuard = $publisher.IndexOf('Assert-ReleaseCachePolicy', [System.StringComparison]::Ordinal)
-    $packageBuild = $publisher.IndexOf('[Package] Building the single release archive', [System.StringComparison]::Ordinal)
+    $packageBuild = $publisher.IndexOf('[Package] Building Full/OTA and portable archive', [System.StringComparison]::Ordinal)
     if ($cacheGuard -lt 0 -or $packageBuild -lt $cacheGuard) {
         throw 'An existing remote Release without its persistent cache must fail before any rebuild.'
+    }
+    foreach ($requiredSignedUpdateStep in @('PackageAssets', 'latest.json.sig', 'Get-OrCreateFinalSignedManifest', 'RSASignaturePadding]::Pss', 'install-manifest.json')) {
+        if (-not $publisher.Contains($requiredSignedUpdateStep) -and -not (Get-Content -Raw -LiteralPath (Join-Path $repoRoot 'build\release-pipeline\ReleaseState.psm1')).Contains($requiredSignedUpdateStep)) {
+            throw "The formal release pipeline is missing signed update package step '$requiredSignedUpdateStep'."
+        }
     }
     if (Test-Path -LiteralPath (Join-Path $repoRoot '.github\workflows\gitee-release-sync.yml')) { throw 'The old GitHub-hosted large-file sync workflow must be removed.' }
     if (Test-Path -LiteralPath (Join-Path $repoRoot 'build\sync-gitee-release.ps1')) { throw 'The old GitHub-download-to-Gitee publisher must be removed.' }

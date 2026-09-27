@@ -146,6 +146,8 @@
   "help.scan.filter": "Filter scan results by IP, MAC, hostname, status, or remark.",
   "help.cancel.operation": "Cancel a cancellable scan, route, or adapter operation; completed system changes follow the rollback policy.",
   "help.cancel.update.download": "Cancel the current update download. Its temporary file is removed, and you can download again later.",
+  "help.restart.update": "Start the independent updater after the package is verified. The app closes normally, then the updater replaces program files, verifies them, and starts the new version.",
+  "update.restart.upgrade": "Restart to upgrade",
   "help.profile.save.current": "Save current DHCP, manual scan, and route drafts as a local profile without applying them.",
   "help.profile.load": "Load the selected profile into forms and route drafts without applying network changes.",
   "help.profile.compare": "Compare the selected profile with the current forms and show DHCP, scan, and route-draft differences without changing anything.",

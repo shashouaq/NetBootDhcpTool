@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+## v1.0.19 / 2026-09-28
+
+- Date: 2026-09-28
+- Type: Portable packaging and signed Full/OTA automatic upgrade / T29
+- Affected files/modules: `build/publish.ps1`, `build/publish-release.ps1`, `build/release-pipeline/ReleaseState.psm1`, `ClientManifestCheck.cs`, `NetBootDhcpTool.Updater`, `src/NetBootDhcpTool.Core/UpdatePackages.cs`, `VersionUpdateService.cs`, `UpdateController.cs`, `src/NetBootDhcpTool.App/UpdateActivationService.cs`, `App.xaml.cs`, `MainWindow.xaml`, `MainWindow.xaml.cs`, unit/release/UI smoke tests, bilingual resources, `README.md`, `docs/MAINTENANCE_GUIDE.md`, `docs/RELEASE_PROCESS.md`, `docs/tasks/T29.md`, `docs/TODO.md`
+- Concrete change: Put the portable application in a fixed unversioned `NetBootDhcpTool/` archive root; generate a signed-manifest-ready Full ZIP and a smaller exact-baseline file-level OTA when available. Added installation inventories, signed package URL/hash metadata, OTA baseline verification with Full fallback when installed files drift, and a separately launched updater that waits for normal exit, transactionally replaces only managed files, verifies the target inventory, launches the new app and supports rollback. Added a toolbar restart-upgrade action and preserved legacy unsigned `.7z` download behavior as manual-only.
+- User impact: After downloading a signed update, users can select **Restart to upgrade**; their `%LOCALAPPDATA%` data remains separate from files replaced by the updater. Older clients and unsigned manifests retain manual archive downloads.
+- 变更内容：便携归档现在包含固定名称 `NetBootDhcpTool/` 目录；新增 Full 包和较小时才发布的精确基线 OTA 包。加入安装清单、签名包元数据校验、OTA 漂移时回退 Full，以及等待主程序正常退出、事务替换受管文件、校验新版并支持回滚的独立更新器。工具栏新增“重启升级”，旧版无签名更新仍保留手动 `.7z` 下载。
+- 用户影响：下载并校验签名更新包后，用户可点击“重启升级”；`%LOCALAPPDATA%` 用户数据与应用目录文件替换隔离，不受更新器影响。旧客户端仍可手动下载便携包。
+- Verification: v1.0.19 candidate; formal release evidence will be recorded after exact-commit CI and dual-mirror publication/readback. Prior local T29 package checks and the v1.0.18 baseline remain documented in [T29](tasks/T29.md). No remote v1.0.19 asset is claimed before the release workflow completes.
+
+### zh-CN / 简体中文
+
+- 解压后得到不带版本号的 `NetBootDhcpTool` 文件夹，可直接移动到目标目录。
+- 支持签名 Full/OTA 自动更新；若 OTA 检测到本地受管文件漂移，会转为 Full 修复包。
+- 更新下载和校验后点击“重启升级”，程序正常关闭后由独立进程更新、验证并启动新版；失败可回滚。
+- 用户数据保存在 `%LOCALAPPDATA%\NetBootDhcpTool`，安装目录中的非受管文件会保留。
+
+### en-US / English
+
+- The portable archive extracts to an unversioned `NetBootDhcpTool` folder that can be moved directly to its destination.
+- Signed Full and OTA updates are supported. If OTA detects local drift in managed files, the client switches to a Full repair package.
+- After download and verification, select **Restart to upgrade**. A separate process waits for normal shutdown, applies and verifies the update, and starts the new version; it can roll back on failure.
+- User data remains under `%LOCALAPPDATA%\NetBootDhcpTool`, and unmanaged installation files are preserved.
+
 - Date: 2026-09-27
 - Type: Release reliability / T19 follow-up
 - Affected files/modules: `.github/workflows/formal-release.yml`, `.github/workflows/windows-ci.yml`, `.gitignore`, `build/publish-release.ps1`, `build/release-pipeline/ReleaseState.psm1`, `ReleaseTransport.psm1`, `ClientManifestCheck.csproj`, `ClientManifestCheck.cs`, `build/tests/release-pipeline.tests.ps1`, `build/tests/release-resilience.tests.ps1`, `docs/RELEASE_PROCESS.md`, `docs/tasks/T19.md`, `docs/TODO.md`

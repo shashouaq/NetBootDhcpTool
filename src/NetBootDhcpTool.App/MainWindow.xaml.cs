@@ -199,7 +199,8 @@ public partial class MainWindow : Window
             (identity, ex) => _logger.Error($"DHCP lease probe failed: session={identity.SessionId} client={identity.ClientKey} ip={identity.IpAddress}", ex));
         _dhcpDetector = new ExistingDhcpDetector(_logger);
         _dhcpServer = new DhcpServer(_logger);
-        _updateController = updateController ?? new UpdateController(new VersionUpdateService(), CurrentVersion);
+        var installContext = UpdateInstallContext.TryLoad(_paths.BaseDirectory, CurrentVersion);
+        _updateController = updateController ?? new UpdateController(new VersionUpdateService(), CurrentVersion, installContext);
         _updateState = _updateController.State;
         _updateController.StateChanged += UpdateController_StateChanged;
         _dhcpServer.LeaseChanged += lease =>
@@ -477,6 +478,7 @@ public partial class MainWindow : Window
         BtnDeleteProfile.Content = _lang.T("profile.delete");
         BtnCancelOperation.Content = _lang.T("cancel");
         BtnCancelUpdateDownload.Content = _lang.T("cancel");
+        BtnRestartUpgrade.Content = _lang.T("update.restart.upgrade");
         AllowGateway.Content = _lang.T("allow.gateway");
         DetectExistingDhcp.Content = _lang.T("detect.existing.dhcp");
         AllowRestartAnyAdapter.Content = _lang.T("allow.restart.any");
@@ -567,6 +569,7 @@ public partial class MainWindow : Window
             TxtUpdateStatus.Text = "";
             TxtUpdateLink.Visibility = Visibility.Collapsed;
             UpdateLink.IsEnabled = false;
+            BtnRestartUpgrade.Visibility = Visibility.Collapsed;
             return;
         }
 
@@ -579,6 +582,7 @@ public partial class MainWindow : Window
             TxtUpdateStatus.ToolTip = FormatUpdateSpeedDetails(_updateState.SourceSpeeds);
             TxtUpdateLink.Visibility = Visibility.Collapsed;
             UpdateLink.IsEnabled = false;
+            BtnRestartUpgrade.Visibility = Visibility.Collapsed;
             return;
         }
 
@@ -598,6 +602,7 @@ public partial class MainWindow : Window
 
         TxtUpdateLink.Visibility = Visibility.Collapsed;
         UpdateLink.IsEnabled = false;
+        BtnRestartUpgrade.Visibility = Visibility.Collapsed;
         TxtUpdateStatus.Text = result.Succeeded ? _lang.T("latest.version") : _lang.T("update.failed");
         TxtUpdateStatus.ToolTip = result.Succeeded ? null : result.Error;
     }
@@ -5453,16 +5458,19 @@ public partial class MainWindow : Window
     private void UpdateLink_Click(object sender, RoutedEventArgs e)
     {
         if (_updateState.CheckResult is not { Succeeded: true, IsNewVersion: true } result || string.IsNullOrWhiteSpace(result.DownloadUrl)) return;
-        var changes = result.Changes.Count > 0
-            ? string.Join(Environment.NewLine, result.Changes.Select(x => "• " + x))
-            : result.ReleaseNotes;
+        var localizedReleaseNotes = ReleaseNotesLocalizer.SelectLocalizedSection(result.ReleaseNotes, _lang.CurrentLanguage);
+        var changes = !string.IsNullOrWhiteSpace(localizedReleaseNotes)
+            ? localizedReleaseNotes
+            : result.Changes.Count > 0
+                ? string.Join(Environment.NewLine, result.Changes.Select(x => "• " + x))
+                : result.ReleaseNotes;
         if (string.IsNullOrWhiteSpace(changes)) changes = IsChineseUi() ? "发布方未提供详细更新内容。" : "The publisher did not provide detailed release notes.";
         var sourceDetails = FormatUpdateSpeedDetails(result.DownloadSpeeds, result.DownloadUrl);
         if (string.IsNullOrWhiteSpace(sourceDetails))
             sourceDetails = IsChineseUi() ? $"当前首选下载源：{GetUpdateSourceName(result.DownloadUrl)}" : $"Preferred download source: {GetUpdateSourceName(result.DownloadUrl)}";
         var message = IsChineseUi()
-            ? $"版本 v{result.LatestVersion}\n\n更新内容：\n{changes}\n\n下载源测速：\n{sourceDetails}\n\n确认后将在后台下载更新包，不会自动安装。下载文件会保存到“下载”文件夹；下载过程中可随时点击“取消”停止。"
-            : $"Version v{result.LatestVersion}\n\nChanges:\n{changes}\n\nDownload source speed:\n{sourceDetails}\n\nAfter confirmation the package will download in the background and will not be installed automatically. It will be saved to your Downloads folder; click Cancel at any time to stop the download.";
+            ? $"版本 v{result.LatestVersion}\n\n更新内容：\n{changes}\n\n下载源测速：\n{sourceDetails}\n\n确认后将在后台下载并校验更新包。{(result.SelectedPackage is null ? "该版本不支持自动升级，下载文件将保存到‘下载’文件夹。" : "下载完成后可点击‘重启升级’，程序会正常关闭、替换文件并启动新版本。")}下载过程中可随时点击‘取消’停止。"
+            : $"Version v{result.LatestVersion}\n\nChanges:\n{changes}\n\nDownload source speed:\n{sourceDetails}\n\nAfter confirmation the package will download and be verified in the background. {(result.SelectedPackage is null ? "Automatic upgrade is unavailable for this release; the file will be saved to Downloads." : "When ready, click Restart to upgrade. The app will close normally, replace its files, and start the new version.")} You can click Cancel at any time to stop the download.";
         if (!AppDialog.Show(this, IsChineseUi() ? "发现新版本" : "New Version", message, confirm: true)) return;
         if (_updateState.DownloadInProgress)
         {
@@ -5480,14 +5488,19 @@ public partial class MainWindow : Window
 
     private async Task DownloadUpdateAsync(UpdateCheckResult result)
     {
-        var fileName = string.IsNullOrWhiteSpace(result.ArchiveName) ? $"NetBootDhcpTool-v{result.LatestVersion}.7z" : Path.GetFileName(result.ArchiveName);
+        var fileName = result.SelectedPackage?.FileName;
+        var automaticInstall = result.SelectedPackage is not null;
+        if (string.IsNullOrWhiteSpace(fileName)) fileName = string.IsNullOrWhiteSpace(result.ArchiveName) ? $"NetBootDhcpTool-v{result.LatestVersion}.7z" : Path.GetFileName(result.ArchiveName);
         if (string.IsNullOrWhiteSpace(fileName)) fileName = $"NetBootDhcpTool-v{result.LatestVersion}.7z";
-        var downloads = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
-        var destination = Path.Combine(downloads, fileName);
-        if (File.Exists(destination)) destination = Path.Combine(downloads, Path.GetFileNameWithoutExtension(fileName) + $"-{DateTime.Now:yyyyMMdd-HHmmss}" + Path.GetExtension(fileName));
+        var destinationDirectory = automaticInstall
+            ? Path.Combine(_paths.DataDirectory, "updates", "staging")
+            : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
+        Directory.CreateDirectory(destinationDirectory);
+        var destination = Path.Combine(destinationDirectory, fileName);
+        if (!automaticInstall && File.Exists(destination)) destination = Path.Combine(destinationDirectory, Path.GetFileNameWithoutExtension(fileName) + $"-{DateTime.Now:yyyyMMdd-HHmmss}" + Path.GetExtension(fileName));
         try
         {
-            _logger.Info($"Update background download started: version={result.LatestVersion} destination={destination}");
+            _logger.Info($"Update background download started: version={result.LatestVersion} kind={result.SelectedPackage?.Kind ?? "legacy-manual"} destination={destination}");
             var downloaded = await _updateController.DownloadAsync(result, destination);
             _logger.Info($"Update background download completed: version={result.LatestVersion} path={downloaded.FilePath} sha256={downloaded.Sha256}");
         }
@@ -5552,14 +5565,27 @@ public partial class MainWindow : Window
         UpdateVersionPresentation();
         BtnCancelUpdateDownload.Visibility = state.DownloadInProgress ? Visibility.Visible : Visibility.Collapsed;
         BtnCancelUpdateDownload.IsEnabled = state.DownloadInProgress && !state.DownloadCancellationRequested;
+        var readyToInstall = state.DownloadedResult is { ReadyToInstall: true };
+        BtnRestartUpgrade.Visibility = readyToInstall ? Visibility.Visible : Visibility.Collapsed;
+        if (readyToInstall)
+        {
+            TxtUpdateLink.Visibility = Visibility.Collapsed;
+            UpdateLink.IsEnabled = false;
+        }
         if (state.DownloadCancellationRequested)
             TxtUpdateStatus.Text = IsChineseUi() ? "正在取消更新下载..." : "Canceling update download...";
+        else if (state.PackageVerificationInProgress)
+            TxtUpdateStatus.Text = IsChineseUi() ? "下载完成，正在校验签名、安装基线和更新包内容..." : "Download complete; verifying the signature, installation baseline, and package contents...";
         else if (state.DownloadProgress is { } progress) UpdateDownloadProgressPresentation(progress);
         else if (state.DownloadedResult is { } downloaded)
         {
-            TxtUpdateStatus.Text = IsChineseUi()
-                ? $"更新包已从 {GetUpdateSourceName(downloaded.DownloadUrl)} 下载（未安装）：{downloaded.FilePath}"
-                : $"Update downloaded from {GetUpdateSourceName(downloaded.DownloadUrl)} (not installed): {downloaded.FilePath}";
+            TxtUpdateStatus.Text = downloaded.ReadyToInstall
+                ? IsChineseUi()
+                    ? $"{(downloaded.FellBackToFullPackage ? "本机文件与 OTA 基线不一致，已改用 Full 包。" : "") }更新包已校验（{downloaded.Package?.Kind}）：点击‘重启升级’应用 v{_updateState.CheckResult?.LatestVersion}"
+                    : $"{(downloaded.FellBackToFullPackage ? "The installed files did not match the OTA baseline; switched to the Full package. " : "")}Update package verified ({downloaded.Package?.Kind}); click Restart to upgrade to v{_updateState.CheckResult?.LatestVersion}"
+                : IsChineseUi()
+                    ? $"更新包已从 {GetUpdateSourceName(downloaded.DownloadUrl)} 下载（未安装）：{downloaded.FilePath}"
+                    : $"Update downloaded from {GetUpdateSourceName(downloaded.DownloadUrl)} (not installed): {downloaded.FilePath}";
             TxtUpdateStatus.ToolTip = FormatUpdateSpeedDetails(state.CheckResult?.DownloadSpeeds ?? [], downloaded.DownloadUrl);
         }
         else if (state.DownloadCanceled) TxtUpdateStatus.Text = _lang.T("update.download.canceled");
@@ -5582,6 +5608,38 @@ public partial class MainWindow : Window
 
     internal Task<UpdateDownloadResult> StartUpdateDownloadForUiTest(UpdateCheckResult result, string destinationPath) =>
         _updateController.DownloadAsync(result, destinationPath);
+
+    private async void RestartUpgrade_Click(object sender, RoutedEventArgs e)
+    {
+        if (_updateState.DownloadedResult is not { ReadyToInstall: true } downloaded
+            || _updateController.InstallContext is not { } install) return;
+        if (_settingsDirty && !_unsavedSettingsExitConfirmed && !AppDialog.Show(this,
+            IsChineseUi() ? "未保存设置" : "Unsaved Settings",
+            IsChineseUi() ? "设置页有未保存更改。继续升级会退出程序并丢弃这些更改，是否继续？" : "The Settings page has unsaved changes. Continuing the upgrade will close the app and discard them. Continue?",
+            confirm: true)) return;
+        if (_settingsDirty) _unsavedSettingsExitConfirmed = true;
+        var confirmation = IsChineseUi()
+            ? $"将升级到 v{_updateState.CheckResult?.LatestVersion}。程序会先正常关闭并完成恢复/保存流程，再替换受管程序文件、核验并启动新版本。个人数据目录不会被替换。现在重启升级吗？"
+            : $"Upgrade to v{_updateState.CheckResult?.LatestVersion}. The app will close normally and finish its cleanup, then replace managed program files, verify them, and start the new version. Your user data directory will not be replaced. Restart to upgrade now?";
+        if (!AppDialog.Show(this, IsChineseUi() ? "重启升级" : "Restart to Upgrade", confirmation, confirm: true)) return;
+        BtnRestartUpgrade.IsEnabled = false;
+        TxtUpdateStatus.Text = IsChineseUi() ? "正在准备并验证更新器..." : "Preparing and validating the updater...";
+        try
+        {
+            var activation = new UpdateActivationService();
+            await activation.ActivateAsync(_paths, install, downloaded);
+            _logger.Info($"Update transaction accepted by updater: target={downloaded.SignedUpdateManifestVersion()}");
+            TxtUpdateStatus.Text = IsChineseUi() ? "更新器已受理，正在正常关闭程序..." : "Updater accepted the transaction; closing normally...";
+            Close();
+        }
+        catch (Exception ex)
+        {
+            BtnRestartUpgrade.IsEnabled = true;
+            _logger.Error("Update activation failed before the application closed", ex);
+            TxtUpdateStatus.Text = IsChineseUi() ? "更新器未受理，程序仍在运行；可重试升级。" : "Updater did not accept the transaction; the app is still running and you can retry.";
+            AppDialog.Show(this, IsChineseUi() ? "升级未启动" : "Upgrade Not Started", ex.Message, danger: true);
+        }
+    }
 
     private static string GetUpdateSourceName(string? url) => new UpdateSourceSpeed(url ?? "", null).SourceName;
 

@@ -79,10 +79,12 @@ $statePath = Join-Path $tempRoot 'release-state.json'
 $archive = Join-Path $tempRoot $expectedArchiveName
 [IO.File]::WriteAllText($archive, 'original bytes')
 $hash = Get-ReleaseFileSha256 $archive
-$bundle = @{ ArchivePath=$archive; ChecksumPath="$archive.sha256"; ArchiveName=$expectedArchiveName; ArchiveSha256=$hash }
+$bundle = @{ ArchivePath=$archive; ChecksumPath="$archive.sha256"; ArchiveName=$expectedArchiveName; ArchiveSha256=$hash; AssetFiles=@($archive, "$archive.sha256") }
 [IO.File]::WriteAllText($bundle.ChecksumPath, "$hash  $expectedArchiveName")
 $finalManifestPath = Join-Path $tempRoot 'latest.json'
 [IO.File]::WriteAllText($finalManifestPath, '{"version":"1.2.3"}')
+$finalSignaturePath = Join-Path $tempRoot 'latest.json.sig'
+[IO.File]::WriteAllText($finalSignaturePath, 'test-signature')
 $script:verifiedAssets = @{}
 $script:releaseWarnings = [System.Collections.Generic.List[string]]::new()
 $savedToken = $env:GITEE_TOKEN
@@ -230,12 +232,12 @@ try {
     }
     & {
         . $publisherFunctions
-        foreach ($name in @($expectedArchiveName,"$expectedArchiveName.sha256",'latest.json')) {
+        foreach ($name in @($expectedArchiveName,"$expectedArchiveName.sha256",'latest.json','latest.json.sig')) {
             Save-GiteeAttachmentCheckpoint -State $script:releaseState -Name $name -AttachmentId '456' -DownloadUrl "https://gitee.com/download/$name" -Status verified
         }
         function Invoke-ReleaseDownload {
             param($Uri,$Destination,$AssetName)
-            $source = if ($AssetName.StartsWith('latest.json')) { $finalManifestPath } elseif ($AssetName.EndsWith('.sha256')) { $bundle.ChecksumPath } else { $archive }
+            $source = if ($AssetName -like 'latest.json.sig*') { $finalSignaturePath } elseif ($AssetName.StartsWith('latest.json')) { $finalManifestPath } elseif ($AssetName.EndsWith('.sha256')) { $bundle.ChecksumPath } else { $archive }
             Copy-Item -LiteralPath $source -Destination $Destination
         }
         function Invoke-ReleaseHttp { return @{StatusCode=200;Content='{"id":123,"tag_name":"v1.2.3","prerelease":false}'} }
@@ -248,7 +250,7 @@ try {
         Assert-Equal ($warningsBefore+1) $script:releaseWarnings.Count 'Unverified public bundle must not be downgraded to warning'
         function Invoke-ReleaseDownload {
             param($Uri,$Destination,$AssetName)
-            $source = if ($AssetName.StartsWith('latest.json')) { $finalManifestPath } elseif ($AssetName.EndsWith('.sha256')) { $bundle.ChecksumPath } else { $archive }
+            $source = if ($AssetName -like 'latest.json.sig*') { $finalSignaturePath } elseif ($AssetName.StartsWith('latest.json')) { $finalManifestPath } elseif ($AssetName.EndsWith('.sha256')) { $bundle.ChecksumPath } else { $archive }
             Copy-Item -LiteralPath $source -Destination $Destination
         }
         function Invoke-ReleaseHttp { return @{StatusCode=200;Content='{"id":123,"tag_name":"v1.2.2","prerelease":false}'} }
@@ -263,8 +265,15 @@ try {
         . $publisherFunctions
         Assert-Fails { Assert-ArchiveContents $archive } 'integrity test failed'
         $incomplete = Join-Path $tempRoot 'incomplete.7z'
-        & 'C:\Program Files\7-Zip\7z.exe' a $incomplete $finalManifestPath | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw 'Archive fixture failed' }
+        $incompleteRoot = Join-Path $tempRoot 'incomplete-payload'
+        $incompleteProduct = Join-Path $incompleteRoot 'NetBootDhcpTool'
+        New-Item -ItemType Directory -Path $incompleteProduct -Force | Out-Null
+        Copy-Item -LiteralPath $finalManifestPath -Destination (Join-Path $incompleteProduct 'latest.json')
+        Push-Location $incompleteRoot
+        try {
+            & 'C:\Program Files\7-Zip\7z.exe' a $incomplete 'NetBootDhcpTool' | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Archive fixture failed' }
+        } finally { Pop-Location }
         Assert-Fails { Assert-ArchiveContents $incomplete } 'archive is incomplete'
     }
     Write-Output 'RELEASE_RESILIENCE_TESTS_OK'

@@ -74,6 +74,34 @@ if ($GiteeOwner -notmatch '^[A-Za-z0-9_.-]+$' -or $GiteeRepository -notmatch '^[
 if ([string]::IsNullOrWhiteSpace($env:GH_TOKEN)) { throw 'GH_TOKEN is not available to the release job.' }
 if ([string]::IsNullOrWhiteSpace($env:GITEE_TOKEN)) { throw 'GITEE_TOKEN is not available to the release job.' }
 if ($env:GITEE_TOKEN -match '[\r\n]') { throw 'GITEE_TOKEN contains a line break and cannot be passed safely.' }
+$signingKeyPath = if ([string]::IsNullOrWhiteSpace($env:NETBOOT_UPDATE_SIGNING_KEY)) {
+    Join-Path $env:LOCALAPPDATA 'NetBootDhcpTool\release-signing\update-signing-private.pem'
+} else { [System.IO.Path]::GetFullPath($env:NETBOOT_UPDATE_SIGNING_KEY) }
+if (-not (Test-Path -LiteralPath $signingKeyPath -PathType Leaf)) {
+    throw "Update signing key is missing at the protected release-runner path: $signingKeyPath. No remote release assets have been changed."
+}
+$script:updateSigningRsa = [System.Security.Cryptography.RSA]::Create()
+try {
+    $signingPem = [System.IO.File]::ReadAllText($signingKeyPath)
+    $script:updateSigningRsa.ImportFromPem($signingPem)
+    if ($script:updateSigningRsa.KeySize -lt 3072) { throw 'Update signing key must be RSA 3072-bit or stronger.' }
+    $coreSource = Get-Content -LiteralPath (Join-Path $repoRoot 'src\NetBootDhcpTool.Core\UpdatePackages.cs') -Raw
+    $publicMatch = [regex]::Match($coreSource, '(?ms)public const string TrustedPublicKeyPem = """\r?\n(?<pem>.*?)\r?\n""";')
+    if (-not $publicMatch.Success) { throw 'Could not read the trusted public key from the client source.' }
+    $trustedRsa = [System.Security.Cryptography.RSA]::Create()
+    try {
+        $trustedRsa.ImportFromPem($publicMatch.Groups['pem'].Value)
+        $privatePublic = $script:updateSigningRsa.ExportParameters($false)
+        $trustedPublic = $trustedRsa.ExportParameters($false)
+        if ([Convert]::ToBase64String($privatePublic.Modulus) -cne [Convert]::ToBase64String($trustedPublic.Modulus) -or
+            [Convert]::ToBase64String($privatePublic.Exponent) -cne [Convert]::ToBase64String($trustedPublic.Exponent)) {
+            throw 'Update signing key does not match the public key compiled into the client.'
+        }
+    } finally { $trustedRsa.Dispose() }
+} catch {
+    $script:updateSigningRsa.Dispose()
+    throw "Update signing key validation failed. No remote release assets have been changed. $($_.Exception.Message)"
+}
 
 $fullRepoRoot = [System.IO.Path]::GetFullPath($repoRoot).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
 $fullStateRoot = [System.IO.Path]::GetFullPath($StateRoot).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
@@ -715,26 +743,56 @@ function Get-GiteeReleasePageUrl {
 }
 
 function Get-GiteeArchiveDownloadUrl {
-    $record = $script:releaseState.giteeAssets[$expectedArchiveName]
-    if ($null -eq $record -or [long]$record.attachmentId -le 0) { throw 'Gitee archive identity was not recorded after verification.' }
-    # Shipped clients accept /attach_files/ URLs. Gitee now returns a different
-    # browser_download_url; derive this legacy alias from the verified identity,
-    # then prove it serves the same complete bytes before publishing it.
+    return (Get-GiteeAssetDownloadUrl -Name $expectedArchiveName -LocalPath $bundle.ArchivePath -Sha256 $bundle.ArchiveSha256)
+}
+
+function Get-GiteeAssetDownloadUrl([string]$Name, [string]$LocalPath, [string]$Sha256) {
+    $record = $script:releaseState.giteeAssets[$Name]
+    if ($null -eq $record -or [long]$record.attachmentId -le 0) { throw "Gitee asset identity was not recorded after verification: $Name." }
     $uri = "https://gitee.com/$GiteeOwner/$GiteeRepository/attach_files/$($record.attachmentId)/download"
     $temporary = Join-Path $stateDirectory ('gitee-client-url-' + [guid]::NewGuid().ToString('N'))
     try {
-        Invoke-ReleaseDownload -Uri $uri -Destination $temporary -AssetName $expectedArchiveName
-        Test-DownloadedAsset -RemotePath $temporary -LocalPath $bundle.ArchivePath -AssetName $expectedArchiveName -ArchiveSha256 $bundle.ArchiveSha256
+        Invoke-ReleaseDownload -Uri $uri -Destination $temporary -AssetName $Name
+        Test-DownloadedAsset -RemotePath $temporary -LocalPath $LocalPath -AssetName $Name -ArchiveSha256 $bundle.ArchiveSha256
+        if ((Get-ReleaseFileSha256 $temporary) -cne $Sha256) { throw "Gitee client URL returned different bytes for $Name." }
     } finally { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
     return $uri
 }
 
 function Test-ClientManifest([switch]$Live) {
     $dotnet = & (Join-Path $PSScriptRoot 'resolve-dotnet.ps1')
-    $arguments = @('run', '--project', (Join-Path $PSScriptRoot 'release-pipeline/ClientManifestCheck.csproj'), '-c', 'Release', '--', $finalManifestPath, $version)
+    $arguments = @('run', '--project', (Join-Path $PSScriptRoot 'release-pipeline/ClientManifestCheck.csproj'), '-c', 'Release', '--', $finalManifestPath, $finalSignaturePath, $version)
     if ($Live) { $arguments += '--live' }
     & $dotnet @arguments
     if ($LASTEXITCODE -ne 0) { throw 'The actual published-tag client rejected the manifest or live update source.' }
+}
+
+function Get-OrCreateFinalSignedManifest([System.Collections.IDictionary]$GiteeAssetUrls) {
+    $candidatePath = Join-Path $finalManifestDirectory ('candidate-' + [guid]::NewGuid().ToString('N') + '.json')
+    try {
+        $null = New-DualSourceManifest -BaseManifestPath $bundle.ManifestPath -Tag $Tag -GitHubRepository $GitHubRepository `
+            -GiteeReleasePageUrl $giteeReleasePageUrl -GiteeArchiveDownloadUrl $giteeArchiveUrl `
+            -GiteeAssetUrls $GiteeAssetUrls -OutputPath $candidatePath
+        $manifestExists = Test-Path -LiteralPath $finalManifestPath -PathType Leaf
+        $signatureExists = Test-Path -LiteralPath $finalSignaturePath -PathType Leaf
+        if ($manifestExists -xor $signatureExists) { throw 'Cached final manifest/signature pair is incomplete; refusing to generate replacement bytes.' }
+        if ($manifestExists) {
+            if ((Get-ReleaseFileSha256 $candidatePath) -cne (Get-ReleaseFileSha256 $finalManifestPath)) {
+                throw 'Cached final manifest does not match the verified release assets; refusing to replace immutable signed bytes.'
+            }
+            $cachedBytes = [System.IO.File]::ReadAllBytes($finalManifestPath)
+            $cachedSignature = [System.IO.File]::ReadAllText($finalSignaturePath).Trim()
+            $signatureBytes = [Convert]::FromBase64String($cachedSignature)
+            if (-not $script:updateSigningRsa.VerifyData($cachedBytes, $signatureBytes, [System.Security.Cryptography.HashAlgorithmName]::SHA256, [System.Security.Cryptography.RSASignaturePadding]::Pss)) {
+                throw 'Cached detached signature does not match latest.json.'
+            }
+        } else {
+            Copy-Item -LiteralPath $candidatePath -Destination $finalManifestPath
+            $manifestBytes = [System.IO.File]::ReadAllBytes($finalManifestPath)
+            $signatureBytes = $script:updateSigningRsa.SignData($manifestBytes, [System.Security.Cryptography.HashAlgorithmName]::SHA256, [System.Security.Cryptography.RSASignaturePadding]::Pss)
+            [System.IO.File]::WriteAllText($finalSignaturePath, [Convert]::ToBase64String($signatureBytes), [System.Text.UTF8Encoding]::new($false))
+        }
+    } finally { Remove-Item -LiteralPath $candidatePath -Force -ErrorAction SilentlyContinue }
 }
 
 function Repair-ClientManifest {
@@ -823,7 +881,7 @@ function Get-ValidatedGitSha([string]$Ref) {
 }
 
 function Assert-VerifiedMirror([string]$Mirror) {
-    foreach ($path in @($bundle.ArchivePath, $bundle.ChecksumPath)) {
+    foreach ($path in @($bundle.AssetFiles)) {
         $name = Split-Path -Leaf $path
         if ($script:verifiedAssets["$Mirror/$name"] -cne (Get-ReleaseFileSha256 $path)) {
             throw "$Mirror has no complete download and SHA-256 proof for $name in this run."
@@ -838,8 +896,11 @@ function Assert-ArchiveContents([string]$Path) {
     if ($LASTEXITCODE -ne 0) { throw "Release archive integrity test failed: $testOutput" }
     $listing = & $sevenZip l -slt $Path 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) { throw 'Could not inspect release archive contents.' }
-    $files = @([regex]::Matches($listing, '(?m)^Path = ([^\r\n]+)') | ForEach-Object { $_.Groups[1].Value.Replace('/', '\') })
-    foreach ($required in @('NetBootDhcpTool.exe', 'config\appsettings.json', 'config\favorites.json', 'i18n\zh-CN.json', 'i18n\en-US.json', 'assets\app.ico', 'README.md', 'docs\RELEASE_NOTES.md', 'PresentationNative_cor3.dll', 'wpfgfx_cor3.dll')) {
+    $archiveEntry = [System.IO.Path]::GetFullPath($Path).Replace('/', '\')
+    $files = @([regex]::Matches($listing, '(?m)^Path = ([^\r\n]+)') | ForEach-Object { $_.Groups[1].Value.Replace('/', '\') } | Where-Object { $_ -ine $archiveEntry })
+    $rootPrefix = 'NetBootDhcpTool\'
+    if ($files | Where-Object { $_ -cne 'NetBootDhcpTool' -and $_ -notlike "$rootPrefix*" }) { throw 'Portable archive contains entries outside the fixed NetBootDhcpTool top-level directory.' }
+    foreach ($required in @('NetBootDhcpTool\NetBootDhcpTool.exe', 'NetBootDhcpTool\NetBootDhcpTool.Updater.exe', 'NetBootDhcpTool\install-manifest.json', 'NetBootDhcpTool\config\appsettings.json', 'NetBootDhcpTool\config\favorites.json', 'NetBootDhcpTool\i18n\zh-CN.json', 'NetBootDhcpTool\i18n\en-US.json', 'NetBootDhcpTool\assets\app.ico', 'NetBootDhcpTool\README.md', 'NetBootDhcpTool\docs\RELEASE_NOTES.md', 'NetBootDhcpTool\PresentationNative_cor3.dll', 'NetBootDhcpTool\wpfgfx_cor3.dll')) {
         if ($required -cnotin $files) { throw "Release archive is incomplete; missing $required." }
     }
     Write-Host '[Build] Archive CRC and required application files verified.'
@@ -849,8 +910,9 @@ function Assert-PublicRelease {
     $directory = Join-Path $stateDirectory ('public-readback-' + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $directory -Force | Out-Null
     try {
+        $publicAssets = @($bundle.AssetFiles) + @($finalManifestPath, $finalSignaturePath)
         foreach ($mirror in @('GitHub', 'Gitee')) {
-            foreach ($path in @($bundle.ArchivePath, $bundle.ChecksumPath, $finalManifestPath)) {
+            foreach ($path in $publicAssets) {
                 $name = Split-Path -Leaf $path
                 $uri = if ($mirror -ceq 'GitHub') { "https://github.com/$GitHubRepository/releases/download/$Tag/$name" } else { [string]$script:releaseState.giteeAssets[$name].downloadUrl }
                 $download = Join-Path $directory "$mirror-$name"
@@ -862,6 +924,9 @@ function Assert-PublicRelease {
         $latestPath = Join-Path $directory 'github-latest.json'
         Invoke-ReleaseDownload -Uri "https://github.com/$GitHubRepository/releases/latest/download/latest.json" -Destination $latestPath -AssetName 'latest.json (client endpoint)'
         Test-DownloadedAsset -RemotePath $latestPath -LocalPath $finalManifestPath -AssetName 'latest.json' -ArchiveSha256 $bundle.ArchiveSha256
+        $latestSignaturePath = Join-Path $directory 'github-latest.json.sig'
+        Invoke-ReleaseDownload -Uri "https://github.com/$GitHubRepository/releases/latest/download/latest.json.sig" -Destination $latestSignaturePath -AssetName 'latest.json.sig (client endpoint)'
+        Test-DownloadedAsset -RemotePath $latestSignaturePath -LocalPath $finalSignaturePath -AssetName 'latest.json.sig' -ArchiveSha256 $bundle.ArchiveSha256
         $latest = Invoke-ReleaseHttp -Uri "https://gitee.com/api/v5/repos/$GiteeOwner/$GiteeRepository/releases/latest"
         if ($latest.StatusCode -ne 200) { throw "Gitee client latest-release endpoint returned HTTP $($latest.StatusCode)." }
         $latestRelease = $latest.Content | ConvertFrom-Json -AsHashtable -ErrorAction Stop
@@ -874,7 +939,8 @@ function Assert-PublicRelease {
         try { $attachments = @(Get-GiteeAttachments) }
         catch { Add-ReleaseWarning 'Gitee attachment inventory unavailable after both public bundles passed full download/size/SHA-256 verification; saved attachment IDs were retained.' }
         if ($null -ne $attachments) {
-            foreach ($name in @($bundle.ArchiveName, "$($bundle.ArchiveName).sha256", 'latest.json')) {
+            $expectedNames = @($publicAssets | ForEach-Object { Split-Path -Leaf $_ })
+            foreach ($name in $expectedNames) {
                 $matching = @($attachments | Where-Object { $_.name -ceq $name })
                 if ($matching.Count -ne 1) { throw "Gitee inventory has $($matching.Count) attachments named $name; expected exactly one." }
                 if ([string]$matching[0].id -cne [string]$script:releaseState.giteeAssets[$name].attachmentId -or
@@ -882,7 +948,7 @@ function Assert-PublicRelease {
                     throw "Gitee inventory for $name disagrees with its verified attachment identity/URL."
                 }
             }
-            Write-Host '[Final Verify] Gitee inventory: exactly one of each asset; client manifest URL matches verified bytes.'
+            Write-Host '[Final Verify] Gitee inventory: exactly one of each archive, Full/OTA, sidecar and signed-manifest asset; client URLs match verified bytes.'
         }
     } finally {
         Remove-OwnedTemporaryDirectory -Path $directory -ExpectedParent $stateDirectory -RequiredNamePrefix 'public-readback-'
@@ -908,16 +974,17 @@ if ($cacheIsPresent) {
     $script:releaseState = Read-ReleaseState -Path $statePath -Tag $Tag -SourceCommit $SourceCommit -ArchiveSha256 $bundle.ArchiveSha256
     Write-Host "[Package] Reusing cached $archiveName; it will not be rebuilt on workflow retry."
 } else {
-    Write-Host "[Package] Building the single release archive for $Tag."
-    & (Join-Path $PSScriptRoot 'publish.ps1') -GitHubRepository $GitHubRepository
-    if ($LASTEXITCODE -ne 0) { throw "Release package build failed with exit code $LASTEXITCODE." }
-    $builtBundle = Get-ReleaseBundle -Directory (Join-Path $repoRoot 'release') -Tag $Tag
     $stagingDirectory = "$stateDirectory.$([guid]::NewGuid().ToString('N')).tmp"
     New-Item -ItemType Directory -Path $stagingDirectory -Force | Out-Null
     try {
-        Copy-Item -LiteralPath $builtBundle.ArchivePath -Destination $stagingDirectory
-        Copy-Item -LiteralPath $builtBundle.ChecksumPath -Destination $stagingDirectory
+        $buildOutput = Join-Path $stagingDirectory 'build-output'
+        Write-Host "[Package] Building Full/OTA and portable archive for $Tag in an isolated cache directory."
+        & (Join-Path $PSScriptRoot 'publish.ps1') -GitHubRepository $GitHubRepository -OutputDirectory $buildOutput -BaselineDirectory $fullStateRoot
+        if ($LASTEXITCODE -ne 0) { throw "Release package build failed with exit code $LASTEXITCODE." }
+        $builtBundle = Get-ReleaseBundle -Directory $buildOutput -Tag $Tag
+        foreach ($assetPath in $builtBundle.AssetFiles) { Copy-Item -LiteralPath $assetPath -Destination $stagingDirectory }
         Copy-Item -LiteralPath $builtBundle.ManifestPath -Destination (Join-Path $stagingDirectory 'latest.json')
+        Copy-Item -LiteralPath (Join-Path $buildOutput 'NetBootDhcpTool\install-manifest.json') -Destination (Join-Path $stagingDirectory 'install-manifest.json')
         $script:releaseState = New-ReleaseState -Tag $Tag -SourceCommit $SourceCommit -ArchiveSha256 $builtBundle.ArchiveSha256
         $script:releaseState.giteeReleaseCreatedByPipeline = $false
         Save-ReleaseState -Path (Join-Path $stagingDirectory 'release-state.json') -State $script:releaseState
@@ -942,6 +1009,10 @@ $null = Get-OrCreateGitHubRelease
 # Upload the exact same cached archive and sidecar to both hosts. Reuse is allowed only after full remote readback.
 Ensure-GitHubAsset -LocalPath $bundle.ArchivePath -Name $bundle.ArchiveName -ArchiveSha256 $bundle.ArchiveSha256
 Ensure-GitHubAsset -LocalPath $bundle.ChecksumPath -Name "$($bundle.ArchiveName).sha256" -ArchiveSha256 $bundle.ArchiveSha256
+foreach ($packageAsset in $bundle.PackageAssets) {
+    Ensure-GitHubAsset -LocalPath $packageAsset.Path -Name $packageAsset.Name -ArchiveSha256 $bundle.ArchiveSha256
+    Ensure-GitHubAsset -LocalPath $packageAsset.ChecksumPath -Name "$($packageAsset.Name).sha256" -ArchiveSha256 $bundle.ArchiveSha256
+}
 Start-ReleaseStage 'GitHub Verify'
 Assert-VerifiedMirror 'GitHub'
 Start-ReleaseStage 'Gitee Publish'
@@ -949,6 +1020,10 @@ Sync-GiteeSource
 $giteeRelease = Ensure-GiteeRelease -BaseManifest $script:baseManifest
 Ensure-GiteeAsset -LocalPath $bundle.ChecksumPath -Name "$($bundle.ArchiveName).sha256" -ArchiveSha256 $bundle.ArchiveSha256
 Ensure-GiteeAsset -LocalPath $bundle.ArchivePath -Name $bundle.ArchiveName -ArchiveSha256 $bundle.ArchiveSha256
+foreach ($packageAsset in $bundle.PackageAssets) {
+    Ensure-GiteeAsset -LocalPath $packageAsset.ChecksumPath -Name "$($packageAsset.Name).sha256" -ArchiveSha256 $bundle.ArchiveSha256
+    Ensure-GiteeAsset -LocalPath $packageAsset.Path -Name $packageAsset.Name -ArchiveSha256 $bundle.ArchiveSha256
+}
 Start-ReleaseStage 'Gitee Verify'
 Assert-VerifiedMirror 'Gitee'
 
@@ -959,18 +1034,28 @@ $giteeReleasePageUrl = Get-GiteeReleasePageUrl
 $finalManifestDirectory = Join-Path $stateDirectory 'final-manifest'
 New-Item -ItemType Directory -Path $finalManifestDirectory -Force | Out-Null
 $finalManifestPath = Join-Path $finalManifestDirectory 'latest.json'
-$finalManifest = New-DualSourceManifest -BaseManifestPath $bundle.ManifestPath -Tag $Tag -GitHubRepository $GitHubRepository -GiteeReleasePageUrl $giteeReleasePageUrl -GiteeArchiveDownloadUrl $giteeArchiveUrl -OutputPath $finalManifestPath
+$finalSignaturePath = Join-Path $finalManifestDirectory 'latest.json.sig'
+$giteeAssetUrls = @{}
+foreach ($packageAsset in $bundle.PackageAssets) {
+    $giteeAssetUrls[$packageAsset.Name] = Get-GiteeAssetDownloadUrl $packageAsset.Name $packageAsset.Path $packageAsset.Sha256
+}
+Get-OrCreateFinalSignedManifest -GiteeAssetUrls $giteeAssetUrls
 $finalManifestBundleHash = Get-ReleaseFileSha256 $finalManifestPath
 Test-ClientManifest
 Repair-ClientManifest
 
+Ensure-GiteeAsset -LocalPath $finalSignaturePath -Name 'latest.json.sig' -ArchiveSha256 $bundle.ArchiveSha256
+Ensure-GitHubAsset -LocalPath $finalSignaturePath -Name 'latest.json.sig' -ArchiveSha256 $bundle.ArchiveSha256
 Ensure-GiteeAsset -LocalPath $finalManifestPath -Name 'latest.json' -ArchiveSha256 $bundle.ArchiveSha256
 Ensure-GitHubAsset -LocalPath $finalManifestPath -Name 'latest.json' -ArchiveSha256 $bundle.ArchiveSha256
 
 $finalGiteeManifest = $script:releaseState.giteeAssets['latest.json']
 if ($null -eq $finalGiteeManifest -or $finalGiteeManifest.status -ne 'verified') { throw 'Gitee latest.json did not reach the verified state.' }
 foreach ($mirror in @('GitHub', 'Gitee')) {
-    if ($script:verifiedAssets["$mirror/latest.json"] -cne $finalManifestBundleHash) { throw "$mirror latest.json lacks matching full readback evidence from this run." }
+    if ($script:verifiedAssets["$mirror/latest.json"] -cne $finalManifestBundleHash -or
+        $script:verifiedAssets["$mirror/latest.json.sig"] -cne (Get-ReleaseFileSha256 $finalSignaturePath)) {
+        throw "$mirror signed manifest pair lacks matching full readback evidence from this run."
+    }
 }
 
 Start-ReleaseStage 'Final Verify'

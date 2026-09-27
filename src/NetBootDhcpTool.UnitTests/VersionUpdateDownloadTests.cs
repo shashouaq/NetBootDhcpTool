@@ -135,7 +135,7 @@ public sealed class VersionUpdateDownloadTests
             await File.WriteAllTextAsync(destination, "keep until verified");
             var package = new byte[] { 31, 32, 33, 34, 35 };
             var giteeUrl = "https://gitee.com/joel20230302/NetBootDhcpTool/attach_files/123";
-            var githubUrl = "https://github.com/shashouaq/NetBootDhcpTool/releases/download/v1.0.14/package.7z";
+            var githubUrl = "https://github.com/shashouaq/NetBootDhcpTool/releases/download/v1.0.14/NetBootDhcpTool-v1.0.14.7z";
             var requestedUrls = new List<string>();
             using var client = new HttpClient(new DelegateHandler((request, _) =>
             {
@@ -214,7 +214,7 @@ public sealed class VersionUpdateDownloadTests
             await File.WriteAllTextAsync(destination, "keep until verified");
             var package = new byte[] { 31, 32, 33, 34, 35 };
             var giteeUrl = "https://gitee.com/joel20230302/NetBootDhcpTool/attach_files/123";
-            var githubUrl = "https://github.com/shashouaq/NetBootDhcpTool/releases/download/v1.0.14/package.7z";
+            var githubUrl = "https://github.com/shashouaq/NetBootDhcpTool/releases/download/v1.0.14/NetBootDhcpTool-v1.0.14.7z";
             var stalledStream = new BlockingReadStream(package[..2]);
             var requestedUrls = new List<string>();
             using var client = new HttpClient(new DelegateHandler((request, _) =>
@@ -251,7 +251,7 @@ public sealed class VersionUpdateDownloadTests
             var destination = Path.Combine(root, "update.7z");
             var package = new byte[] { 31, 32, 33 };
             var giteeUrl = "https://gitee.com/joel20230302/NetBootDhcpTool/attach_files/123";
-            var githubUrl = "https://github.com/shashouaq/NetBootDhcpTool/releases/download/v1.0.14/package.7z";
+            var githubUrl = "https://github.com/shashouaq/NetBootDhcpTool/releases/download/v1.0.14/NetBootDhcpTool-v1.0.14.7z";
             var requestedUrls = new List<string>();
             using var client = new HttpClient(new DelegateHandler(async (request, token) =>
             {
@@ -413,7 +413,7 @@ public sealed class VersionUpdateDownloadTests
             Assert.AreEqual(0, requests);
 
             service.Dispose();
-            using var response = await client.GetAsync("https://github.com/shashouaq/NetBootDhcpTool/releases/download/v1.0.0/test.7z");
+            using var response = await client.GetAsync("https://github.com/shashouaq/NetBootDhcpTool/releases/download/v1.0.0/NetBootDhcpTool-v1.0.0.7z");
             Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
         }
         finally
@@ -424,7 +424,7 @@ public sealed class VersionUpdateDownloadTests
 
     private static UpdateCheckResult UpdateFor(byte[] bytes, string? checksum = null, string? url = null, IReadOnlyList<string>? mirrors = null)
     {
-        var primaryUrl = url ?? "https://github.com/shashouaq/NetBootDhcpTool/releases/download/v1.0.0/test.7z";
+        var primaryUrl = url ?? "https://github.com/shashouaq/NetBootDhcpTool/releases/download/v1.0.0/NetBootDhcpTool-v1.0.0.7z";
         return new UpdateCheckResult
         {
             Succeeded = true,

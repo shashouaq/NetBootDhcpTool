@@ -13,6 +13,7 @@ public sealed record UpdateControllerState
     public bool DownloadCanceled { get; init; }
     public UpdateDownloadProgress? DownloadProgress { get; init; }
     public bool LowSpeedWarningRaised { get; init; }
+    public bool PackageVerificationInProgress { get; init; }
     public UpdateDownloadResult? DownloadedResult { get; init; }
     public string? DownloadError { get; init; }
 }
@@ -22,7 +23,9 @@ public sealed class UpdateController : IAsyncDisposable
 {
     private readonly object _sync = new();
     private readonly VersionUpdateService _service;
+    private readonly UpdatePackageApplier _packageApplier;
     private readonly Version _currentVersion;
+    private readonly UpdateInstallContext? _installContext;
     private readonly TaskCompletionSource _disposeCompletion = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private CancellationTokenSource? _checkCancellation;
     private CancellationTokenSource? _downloadCancellation;
@@ -32,11 +35,20 @@ public sealed class UpdateController : IAsyncDisposable
     private bool _disposed;
     private bool _disposeStarted;
 
-    public UpdateController(VersionUpdateService service, Version currentVersion)
+    public UpdateController(VersionUpdateService service, Version currentVersion, UpdateInstallContext? installContext = null)
+        : this(service, currentVersion, installContext, new UpdatePackageApplier())
+    {
+    }
+
+    internal UpdateController(VersionUpdateService service, Version currentVersion, UpdateInstallContext? installContext, UpdatePackageApplier packageApplier)
     {
         _service = service ?? throw new ArgumentNullException(nameof(service));
         _currentVersion = currentVersion ?? throw new ArgumentNullException(nameof(currentVersion));
+        _installContext = installContext;
+        _packageApplier = packageApplier ?? throw new ArgumentNullException(nameof(packageApplier));
     }
+
+    public UpdateInstallContext? InstallContext => _installContext;
 
     public event Action<UpdateControllerState>? StateChanged;
 
@@ -92,6 +104,7 @@ public sealed class UpdateController : IAsyncDisposable
                 DownloadCancellationRequested = false,
                 DownloadCanceled = false,
                 DownloadProgress = null,
+                PackageVerificationInProgress = false,
                 LowSpeedWarningRaised = false,
                 DownloadedResult = null,
                 DownloadError = null
@@ -153,6 +166,10 @@ public sealed class UpdateController : IAsyncDisposable
                     .ToArray()
             }));
             var result = await _service.CheckAsync(_currentVersion, cancellation.Token, progress).ConfigureAwait(false);
+            if (result is { Succeeded: true, IsNewVersion: true })
+            {
+                result = CopyWithSelectedPackage(result, UpdatePackageSelector.Select(result, _installContext));
+            }
             Mutate(state => state with { IsChecking = false, CheckResult = result, SourceSpeeds = result.DownloadSpeeds });
             completion.TrySetResult(result);
         }
@@ -185,20 +202,74 @@ public sealed class UpdateController : IAsyncDisposable
                 DownloadProgress = item,
                 LowSpeedWarningRaised = state.LowSpeedWarningRaised || item.LowSpeedDuration >= TimeSpan.FromSeconds(10)
             }));
-            var downloaded = await _service.DownloadAsync(result, destinationPath, progress, cancellation.Token).ConfigureAwait(false);
-            Mutate(state => state with { DownloadInProgress = false, DownloadedResult = downloaded, DownloadError = null });
+            var downloaded = result.SelectedPackage is { } package
+                ? await _service.DownloadPackageAsync(result, package, destinationPath, progress, cancellation.Token).ConfigureAwait(false)
+                : await _service.DownloadAsync(result, destinationPath, progress, cancellation.Token).ConfigureAwait(false);
+            if (downloaded.ReadyToInstall)
+            {
+                if (_installContext is null || result.LatestVersion is null)
+                    throw new InvalidDataException("The signed update package cannot be applied without a verified installation baseline.");
+                Mutate(state => state with { PackageVerificationInProgress = true, DownloadProgress = null });
+                try
+                {
+                    await VerifyPackageForInstallAsync(_packageApplier, downloaded, _installContext, result.LatestVersion, cancellation.Token).ConfigureAwait(false);
+                }
+                catch (UpdateBaseInventoryMismatchException) when (downloaded.Package!.Kind.Equals("Ota", StringComparison.OrdinalIgnoreCase))
+                {
+                    var fullPackage = result.Packages.FirstOrDefault(item => item.Kind.Equals("Full", StringComparison.OrdinalIgnoreCase))
+                        ?? throw new InvalidDataException("The installed files do not match the OTA base, and no Full package is available.");
+                    var fullDestination = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(destinationPath))!, fullPackage.FileName);
+                    Mutate(state => state with { PackageVerificationInProgress = false, DownloadProgress = null });
+                    downloaded = await _service.DownloadPackageAsync(result, fullPackage, fullDestination, progress, cancellation.Token).ConfigureAwait(false);
+                    Mutate(state => state with { PackageVerificationInProgress = true, DownloadProgress = null });
+                    await VerifyPackageForInstallAsync(_packageApplier, downloaded, _installContext, result.LatestVersion, cancellation.Token).ConfigureAwait(false);
+                    downloaded = new UpdateDownloadResult
+                    {
+                        FilePath = downloaded.FilePath,
+                        Sha256 = downloaded.Sha256,
+                        DownloadUrl = downloaded.DownloadUrl,
+                        ReadyToInstall = downloaded.ReadyToInstall,
+                        Package = downloaded.Package,
+                        FellBackToFullPackage = true,
+                        SignedManifestJson = downloaded.SignedManifestJson,
+                        ManifestSignature = downloaded.ManifestSignature
+                    };
+                }
+            }
+            Mutate(state => state with { DownloadInProgress = false, PackageVerificationInProgress = false, DownloadedResult = downloaded, DownloadError = null });
             completion.TrySetResult(downloaded);
         }
         catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
         {
-            Mutate(state => state with { DownloadInProgress = false, DownloadCancellationRequested = false, DownloadCanceled = true });
+            Mutate(state => state with { DownloadInProgress = false, DownloadCancellationRequested = false, DownloadCanceled = true, PackageVerificationInProgress = false });
             completion.TrySetCanceled(cancellation.Token);
         }
         catch (Exception ex)
         {
-            Mutate(state => state with { DownloadInProgress = false, DownloadError = ex.Message });
+            Mutate(state => state with { DownloadInProgress = false, PackageVerificationInProgress = false, DownloadError = ex.Message });
             completion.TrySetException(ex);
         }
+    }
+
+    private static async Task VerifyPackageForInstallAsync(
+        UpdatePackageApplier applier,
+        UpdateDownloadResult downloaded,
+        UpdateInstallContext install,
+        Version targetVersion,
+        CancellationToken cancellationToken)
+    {
+        var preflight = new UpdateApplyRequest(
+            install.RootDirectory,
+            downloaded.FilePath,
+            downloaded.Sha256,
+            install.Manifest.Version,
+            targetVersion.ToString(3),
+            downloaded.Package!.Kind,
+            install.ManifestSha256,
+            Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(downloaded.SignedManifestJson)),
+            downloaded.ManifestSignature,
+            Guid.NewGuid().ToString("N"));
+        await applier.ApplyAsync(preflight, cancellationToken, validateOnly: true).ConfigureAwait(false);
     }
 
     private void Mutate(Func<UpdateControllerState, UpdateControllerState> change)
@@ -211,6 +282,28 @@ public sealed class UpdateController : IAsyncDisposable
         }
         Publish(published);
     }
+
+    private static UpdateCheckResult CopyWithSelectedPackage(UpdateCheckResult source, UpdatePackageMetadata? selectedPackage) => new()
+    {
+        CurrentVersion = source.CurrentVersion,
+        LatestVersion = source.LatestVersion,
+        Succeeded = source.Succeeded,
+        IsNewVersion = source.IsNewVersion,
+        DownloadUrl = source.DownloadUrl,
+        DownloadUrls = source.DownloadUrls,
+        ReleasePageUrl = source.ReleasePageUrl,
+        ArchiveName = source.ArchiveName,
+        ArchiveSha256 = source.ArchiveSha256,
+        DownloadSpeeds = source.DownloadSpeeds,
+        ReleaseNotes = source.ReleaseNotes,
+        Changes = source.Changes,
+        SignatureVerified = source.SignatureVerified,
+        SignedManifestJson = source.SignedManifestJson,
+        ManifestSignature = source.ManifestSignature,
+        Packages = source.Packages,
+        SelectedPackage = selectedPackage,
+        Error = source.Error
+    };
 
     private UpdateControllerState Update(UpdateControllerState state)
     {

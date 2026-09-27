@@ -1,5 +1,7 @@
 using System.Diagnostics;
+using System.IO;
 using System.Security.Principal;
+using System.Text;
 using System.Windows;
 using NetBootDhcpTool.Core;
 
@@ -10,12 +12,29 @@ public partial class App : Application
     public AppPaths Paths { get; private set; } = null!;
     public FileLogger? Logger { get; private set; }
     private SingleInstanceLease? _instanceLease;
+    private UpdateStartupHealth? _updateStartupHealth;
 
     protected override void OnStartup(StartupEventArgs e)
     {
         var startupStopwatch = Stopwatch.StartNew();
         var phaseStopwatch = Stopwatch.StartNew();
         var paths = new AppPaths(AppContext.BaseDirectory);
+        try
+        {
+            _updateStartupHealth = ParseUpdateStartupHealth(e.Args, paths);
+            if (_updateStartupHealth is not null)
+                UpdatePackageApplier.VerifyInstalledFilesAsync(paths.BaseDirectory, _updateStartupHealth.TargetVersion).GetAwaiter().GetResult();
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(
+                $"新版启动文件校验失败，更新器将尝试恢复旧版本。\nThe new version failed startup file verification; the updater will attempt to restore the previous version.\n\n{ex.Message}",
+                "NetBoot DHCP Tool Update",
+                MessageBoxButton.OK,
+                MessageBoxImage.Error);
+            Shutdown(-1);
+            return;
+        }
         try
         {
             _instanceLease = SingleInstanceLease.TryAcquire(paths);
@@ -62,6 +81,7 @@ public partial class App : Application
         AppDomain.CurrentDomain.UnhandledException += (_, args2) => logger.Error("Unhandled exception", args2.ExceptionObject as Exception);
         logger.Info($"Log session started: file={logger.SessionLogPath}");
         logger.Info("Application start");
+        if (_updateStartupHealth is not null) logger.Info($"Update startup inventory verified: version={_updateStartupHealth.TargetVersion}");
         logger.Info($"Application startup phase completed: phase=single-instance-lease elapsedMs={instanceLeaseElapsedMs}");
         logger.Info($"Application startup phase completed: phase=data-directory-and-default-files elapsedMs={phaseStopwatch.ElapsedMilliseconds}");
         SessionEnding += (_, args) => logger.Info($"Windows session ending notification: reason={args.ReasonSessionEnding} applicationUptimeMs={startupStopwatch.ElapsedMilliseconds}");
@@ -82,6 +102,16 @@ public partial class App : Application
             if (firstContentRendered) return;
             firstContentRendered = true;
             logger.Info($"Application startup phase completed: phase=first-content-rendered elapsedMs={startupStopwatch.ElapsedMilliseconds}");
+            if (_updateStartupHealth is not null)
+            {
+                try
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(_updateStartupHealth.HealthFilePath)!);
+                    File.WriteAllText(_updateStartupHealth.HealthFilePath, _updateStartupHealth.HealthToken, new UTF8Encoding(false));
+                    logger.Info($"Update startup health accepted: version={_updateStartupHealth.TargetVersion}");
+                }
+                catch (Exception ex) { logger.Error("Could not write update startup health confirmation", ex); }
+            }
         };
         MainWindow = mainWindow;
         mainWindow.Show();
@@ -106,4 +136,33 @@ public partial class App : Application
         using var identity = WindowsIdentity.GetCurrent();
         return new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator);
     }
+
+    private static UpdateStartupHealth? ParseUpdateStartupHealth(string[] args, AppPaths paths)
+    {
+        if (!args.Any(argument => argument.StartsWith("--update-", StringComparison.Ordinal))) return null;
+        var values = new Dictionary<string, string>(StringComparer.Ordinal);
+        for (var index = 0; index < args.Length; index++)
+        {
+            var key = args[index];
+            if (!key.StartsWith("--update-", StringComparison.Ordinal) || index + 1 >= args.Length || !values.TryAdd(key, args[++index]))
+                throw new InvalidDataException("Update startup arguments are invalid.");
+        }
+        if (values.Count != 3 || !values.TryGetValue("--update-health-file", out var healthPath)
+            || !values.TryGetValue("--update-health-token", out var healthToken)
+            || !values.TryGetValue("--update-target-version", out var targetVersion)
+            || !VersionUpdateService.TryParseVersion(targetVersion, out var expectedVersion)
+            || expectedVersion.ToString(3) != targetVersion
+            || expectedVersion.ToString(3) != (typeof(MainWindow).Assembly.GetName().Version ?? new Version(0, 0)).ToString(3))
+            throw new InvalidDataException("Update startup arguments do not match this application version.");
+        if (healthToken.Length != 64 || !healthToken.All(Uri.IsHexDigit))
+            throw new InvalidDataException("Update startup token is invalid.");
+        var updatesRoot = Path.GetFullPath(Path.Combine(paths.DataDirectory, "updates", "health"));
+        var fullHealthPath = Path.GetFullPath(healthPath);
+        if (!fullHealthPath.StartsWith(updatesRoot + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
+            || !Path.GetFileName(fullHealthPath).EndsWith(".health", StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException("Update startup health path is outside the application update directory.");
+        return new UpdateStartupHealth(fullHealthPath, healthToken, targetVersion);
+    }
+
+    private sealed record UpdateStartupHealth(string HealthFilePath, string HealthToken, string TargetVersion);
 }

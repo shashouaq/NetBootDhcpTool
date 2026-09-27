@@ -46,27 +46,31 @@ Publish from the repository root after completing the required checks:
 .\build\publish.ps1 -GitHubRepository owner/repo
 ```
 
-The publish script invokes `stop-test-processes.ps1`. That helper resolves actual executable paths and quoted `dotnet` entry points, stops only test runners proven to be under this repository's test-project output trees, and rechecks PID identity before stopping. It refuses to package while any NetBootDhcpTool GUI is running or its executable path is unreadable; no GUI is force-terminated. Close the app normally and retry. It leaves machine-wide PktMon captures and filters untouched.
+The publish script writes to a new `release\local-build-<timestamp>-<id>` folder by default (or to a caller-supplied new output directory) and refuses to overwrite existing output. It invokes `stop-test-processes.ps1`. That helper resolves actual executable paths and quoted `dotnet` entry points, stops only test runners proven to be under this repository's test-project output trees, and rechecks PID identity before stopping. It refuses to package while any NetBootDhcpTool GUI is running or its executable path is unreadable; no GUI is force-terminated. Close the app normally and retry. It leaves machine-wide PktMon captures and filters untouched.
 
-When `-GitHubRepository` is supplied, `release\latest.json` includes GitHub download URLs for the versioned archive. If the repository is not known yet, omit the parameter and rerun the publish command before uploading a GitHub release.
+`build/clean.ps1` retains the two newest `local-build-*` directories alongside the two newest versioned releases.
 
-Expected outputs:
+When `-GitHubRepository` is supplied, the local `latest.json` includes GitHub URLs for the versioned archive and Full/optional OTA packages. It is a build manifest, not a formally signed client manifest; the release publisher adds approved Gitee URLs and signs the final exact bytes. If the repository is not known yet, omit the parameter and rerun local packaging before any separately authorized release.
 
-- `release\NetBootDhcpTool`
-- `release\NetBootDhcpTool-tools`
-- `release\NetBootDhcpTool-v<version>`
-- `release\NetBootDhcpTool-v<version>.7z`
-- `release\NetBootDhcpTool-v<version>.7z.sha256`
-- `release\latest.json`
+Expected outputs under the selected new build directory:
 
-The publish script tests the `.7z` archive and writes its SHA-256 sidecar and `latest.json` manifest. Before uploading, verify that the local manifest and checksum sidecar both match the archive:
+- `NetBootDhcpTool` (the portable product directory, without a version suffix)
+- `NetBootDhcpTool-tools`
+- `NetBootDhcpTool-v<version>` (versioned inventory copy for release recovery)
+- `NetBootDhcpTool-v<version>.7z` and `.sha256` (archive root contains only `NetBootDhcpTool/`)
+- `NetBootDhcpTool-full-v<version>.zip` and `.sha256`
+- `NetBootDhcpTool-ota-v<base>-to-v<version>.zip` and `.sha256` only when a valid prior install manifest exists and the OTA is smaller than Full
+- `latest.json`
+
+The publish script tests the `.7z` archive and writes package SHA-256 sidecars plus `latest.json`. The first build without a prior managed install manifest is Full-only. Before a formally authorized publication, verify that each package matches its sidecar and manifest; the release workflow also verifies the final signed dual-source manifest and public bytes:
 
 ```powershell
 $version = "<version>"
-$archive = ".\release\NetBootDhcpTool-v$version.7z"
+$buildDirectory = "<new local-build output directory>"
+$archive = Join-Path $buildDirectory "NetBootDhcpTool-v$version.7z"
 $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
 $sidecarHash = (Get-Content -Raw "$archive.sha256").Trim().Split(' ')[0].ToLowerInvariant()
-$manifest = Get-Content -Raw .\release\latest.json | ConvertFrom-Json
+$manifest = Get-Content -Raw (Join-Path $buildDirectory 'latest.json') | ConvertFrom-Json
 if ($sidecarHash -ne $hash -or $manifest.version -ne $version -or $manifest.archiveSha256 -ne $hash) {
     throw "Local release assets are inconsistent for v$version"
 }
@@ -78,7 +82,7 @@ Local source changes are not committed, pushed, or published unless the user exp
 
 GitHub-hosted Windows CI remains the gate for everyday branch and pull-request work. Before release, push the commit to `main`, wait for the exact commit's `windows-ci.yml` push run to succeed, and push its matching stable `v<version>` tag. The Windows CI run covers restore, maintenance checks, Release build, unit tests, console smoke, non-admin UI smoke when available, and the release-pipeline helper tests.
 
-The only formal publication entry point is `.github/workflows/formal-release.yml` → **Run workflow** on `main`, with the stable tag as input. A GitHub-hosted validation job confirms the tag is in `main` and that Windows CI passed for both the exact application-tag commit and the exact workflow/publisher commit. The publish job then runs on `[self-hosted, windows, x64, netboot-release]`. It loads the release scripts from the CI-verified workflow commit but builds the application sources and reads the version from the requested immutable tag. It builds the existing `.7z` package once, stores the package and release checkpoint outside the checkout, and uploads those same bytes to GitHub and Gitee. The `.7z` format remains unchanged for current updater compatibility.
+The only formal publication entry point is `.github/workflows/formal-release.yml` → **Run workflow** on `main`, with the stable tag as input. A GitHub-hosted validation job confirms the tag is in `main` and that Windows CI passed for both the exact application-tag commit and the exact workflow/publisher commit. The publish job then runs on `[self-hosted, windows, x64, netboot-release]`. It loads the release scripts from the CI-verified workflow commit but builds the application sources and reads the version from the requested immutable tag. It builds the versioned `.7z`, Full and optional OTA packages once, stores those same bytes and the final signed-manifest pair in persistent release state outside the checkout, and uploads identical asset names to GitHub and Gitee. The `.7z` format remains available for current and legacy clients; its archive root is the fixed `NetBootDhcpTool/` directory.
 
 GitHub reported `main` as unprotected on 2026-09-26. The workflow checks CI evidence for normal dispatches, but a repository writer can still change that workflow and push directly. A branch ruleset requiring the Windows CI check is the remaining repository-level control if direct pushes should no longer bypass review; configure that separately because it changes the team's normal push flow.
 
@@ -86,7 +90,7 @@ Register one repository-level Windows x64 self-hosted runner before dispatching 
 
 The current `NetBootRelease-DESQIAOWEI` runner is registered under `%LOCALAPPDATA%\NetBootDhcpTool\actions-runner` and runs in the logged-in user's session. Confirm its GitHub status is `online` before dispatch. If it is offline, start `run.cmd` from that directory and keep the session active through publication. It is not installed as a Windows service on this host.
 
-The publisher creates each GitHub/Gitee Release only when absent. New Releases remain a GitHub draft and a Gitee prerelease until archives, sidecars and manifests pass remote verification. An existing attachment is reused only after a complete download matches its local size and SHA-256; different bytes or duplicate names fail without overwriting. Gitee upload responses immediately save the attachment ID and public URL. Recovery downloads that exact URL first, with the single-attachment download endpoint as a fallback. It preserves the known ID on verification failure. Attachment listing is needed only to recover an unknown upload identity, or as a final auxiliary inventory check. Both archives and sidecars must pass readback before either `latest.json` is published. Both identical manifests must pass readback before GitHub is made stable, followed by Gitee. A final anonymous download checks all six public assets and the client latest endpoints.
+The publisher creates each GitHub/Gitee Release only when absent. New Releases remain a GitHub draft and a Gitee prerelease until the portable archive, Full/OTA packages, sidecars, and signed manifests pass remote verification. An existing attachment is reused only after a complete download matches its local size and SHA-256; different bytes or duplicate names fail without overwriting. Gitee upload responses immediately save the attachment ID and public URL. Recovery downloads that exact URL first, with the single-attachment download endpoint as a fallback. It preserves the known ID on verification failure. Attachment listing is needed only to recover an unknown upload identity, or as a final auxiliary inventory check. All declared package assets and sidecars must pass readback before either `latest.json` is published. Both identical manifest/signature pairs must pass readback before GitHub is made stable, followed by Gitee. Final anonymous downloads check every public asset and the client latest endpoints.
 
 If a release job fails without a tooling change, use **Re-run failed jobs** or dispatch the same tag again from the same runner. After fixing release tooling, wait for its exact main-commit Windows CI, then dispatch **Formal Release on main with the original tag**. GitHub's [rerun behavior](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs) retains the original workflow SHA, so rerunning an old run cannot validate new tooling. Keep the application tag and persistent cached archive unchanged. A divergent Gitee main branch, missing cache for an existing Release, or changed package fails closed. The workflow never deletes a Release, overwrites an attachment, or force-pushes a tag. The publish job remains bounded to 30 minutes.
 
@@ -126,5 +130,7 @@ The manifest contains:
 - `minimumSupportedVersion`: oldest version allowed to use this update path.
 - `releaseNotes`: Markdown release-note section extracted from the unreleased/current-version change-log section.
 - `changes`: concise change items extracted from the same change-log section for the in-app update dialog.
+
+For user-facing release descriptions, include `### zh-CN / 简体中文` and `### en-US / English` sections. The current client selects a section using the saved `Language` in `%LOCALAPPDATA%\NetBootDhcpTool\config\appsettings.json`; `auto` follows the Windows UI language. Keep both translations in the manifest's legacy `changes` array too, so older clients still receive readable release details.
 
 When `version` is newer than the running version, the app requests at most 64 KB from each valid download URL in parallel. Successful rates determine download order; a failed or timed-out probe is shown as unavailable and remains a later fallback. The toolbar shows rates and the selected host, with per-source details in its tooltip and confirmation dialog. After confirmation, a background download to the user's Downloads folder refreshes transfer speed and host in the status bar and reports a fallback switch. The archive is written to a temporary `.download` file and SHA-256 verified before it is moved into place; it is never installed automatically. Below 3 KB/s for 10 continuous seconds only produces an email contact hint and no automatic email.

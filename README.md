@@ -1,6 +1,6 @@
 # NetBoot DHCP Tool
 
-Version: 1.0.18
+Version: 1.0.19
 
 Authors: Joel & Codex
 
@@ -8,9 +8,9 @@ Windows portable IPv4 DHCP, adapter IP configuration, IPv4/IPv6 static route rul
 
 ## Maintenance Entry / 维护入口
 
-Start with the [maintenance guide](docs/MAINTENANCE_GUIDE.md), then read only the selected [approved work item](docs/TODO.md) and its source references. [PROJECT_MEMORY.md](PROJECT_MEMORY.md) holds stable product/network boundaries; the [release process](docs/RELEASE_PROCESS.md) owns publication steps. The [change log](docs/FEATURE_CHANGELOG.md) records completed changes, not future work. T01-T28 implementation and acceptance status is tracked in the [work-item index](docs/TODO.md); the most recently published version is recorded in the [release process](docs/RELEASE_PROCESS.md).
+Start with the [maintenance guide](docs/MAINTENANCE_GUIDE.md), then read only the selected [approved work item](docs/TODO.md) and its source references. [PROJECT_MEMORY.md](PROJECT_MEMORY.md) holds stable product/network boundaries; the [release process](docs/RELEASE_PROCESS.md) owns publication steps. The [change log](docs/FEATURE_CHANGELOG.md) records completed changes, not future work. T01-T29 implementation and acceptance status is tracked in the [work-item index](docs/TODO.md); the most recently published version is recorded in the [release process](docs/RELEASE_PROCESS.md).
 
-维护顺序：维护指南 → 待办索引 → 单个任务及相关代码。T01-T28 的实施与验收状态以[待办索引](docs/TODO.md)为准；发布步骤及远端发布证据以[发布流程](docs/RELEASE_PROCESS.md)为准。无需每次读取全部任务或历史日志。仅明确授权“发布/release”后才能提交、推送或发布。
+维护顺序：维护指南 → 待办索引 → 单个任务及相关代码。T01-T29 的实施与验收状态以[待办索引](docs/TODO.md)为准；发布步骤及远端发布证据以[发布流程](docs/RELEASE_PROCESS.md)为准。无需每次读取全部任务或历史日志。仅明确授权“发布/release”后才能提交、推送或发布。
 
 At startup, the application claims a system-wide mutex keyed by the normalized full data-directory path before it migrates legacy files, creates defaults, or reads recovery journals. The owner keeps the mutex through asynchronous exit cleanup. A second process shows a bilingual notice and exits without changing shared files; an abnormal exit releases the mutex so a later run can inspect the preserved recovery data.
 
@@ -32,7 +32,7 @@ Every application action button has a small, visible-by-default round `?` help i
 
 ## Version Check
 
-The application displays its running version when it starts. It checks the public [Gitee releases](https://gitee.com/joel20230302/NetBootDhcpTool/releases) and the GitHub `latest.json` manifest, selecting the newest validated release. When an update is available, it probes up to 64 KB from each available mirror, prioritizes the faster source, and shows the results beside the update link and in its tooltip. Confirming the update downloads the archive in the background to Downloads, displaying the live speed and source. The toolbar can cancel an active download; a failed or idle source automatically falls back to the other mirror. SHA-256 is checked before replacing a destination. The app never installs automatically. If speed remains below 3 KB/s for 10 seconds, the app only displays `1406829360@qq.com`.
+The application displays its running version when it starts. It checks the public [Gitee releases](https://gitee.com/joel20230302/NetBootDhcpTool/releases) and the GitHub `latest.json` manifest, selecting the newest validated release. When an update is available, it probes up to 64 KB from each available mirror, prioritizes the faster source, and shows the results beside the update link and in its tooltip. For a signed release, the app downloads a Full package or an exact-baseline OTA package into `%LOCALAPPDATA%\NetBootDhcpTool\updates\staging`, verifies the release signature, package hash, installation inventory and every managed file, then shows **Restart to upgrade**. The separate updater waits for normal app shutdown, applies the transaction, verifies the installed files and starts the new version; a failed start restores the previous managed files. Existing unsigned manifests remain available as manual `.7z` downloads and never enable automatic installation. Downloads can be canceled, and a failed or idle mirror falls back to the other approved source. If speed remains below 3 KB/s for 10 seconds, the app only displays `1406829360@qq.com`.
 
 ## Build
 
@@ -48,7 +48,7 @@ For development and change-specific validation, follow the [standard maintenance
 
 For local packaging and GitHub/Gitee distribution, follow the single [release process](docs/RELEASE_PROCESS.md).
 
-The portable output is `release\NetBootDhcpTool`. Copy this folder to another Windows x64 computer and run `NetBootDhcpTool.exe`.
+The portable archive contains one top-level `NetBootDhcpTool` folder with no version number in its name. Extract it, then move that folder to any writable path on a Windows x64 computer and run `NetBootDhcpTool.exe` inside it. Local packaging writes to a new `release\local-build-*` directory so existing release files are preserved.
 
 For maintenance, packaging, and release standards, see `docs\MAINTENANCE_GUIDE.md` and `docs\RELEASE_PROCESS.md`.
 

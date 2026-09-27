@@ -1,5 +1,27 @@
 # Release Notes
 
+## v1.0.19
+
+### zh-CN / 简体中文
+
+NetBoot DHCP Tool v1.0.19 增加固定名称的便携目录，并支持带签名校验的 Full/OTA 自动升级。
+
+- 解压便携包后，可直接将 `NetBootDhcpTool` 文件夹移动到目标路径。
+- 更新包下载并校验完成后，可点击“重启升级”。独立更新器会等待程序正常退出，再替换受管文件、校验文件并启动新版；应用失败时可恢复旧文件。
+- 用户数据继续保存在 `%LOCALAPPDATA%\NetBootDhcpTool`；安装目录中不归更新器管理的文件会保留。
+- 更新弹窗根据保存的 `Language` 设置选择中文或英文说明；`auto` 跟随系统 UI 语言。
+- 旧版客户端仍可手动下载 `.7z` 便携包。
+
+### en-US / English
+
+NetBoot DHCP Tool v1.0.19 adds a fixed-name portable folder and signed Full/OTA automatic upgrades.
+
+- Extract the portable archive and move the `NetBootDhcpTool` folder directly to the desired location.
+- After an update package is downloaded and verified, select **Restart to upgrade**. A separate updater waits for normal application shutdown, replaces and verifies managed files, then starts the new version. It can restore the previous files if applying the update fails.
+- User data remains under `%LOCALAPPDATA%\NetBootDhcpTool`; files in the installation directory that are not managed by the updater are preserved.
+- The update dialog selects the matching language from the saved `Language` setting; `auto` follows the system UI language.
+- Legacy clients can continue to download the `.7z` portable archive manually.
+
 ## v1.0.18
 
 NetBoot DHCP Tool v1.0.18 fixes Gitee-only update discovery for clients that receive canonical Release download URLs from Gitee's metadata API.

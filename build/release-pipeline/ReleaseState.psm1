@@ -130,6 +130,40 @@ function Get-ReleaseBundle {
         throw "Release latest.json does not match the local archive for $Tag."
     }
 
+    $packageAssets = [System.Collections.Generic.List[object]]::new()
+    $fullCount = 0
+    foreach ($package in @($manifest.packages)) {
+        if ([string]$package.sha256 -notmatch '^[a-fA-F0-9]{64}$' -or [long]$package.size -le 0) {
+            throw 'Release package metadata has an invalid size or SHA-256.'
+        }
+        if ($package.kind -ceq 'Full') {
+            $fullCount++
+            $expectedName = "NetBootDhcpTool-full-v$version.zip"
+        } elseif ($package.kind -ceq 'Ota') {
+            if ([string]$package.baseVersion -notmatch '^\d+\.\d+\.\d+$' -or [version]$package.baseVersion -ge [version]$version) {
+                throw 'Release OTA metadata has an invalid base version.'
+            }
+            $expectedName = "NetBootDhcpTool-ota-v$($package.baseVersion)-to-v$version.zip"
+        } else { throw 'Release package kind must be Full or Ota.' }
+        if ([string]$package.fileName -cne $expectedName) { throw "Unexpected update package filename: $($package.fileName)." }
+        $packagePath = Join-Path $Directory $expectedName
+        $packageSidecar = "$packagePath.sha256"
+        if (-not (Test-Path -LiteralPath $packagePath -PathType Leaf) -or -not (Test-Path -LiteralPath $packageSidecar -PathType Leaf)) {
+            throw "Release bundle is incomplete; missing $expectedName or its checksum sidecar."
+        }
+        $actualHash = Get-ReleaseFileSha256 $packagePath
+        $sidecarParts = (Get-Content -LiteralPath $packageSidecar -Raw).Trim() -split '\s+', 2
+        if ($actualHash -cne ([string]$package.sha256).ToLowerInvariant() -or
+            [long](Get-Item -LiteralPath $packagePath).Length -ne [long]$package.size -or
+            $sidecarParts.Count -ne 2 -or $sidecarParts[0].ToLowerInvariant() -cne $actualHash -or $sidecarParts[1] -cne $expectedName) {
+            throw "Update package metadata, sidecar and bytes disagree for $expectedName."
+        }
+        $packageAssets.Add([ordered]@{ Kind=[string]$package.kind;Name=$expectedName;Path=$packagePath;ChecksumPath=$packageSidecar;Sha256=$actualHash;Size=[long]$package.size;Metadata=$package })
+    }
+    if ($fullCount -ne 1) { throw 'Every release bundle must contain exactly one Full update package.' }
+    $packageNames = @($packageAssets | ForEach-Object Name)
+    if ($packageNames | Group-Object | Where-Object Count -gt 1) { throw 'Release bundle contains duplicate update package names.' }
+
     return [ordered]@{
         Tag = $Tag
         Version = $version
@@ -139,6 +173,8 @@ function Get-ReleaseBundle {
         ManifestPath = $manifestPath
         ArchiveSha256 = $archiveHash
         ArchiveSize = [long](Get-Item -LiteralPath $archivePath).Length
+        PackageAssets = @($packageAssets)
+        AssetFiles = @($archivePath, $checksumPath) + @($packageAssets | ForEach-Object { $_.Path; $_.ChecksumPath })
         Manifest = $manifest
     }
 }
@@ -255,6 +291,7 @@ function New-DualSourceManifest {
         [Parameter(Mandatory)][string]$GitHubRepository,
         [Parameter(Mandatory)][string]$GiteeReleasePageUrl,
         [Parameter(Mandatory)][string]$GiteeArchiveDownloadUrl,
+        [System.Collections.IDictionary]$GiteeAssetUrls = @{},
         [Parameter(Mandatory)][string]$OutputPath
     )
 
@@ -268,6 +305,18 @@ function New-DualSourceManifest {
     $manifest.downloadUrl = $GiteeArchiveDownloadUrl
     $manifest.downloadMirrors = @($githubArchiveUrl)
     $manifest.releasePageUrl = $GiteeReleasePageUrl
+    foreach ($package in @($manifest.packages)) {
+        $githubPackageUrl = "https://github.com/$GitHubRepository/releases/download/$Tag/$($package.fileName)"
+        if ($GiteeAssetUrls.Contains([string]$package.fileName) -and -not [string]::IsNullOrWhiteSpace([string]$GiteeAssetUrls[[string]$package.fileName])) {
+            $package.downloadUrl = [string]$GiteeAssetUrls[[string]$package.fileName]
+        } else {
+            $package.downloadUrl = [string]$GiteeAssetUrls[[string]$package.fileName]
+        }
+        if ([string]::IsNullOrWhiteSpace([string]$package.downloadUrl)) {
+            throw "Gitee attachment URL is missing for update package $($package.fileName)."
+        }
+        $package.downloadMirrors = @($githubPackageUrl)
+    }
     $json = ConvertTo-Json -InputObject $manifest -Depth 12
     $directory = Split-Path -Parent $OutputPath
     New-Item -ItemType Directory -Path $directory -Force | Out-Null

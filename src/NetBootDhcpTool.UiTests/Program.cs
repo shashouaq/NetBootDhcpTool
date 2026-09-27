@@ -864,6 +864,39 @@ internal static class Program
                     || !updateConfirmationMessage.Contains("click Cancel at any time", StringComparison.Ordinal))
                     throw new InvalidOperationException("the update confirmation did not explain the mirror selection and how to cancel the download");
 
+                var restartUpgradeButton = (Button)window.FindName("BtnRestartUpgrade")!;
+                if (restartUpgradeButton.Visibility != Visibility.Collapsed)
+                    throw new InvalidOperationException("the restart-upgrade button was visible before a package passed verification");
+                var readyPackage = new UpdateDownloadResult
+                {
+                    FilePath = Path.Combine(dataDirectory, "verified-full.zip"),
+                    Sha256 = new string('b', 64),
+                    DownloadUrl = githubArchiveUrl,
+                    ReadyToInstall = true,
+                    Package = new UpdatePackageMetadata { Kind = "Full", FileName = "NetBootDhcpTool-full-v1.0.15.zip" },
+                    SignedManifestJson = "{}",
+                    ManifestSignature = "synthetic"
+                };
+                var currentUiUpdateState = (UpdateControllerState)window.GetType().GetField("_updateState", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(window)!;
+                var readyState = currentUiUpdateState with
+                {
+                    Revision = currentUiUpdateState.Revision + 1,
+                    DownloadInProgress = false,
+                    PackageVerificationInProgress = false,
+                    DownloadedResult = readyPackage,
+                    DownloadError = null
+                };
+                window.ApplyUpdateControllerState(readyState);
+                if (restartUpgradeButton.Visibility != Visibility.Visible)
+                    throw new InvalidOperationException("a verified Full package did not expose the restart-upgrade button");
+                window.ApplyUpdateControllerState(readyState with
+                {
+                    Revision = readyState.Revision + 1,
+                    DownloadedResult = new UpdateDownloadResult { FilePath = Path.Combine(dataDirectory, "legacy.7z"), Sha256 = new string('c', 64) }
+                });
+                if (restartUpgradeButton.Visibility != Visibility.Collapsed)
+                    throw new InvalidOperationException("a legacy manual archive exposed the restart-upgrade button");
+
                 manualAdapterRefreshRunning = true;
                 try { await ValidateManualAdapterRefreshCompletenessAsync(window, uiLogger); }
                 finally { manualAdapterRefreshRunning = false; }

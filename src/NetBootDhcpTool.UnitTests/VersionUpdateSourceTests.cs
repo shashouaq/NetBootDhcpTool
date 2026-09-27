@@ -80,7 +80,7 @@ public sealed class VersionUpdateSourceTests
         Assert.IsTrue(result.Succeeded, result.Error);
         Assert.IsFalse(result.IsNewVersion);
         Assert.AreEqual(0, result.DownloadSpeeds.Count);
-        Assert.AreEqual(4, requests.Count);
+        Assert.AreEqual(5, requests.Count);
         Assert.AreEqual(0, requests.Count(request => request.Headers.Range != null));
     }
 
@@ -221,8 +221,8 @@ public sealed class VersionUpdateSourceTests
 
         Assert.IsTrue(result.Succeeded, result.Error);
         Assert.IsFalse(result.IsNewVersion);
-        Assert.AreEqual(VersionUpdateService.DefaultManifestUrl, requests.Last());
-        Assert.AreEqual(2, requests.Count);
+        Assert.AreEqual(VersionUpdateService.DefaultManifestUrl + ".sig", requests.Last());
+        Assert.AreEqual(3, requests.Count);
     }
 
     private static string Manifest(string version) => $$"""
