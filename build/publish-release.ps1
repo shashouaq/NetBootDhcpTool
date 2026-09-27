@@ -507,8 +507,11 @@ function Upload-GiteeAsset {
             if (-not $rejected -or $attempt -eq 4) { break }
             $retryAfter = ''
             if (Test-Path -LiteralPath "$responsePath.headers") {
-                $retryMatch = [regex]::Match((Get-Content -LiteralPath "$responsePath.headers" -Raw), '(?im)^Retry-After:\s*([^\r\n]+)')
-                if ($retryMatch.Success) { $retryAfter = $retryMatch.Groups[1].Value }
+                $headerText = Get-Content -LiteralPath "$responsePath.headers" -Raw
+                if (-not [string]::IsNullOrEmpty($headerText)) {
+                    $retryMatch = [regex]::Match($headerText, '(?im)^Retry-After:\s*([^\r\n]+)')
+                    if ($retryMatch.Success) { $retryAfter = $retryMatch.Groups[1].Value }
+                }
             }
             $delay = Get-ReleaseRetryDelay -Attempt $attempt -RetryAfter $retryAfter
             if ($delay -gt 60) { throw "Gitee upload Retry-After for $Name exceeds this run's retry budget." }

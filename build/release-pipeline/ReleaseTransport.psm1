@@ -77,8 +77,11 @@ function Invoke-ReleaseDownload {
             }
             $retryAfter = ''
             if (Test-Path -LiteralPath $headersPath) {
-                $matches = @([regex]::Matches((Get-Content -LiteralPath $headersPath -Raw), '(?im)^Retry-After:\s*([^\r\n]+)'))
-                if ($matches.Count -gt 0) { $retryAfter = $matches[-1].Groups[1].Value }
+                $headerText = Get-Content -LiteralPath $headersPath -Raw
+                if (-not [string]::IsNullOrEmpty($headerText)) {
+                    $headerMatches = @([regex]::Matches($headerText, '(?im)^Retry-After:\s*([^\r\n]+)'))
+                    if ($headerMatches.Count -gt 0) { $retryAfter = $headerMatches[-1].Groups[1].Value }
+                }
             }
             $delay = Get-ReleaseRetryDelay -Attempt $attempt -RetryAfter $retryAfter
             if ($delay -gt 60) { throw "Download rate limit for $AssetName exceeds this run's retry budget." }

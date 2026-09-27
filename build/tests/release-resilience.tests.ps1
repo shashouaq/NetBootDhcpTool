@@ -41,6 +41,25 @@ $transport = Get-Module ReleaseTransport
     function script:Invoke-WebRequest { return @{StatusCode=429;Headers=@{'Retry-After'='600'};Content='limited'} }
     try { $null = Invoke-ReleaseHttp -Uri 'https://gitee.com/api/test'; throw 'unexpected success' }
     catch { if ($_.Exception.Message -notmatch 'retry budget') { throw } }
+    # curl can create an empty header file when DNS/TLS fails before any response.
+    # PowerShell Get-Content -Raw then returns null; retry parsing must accept it.
+    $script:attempts=0
+    function script:Get-Command { return @{Source='Invoke-FakeCurl'} }
+    function script:Invoke-FakeCurl {
+        $script:attempts++
+        $headerIndex=[array]::IndexOf($args,'--dump-header')
+        [IO.File]::WriteAllText($args[$headerIndex+1], '')
+        if ($script:attempts -eq 1) { $global:LASTEXITCODE=28; return 'http=000' }
+        $outputIndex=[array]::IndexOf($args,'--output')
+        [IO.File]::WriteAllText($args[$outputIndex+1], 'complete bytes')
+        $global:LASTEXITCODE=0
+        return 'http=200'
+    }
+    $download=Join-Path $env:TEMP ('netboot-empty-header-' + [guid]::NewGuid().ToString('N'))
+    try {
+        Invoke-ReleaseDownload -Uri 'https://gitee.com/download/file' -Destination $download -AssetName file
+        if ($script:attempts -ne 2 -or (Get-Content -LiteralPath $download -Raw) -cne 'complete bytes') { throw 'Empty-header timeout did not recover.' }
+    } finally { Remove-Item -LiteralPath $download, "$download.headers" -Force -ErrorAction SilentlyContinue }
 }
 Import-Module (Join-Path $repoRoot 'build/release-pipeline/ReleaseTransport.psm1') -Force
 
