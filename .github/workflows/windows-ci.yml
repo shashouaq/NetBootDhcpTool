@@ -24,7 +24,15 @@ jobs:
         run: .\build\verify-maintenance.ps1
       - name: Test idempotent release pipeline helpers
         shell: pwsh
-        run: .\build\tests\release-pipeline.tests.ps1
+        run: |
+          try {
+            .\build\tests\release-pipeline.tests.ps1
+          } catch {
+            $message = ($_.Exception.Message -replace '[\r\n]+', ' ').Trim()
+            $position = ($_.InvocationInfo.PositionMessage -replace '[\r\n]+', ' ').Trim()
+            Write-Output "::error title=Release pipeline test failure::$message $position"
+            throw
+          }
       - name: Build the actual-client manifest gate
         run: dotnet build .\build\release-pipeline\ClientManifestCheck.csproj -c Release
       - name: Build
