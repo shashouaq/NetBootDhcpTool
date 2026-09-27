@@ -276,4 +276,26 @@ function New-DualSourceManifest {
     return $manifest
 }
 
-Export-ModuleMember -Function Get-ReleaseVersionFromTag, Get-ReleaseArchiveName, Test-SuccessfulMainWindowsCiRun, New-GiteeReleasePayload, Get-ReleaseFileSha256, Assert-SafeGiteeDownloadUrl, Get-ReleaseBundle, New-ReleaseState, Save-ReleaseState, Read-ReleaseState, Assert-ReleaseCachePolicy, Save-GiteeAttachmentCheckpoint, New-DualSourceManifest
+function Assert-ManifestUrlRepair {
+    param(
+        [string]$OldPath, [string]$NewPath, [string]$ExpectedOldSha256,
+        [string]$Tag, [string]$GiteeOwner, [string]$GiteeRepository, [long]$ArchiveAttachmentId
+    )
+    if ((Get-ReleaseFileSha256 $OldPath) -cne $ExpectedOldSha256.ToLowerInvariant()) { throw 'Manifest repair old SHA-256 does not match the reviewed value.' }
+    $old = Get-Content -LiteralPath $OldPath -Raw | ConvertFrom-Json -AsHashtable
+    $new = Get-Content -LiteralPath $NewPath -Raw | ConvertFrom-Json -AsHashtable
+    $archiveName = Get-ReleaseArchiveName $Tag
+    if ($old.version -cne (Get-ReleaseVersionFromTag $Tag) -or $old.archiveName -cne $archiveName -or $ArchiveAttachmentId -le 0 -or
+        $old.downloadUrl -cne "https://gitee.com/$GiteeOwner/$GiteeRepository/releases/download/$Tag/$archiveName" -or
+        $new.downloadUrl -cne "https://gitee.com/$GiteeOwner/$GiteeRepository/attach_files/$ArchiveAttachmentId/download") {
+        throw 'Manifest repair only permits the reviewed Gitee client URL alias migration for the same tag and attachment.'
+    }
+    foreach ($key in @(@($old.Keys) + @($new.Keys) | Select-Object -Unique)) {
+        if ($key -ceq 'downloadUrl') { continue }
+        if ((ConvertTo-Json -InputObject $old[$key] -Depth 12 -Compress) -cne (ConvertTo-Json -InputObject $new[$key] -Depth 12 -Compress)) {
+            throw "Manifest repair may not change $key; archive identity, mirrors and release metadata are immutable."
+        }
+    }
+}
+
+Export-ModuleMember -Function Get-ReleaseVersionFromTag, Get-ReleaseArchiveName, Test-SuccessfulMainWindowsCiRun, New-GiteeReleasePayload, Get-ReleaseFileSha256, Assert-SafeGiteeDownloadUrl, Get-ReleaseBundle, New-ReleaseState, Save-ReleaseState, Read-ReleaseState, Assert-ReleaseCachePolicy, Save-GiteeAttachmentCheckpoint, New-DualSourceManifest, Assert-ManifestUrlRepair

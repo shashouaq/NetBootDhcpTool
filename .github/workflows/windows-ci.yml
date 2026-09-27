@@ -25,6 +25,8 @@ jobs:
       - name: Test idempotent release pipeline helpers
         shell: pwsh
         run: .\build\tests\release-pipeline.tests.ps1
+      - name: Build the actual-client manifest gate
+        run: dotnet build .\build\release-pipeline\ClientManifestCheck.csproj -c Release
       - name: Build
         run: dotnet build .\NetBootDhcpTool.sln -c Release --no-restore
       - name: Run unit tests

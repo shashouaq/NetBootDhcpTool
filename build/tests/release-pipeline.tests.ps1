@@ -174,7 +174,7 @@ try {
         }
     }
     $archivesReady = $publisher.IndexOf('Ensure-GiteeAsset -LocalPath $bundle.ArchivePath', [System.StringComparison]::Ordinal)
-    $manifestPublished = $publisher.IndexOf("Ensure-GiteeAsset -LocalPath `$finalManifestPath", [System.StringComparison]::Ordinal)
+    $manifestPublished = $publisher.LastIndexOf("Ensure-GiteeAsset -LocalPath `$finalManifestPath", [System.StringComparison]::Ordinal)
     $releasePromoted = $publisher.IndexOf('$giteeRelease = Publish-GiteeRelease', [System.StringComparison]::Ordinal)
     if ($archivesReady -lt 0 -or $manifestPublished -lt $archivesReady -or $releasePromoted -lt $manifestPublished) {
         throw 'Stable Release promotion must follow archive and latest.json remote verification.'
@@ -191,8 +191,8 @@ try {
             throw "Both remote archive and sidecar verification must precede latest.json publication: $operation"
         }
     }
-    $githubManifestUpload = $publisher.IndexOf('Ensure-GitHubAsset -LocalPath $finalManifestPath', [System.StringComparison]::Ordinal)
-    $githubManifestReadback = $publisher.IndexOf('$githubManifestPath = Download-GitHubAsset ''latest.json''', [System.StringComparison]::Ordinal)
+    $githubManifestUpload = $publisher.LastIndexOf('Ensure-GitHubAsset -LocalPath $finalManifestPath', [System.StringComparison]::Ordinal)
+    $githubManifestReadback = $publisher.IndexOf('$script:verifiedAssets["$mirror/latest.json"]', [System.StringComparison]::Ordinal)
     $githubPromotion = $publisher.IndexOf('$githubRelease = Publish-GitHubRelease', [System.StringComparison]::Ordinal)
     $giteePromotion = $publisher.IndexOf('$giteeRelease = Publish-GiteeRelease', [System.StringComparison]::Ordinal)
     if ($githubManifestUpload -lt $manifestPublished -or
@@ -212,6 +212,8 @@ try {
     }
     if (Test-Path -LiteralPath (Join-Path $repoRoot '.github\workflows\gitee-release-sync.yml')) { throw 'The old GitHub-hosted large-file sync workflow must be removed.' }
     if (Test-Path -LiteralPath (Join-Path $repoRoot 'build\sync-gitee-release.ps1')) { throw 'The old GitHub-download-to-Gitee publisher must be removed.' }
+
+    & (Join-Path $PSScriptRoot 'release-resilience.tests.ps1')
 
     Write-Output 'RELEASE_PIPELINE_TESTS_OK'
 } finally {

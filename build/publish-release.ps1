@@ -5,12 +5,56 @@ param(
     [Parameter(Mandatory)][string]$StateRoot,
     [string]$GitHubRepository = $env:GITHUB_REPOSITORY,
     [string]$GiteeOwner = 'joel20230302',
-    [string]$GiteeRepository = 'NetBootDhcpTool'
+    [string]$GiteeRepository = 'NetBootDhcpTool',
+    [AllowEmptyString()][string]$RepairManifestSha256 = ''
 )
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 Import-Module (Join-Path $PSScriptRoot 'release-pipeline\ReleaseState.psm1') -Force
+Import-Module (Join-Path $PSScriptRoot 'release-pipeline\ReleaseTransport.psm1') -Force
+$script:releaseWarnings = [System.Collections.Generic.List[string]]::new()
+$script:verifiedAssets = @{}
+$script:releaseStages = [ordered]@{}
+foreach ($stageName in @('Build', 'GitHub Publish', 'GitHub Verify', 'Gitee Publish', 'Gitee Verify', 'Manifest Publish', 'Final Verify')) {
+    $script:releaseStages[$stageName] = 'Not run'
+}
+
+function Add-ReleaseWarning([string]$Message) {
+    $script:releaseWarnings.Add($Message)
+    Write-Host "[Auxiliary] $Message"
+}
+
+function Start-ReleaseStage([string]$Name) {
+    if ($script:currentStage) {
+        $script:releaseStages[$script:currentStage] = 'Success'
+        Write-Host '::endgroup::'
+    }
+    $script:currentStage = $Name
+    $script:releaseStages[$Name] = 'Running'
+    Write-Host "::group::$Name"
+}
+
+function Write-ReleaseSummary([bool]$Succeeded) {
+    if ($script:currentStage) {
+        $script:releaseStages[$script:currentStage] = $(if ($Succeeded) { 'Success' } else { 'Failed' })
+        Write-Host '::endgroup::'
+    }
+    $lines = @("## Formal release $Tag", '', '| Stage | Result |', '| --- | --- |')
+    foreach ($entry in $script:releaseStages.GetEnumerator()) { $lines += "| $($entry.Key) | $($entry.Value) |" }
+    if ($Succeeded) {
+        foreach ($message in $script:releaseWarnings) {
+            $escaped = $message.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Host "::warning::$escaped"
+            $lines += "- Warning: $message"
+        }
+    }
+    if ($env:GITHUB_STEP_SUMMARY) {
+        try { Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ($lines -join "`n") -Encoding utf8 }
+        catch { Write-Warning 'Could not write the optional Actions summary; release validation result is unchanged.' }
+    }
+    Write-Host ($lines -join "`n")
+}
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $version = Get-ReleaseVersionFromTag $Tag
@@ -20,6 +64,7 @@ $projectPath = Join-Path $repoRoot 'src\NetBootDhcpTool.App\NetBootDhcpTool.App.
 $projectVersion = [string]$project.Project.PropertyGroup.Version
 if ($projectVersion -cne $version) { throw "Tag $Tag does not match application version $projectVersion." }
 if ($SourceCommit -notmatch '^[a-fA-F0-9]{40}$') { throw 'SourceCommit must be a full Git SHA.' }
+if ($RepairManifestSha256 -and $RepairManifestSha256 -notmatch '^[a-fA-F0-9]{64}$') { throw 'Manifest repair requires the exact old SHA-256.' }
 if ([string]::IsNullOrWhiteSpace($GitHubRepository) -or $GitHubRepository -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') {
     throw 'GitHubRepository must be in owner/repository form.'
 }
@@ -53,14 +98,20 @@ function Remove-OwnedTemporaryDirectory {
         -not ([System.IO.Path]::GetFileName($fullPath).StartsWith($RequiredNamePrefix, [System.StringComparison]::OrdinalIgnoreCase))) {
         throw "Refusing to remove a temporary directory outside its owned release state: $fullPath"
     }
-    Remove-Item -LiteralPath $fullPath -Recurse -Force
+    try { Remove-Item -LiteralPath $fullPath -Recurse -Force }
+    catch { Add-ReleaseWarning "Temporary readback cleanup failed for $([System.IO.Path]::GetFileName($fullPath))." }
 }
 
 function Invoke-GitChecked {
     param([Parameter(Mandatory)][string[]]$Arguments)
 
-    $output = & git @Arguments 2>&1 | Out-String
-    $exitCode = $LASTEXITCODE
+    for ($attempt = 1; $attempt -le 4; $attempt++) {
+        $output = & git @Arguments 2>&1 | Out-String
+        $exitCode = $LASTEXITCODE
+        if ($exitCode -eq 0 -or $Arguments[0] -notin @('fetch', 'push') -or $attempt -eq 4 -or -not (Test-GitHubTransientError $output)) { break }
+        Write-Host "[Retry] Git $($Arguments[0]) transport failed; retrying the same non-forced ref operation ($attempt/4)."
+        Start-Sleep -Seconds (Get-ReleaseRetryDelay -Attempt $attempt)
+    }
     if ($exitCode -ne 0) {
         throw "Git command failed (exit $exitCode): $($output.Trim())"
     }
@@ -73,12 +124,22 @@ function Invoke-Gh {
         [switch]$AllowFailure
     )
 
-    $output = & gh @Arguments 2>&1 | Out-String
-    $exitCode = $LASTEXITCODE
+    $retrySafe = $Arguments[0] -eq 'api' -or ($Arguments[0] -eq 'release' -and $Arguments[1] -in @('view', 'download', 'edit'))
+    for ($attempt = 1; $attempt -le 4; $attempt++) {
+        $output = & gh @Arguments 2>&1 | Out-String
+        $exitCode = $LASTEXITCODE
+        if ($exitCode -eq 0 -or -not $retrySafe -or $attempt -eq 4 -or -not (Test-GitHubTransientError $output)) { break }
+        Write-Host "[Retry] GitHub $($Arguments[0]) $($Arguments[1]) transient failure; attempt $attempt/4."
+        Start-Sleep -Seconds (Get-ReleaseRetryDelay -Attempt $attempt)
+    }
     if ($exitCode -ne 0 -and -not $AllowFailure) {
         throw "GitHub CLI command failed (exit $exitCode): $($output.Trim())"
     }
     return [pscustomobject]@{ ExitCode = $exitCode; Output = $output.Trim() }
+}
+
+function Test-GitHubTransientError([string]$Message) {
+    return $Message -match '(?i)(HTTP (408|429|500|502|503|504)|rate limit|timed? ?out|timeout|TLS|SSL|connection|wsarecv|EOF|no such host|temporar)'
 }
 
 function Get-GitHubRelease {
@@ -94,7 +155,10 @@ function Get-GitHubRelease {
 function Get-GitHubAsset([string]$Name) {
     $release = Get-GitHubRelease
     if ($null -eq $release) { return $null }
-    return @($release.assets | Where-Object { $_.name -ceq $Name } | Select-Object -First 1)[0]
+    $assets = @($release.assets | Where-Object { $_.name -ceq $Name })
+    if ($assets.Count -gt 1) { throw "GitHub has duplicate attachments named $Name." }
+    if ($assets.Count -eq 0) { return $null }
+    return $assets[0]
 }
 
 function Test-DownloadedAsset {
@@ -106,6 +170,9 @@ function Test-DownloadedAsset {
     )
 
     if (-not (Test-Path -LiteralPath $RemotePath -PathType Leaf)) { throw "Remote readback did not create $AssetName." }
+    if ((Get-Item -LiteralPath $RemotePath).Length -ne (Get-Item -LiteralPath $LocalPath).Length) {
+        throw "Remote readback size mismatch for $AssetName."
+    }
     if ((Get-ReleaseFileSha256 $RemotePath) -ne (Get-ReleaseFileSha256 $LocalPath)) {
         throw "Remote readback SHA-256 mismatch for $AssetName."
     }
@@ -130,7 +197,7 @@ function Assert-ReleaseAssetFileName {
 
 function Download-GitHubAsset([string]$Name, [string]$DestinationDirectory) {
     New-Item -ItemType Directory -Path $DestinationDirectory -Force | Out-Null
-    $result = Invoke-Gh -Arguments @('release', 'download', $Tag, '--repo', $GitHubRepository, '--pattern', $Name, '--dir', $DestinationDirectory)
+    $result = Invoke-Gh -Arguments @('release', 'download', $Tag, '--repo', $GitHubRepository, '--pattern', $Name, '--dir', $DestinationDirectory, '--clobber')
     $path = Join-Path $DestinationDirectory $Name
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "GitHub download did not create $Name." }
     return $path
@@ -151,15 +218,24 @@ function Ensure-GitHubAsset {
         }
         Write-Host "[GitHub] Reusing existing $Name after full download and SHA-256 verification."
     } else {
-        $upload = Invoke-Gh -Arguments @('release', 'upload', $Tag, $LocalPath, '--repo', $GitHubRepository) -AllowFailure
-        if ($upload.ExitCode -ne 0) {
-            # The server may have stored the asset even when the upload response was lost.
+        for ($attempt = 1; $attempt -le 4; $attempt++) {
+            $upload = Invoke-Gh -Arguments @('release', 'upload', $Tag, $LocalPath, '--repo', $GitHubRepository) -AllowFailure
+            if ($upload.ExitCode -eq 0) { break }
+            # GitHub enforces unique asset names. Reconcile after every interrupted
+            # request; never use --clobber for an upload or overwrite different bytes.
+            Start-Sleep -Seconds (Get-ReleaseRetryDelay -Attempt $attempt)
             $asset = Get-GitHubAsset $Name
-            if ($null -eq $asset) { throw "GitHub upload failed for $Name; no matching asset is visible. $($upload.Output)" }
-            Write-Host "[GitHub] Upload response failed, but $Name is present; verifying it before continuing."
-            if ([long]$asset.size -ne [long](Get-Item -LiteralPath $LocalPath).Length) {
-                throw "GitHub upload outcome is ambiguous and $Name has a different size; refusing another upload."
+            if ($null -ne $asset) {
+                if ([long]$asset.size -ne [long](Get-Item -LiteralPath $LocalPath).Length) {
+                    throw "GitHub upload outcome for $Name has a different size; refusing another upload."
+                }
+                Add-ReleaseWarning "GitHub upload response for $Name was interrupted; recovered the stored asset without repeating the upload."
+                break
             }
+            if ($attempt -eq 4 -or -not (Test-GitHubTransientError $upload.Output)) {
+                throw "GitHub upload failed for $Name after $attempt attempt(s); no matching asset is visible. $($upload.Output)"
+            }
+            Write-Host "[Retry] GitHub confirmed $Name absent; retrying the same immutable filename ($attempt/4)."
         }
     }
 
@@ -167,6 +243,7 @@ function Ensure-GitHubAsset {
     try {
         $remotePath = Download-GitHubAsset $Name $readbackDirectory
         Test-DownloadedAsset -RemotePath $remotePath -LocalPath $LocalPath -AssetName $Name -ArchiveSha256 $ArchiveSha256
+        $script:verifiedAssets["GitHub/$Name"] = Get-ReleaseFileSha256 $remotePath
         Write-Host "[GitHub] Verified $Name ($((Get-Item -LiteralPath $remotePath).Length) bytes)."
     } finally {
         Remove-OwnedTemporaryDirectory -Path $readbackDirectory -ExpectedParent $stateDirectory -RequiredNamePrefix 'github-readback-'
@@ -199,15 +276,14 @@ function Invoke-GiteeJsonRequest {
     )
 
     $jsonBody = ConvertTo-Json -InputObject $Payload -Depth 8 -Compress
-    return Invoke-WebRequest -Uri (Assert-SafeGiteeDownloadUrl $Uri) -Method $Method -Headers (Get-GiteeHeaders) `
-        -ContentType 'application/json; charset=utf-8' -Body $jsonBody -SkipHttpErrorCheck -TimeoutSec 30
+    return Invoke-ReleaseHttp -Uri (Assert-SafeGiteeDownloadUrl $Uri) -Method $Method -Headers (Get-GiteeHeaders) `
+        -ContentType 'application/json; charset=utf-8' -Body $jsonBody
 }
 
 function Get-GiteeReleaseByTag {
     $encodedTag = [uri]::EscapeDataString($Tag)
     $uri = "https://gitee.com/api/v5/repos/$GiteeOwner/$GiteeRepository/releases/tags/$encodedTag"
-    try { $response = Invoke-WebRequest -Uri (Assert-SafeGiteeDownloadUrl $uri) -Method Get -Headers (Get-GiteeHeaders) -SkipHttpErrorCheck -TimeoutSec 30 }
-    catch { throw 'Gitee Release lookup failed before any asset upload.' }
+    $response = Invoke-ReleaseHttp -Uri (Assert-SafeGiteeDownloadUrl $uri) -Headers (Get-GiteeHeaders)
     if ($response.StatusCode -eq 404) { return $null }
     if ($response.StatusCode -ne 200) { throw "Gitee Release lookup returned HTTP $($response.StatusCode)." }
     if ([string]::IsNullOrWhiteSpace($response.Content)) { throw 'Gitee Release lookup returned an empty response.' }
@@ -227,14 +303,19 @@ function Ensure-GiteeRelease {
             -Body ([string]$BaseManifest.releaseNotes) -TargetCommit $mainCommit
         try {
             $created = Invoke-GiteeJsonRequest -Uri "https://gitee.com/api/v5/repos/$GiteeOwner/$GiteeRepository/releases" -Method Post -Payload $payload
-        } catch { throw 'Gitee Release creation failed; rerunning this tag is safe.' }
-        if ($created.StatusCode -notin @(200, 201)) {
-            $errorSummary = Get-GiteeResponseErrorSummary $created
-            throw "Gitee Release creation returned HTTP $($created.StatusCode)$errorSummary."
+        } catch { $created = $null }
+        if ($null -eq $created -or $created.StatusCode -notin @(200, 201)) {
+            $release = Get-GiteeReleaseByTag
+            if ($null -eq $release) {
+                $status = if ($null -eq $created) { 'transport failure' } else { "HTTP $($created.StatusCode)$(Get-GiteeResponseErrorSummary $created)" }
+                throw "Gitee Release creation failed ($status); no Release was confirmed."
+            }
+            Add-ReleaseWarning 'Gitee Release creation response failed; the same tag was recovered before uploading.'
+        } else {
+            try { $release = $created.Content | ConvertFrom-Json -AsHashtable -ErrorAction Stop }
+            catch { throw 'Gitee Release creation returned invalid JSON; rerun will reconcile the tag.' }
         }
-        try { $release = $created.Content | ConvertFrom-Json -AsHashtable -ErrorAction Stop }
-        catch { throw 'Gitee Release creation returned invalid JSON.' }
-        $createdByPipeline = $true
+        $createdByPipeline = $null -ne $created -and $created.StatusCode -in @(200, 201)
         Write-Host "[Gitee] Created Release $Tag."
     }
 
@@ -262,7 +343,7 @@ function Ensure-GiteeRelease {
             $errorSummary = Get-GiteeResponseErrorSummary $update
             throw "Gitee Release metadata update returned HTTP $($update.StatusCode)$errorSummary."
         }
-        $release = Get-GiteeReleaseByTag
+        $release = $update.Content | ConvertFrom-Json -AsHashtable -ErrorAction Stop
         if ($null -eq $release -or [long]$release.id -ne $releaseId) { throw 'Gitee Release metadata readback did not resolve to the same Release ID.' }
     }
     return $release
@@ -272,7 +353,7 @@ function Get-GiteeAttachmentById {
     param([Parameter(Mandatory)][long]$ReleaseId, [Parameter(Mandatory)][long]$AttachmentId)
 
     $uri = "https://gitee.com/api/v5/repos/$GiteeOwner/$GiteeRepository/releases/$ReleaseId/attach_files/$AttachmentId"
-    try { $response = Invoke-WebRequest -Uri $uri -Method Get -Headers (Get-GiteeHeaders) -SkipHttpErrorCheck -TimeoutSec 30 }
+    try { $response = Invoke-ReleaseHttp -Uri $uri -Headers (Get-GiteeHeaders) -MaximumAttempts 2 -TimeoutSec 15 }
     catch { return [pscustomobject]@{ Available = $false; Attachment = $null; StatusCode = 0 } }
     if ($response.StatusCode -eq 404) { return [pscustomobject]@{ Available = $true; Attachment = $null; StatusCode = 404 } }
     if ($response.StatusCode -ne 200) { return [pscustomobject]@{ Available = $false; Attachment = $null; StatusCode = [int]$response.StatusCode } }
@@ -286,12 +367,18 @@ function Get-GiteeAttachmentById {
 }
 
 function Get-GiteeAttachments {
-    $uri = "https://gitee.com/api/v5/repos/$GiteeOwner/$GiteeRepository/releases/$($script:releaseState.giteeReleaseId)/attach_files?page=1&per_page=100"
-    try { $response = Invoke-WebRequest -Uri $uri -Method Get -Headers (Get-GiteeHeaders) -SkipHttpErrorCheck -TimeoutSec 60 }
-    catch { throw 'Gitee attachment-list recovery request failed.' }
-    if ($response.StatusCode -ne 200) { throw "Gitee attachment-list recovery returned HTTP $($response.StatusCode)." }
-    try { return @($response.Content | ConvertFrom-Json -AsHashtable -ErrorAction Stop) }
-    catch { throw 'Gitee attachment-list recovery returned invalid JSON.' }
+    $all = @()
+    for ($page = 1; $page -le 10; $page++) {
+        $uri = "https://gitee.com/api/v5/repos/$GiteeOwner/$GiteeRepository/releases/$($script:releaseState.giteeReleaseId)/attach_files?page=$page&per_page=100"
+        $response = Invoke-ReleaseHttp -Uri $uri -Headers (Get-GiteeHeaders)
+        if ($response.StatusCode -ne 200) { throw "Gitee attachment-list recovery returned HTTP $($response.StatusCode)." }
+        if (-not ([string]$response.Content).TrimStart().StartsWith('[')) { throw 'Gitee attachment-list recovery did not return an array.' }
+        try { $items = @($response.Content | ConvertFrom-Json -AsHashtable -ErrorAction Stop) }
+        catch { throw 'Gitee attachment-list recovery returned invalid JSON.' }
+        $all += $items
+        if ($items.Count -lt 100) { return $all }
+    }
+    throw 'Gitee attachment-list recovery exceeded its pagination bound; absence cannot be established.'
 }
 
 function Invoke-CurlDownload {
@@ -302,11 +389,7 @@ function Invoke-CurlDownload {
     )
 
     $safeUri = Assert-SafeGiteeDownloadUrl $Uri
-    $curl = (Get-Command curl.exe -ErrorAction Stop).Source
-    $stats = & $curl --silent --show-error --location --connect-timeout 20 --max-time 600 --fail-with-body --output $Destination --write-out 'http=%{http_code} bytes=%{size_download}' $safeUri 2>&1 | Out-String
-    $exitCode = $LASTEXITCODE
-    if ($exitCode -ne 0) { throw "Gitee download failed for $AssetName (curl exit $exitCode): $($stats.Trim())" }
-    if (-not (Test-Path -LiteralPath $Destination -PathType Leaf)) { throw "Gitee download did not create $AssetName." }
+    Invoke-ReleaseDownload -Uri $safeUri -Destination $Destination -AssetName $AssetName
 }
 
 function Get-GiteeAssetReadback {
@@ -320,12 +403,15 @@ function Get-GiteeAssetReadback {
     $destination = Join-Path $stateDirectory ("gitee-readback-" + [guid]::NewGuid().ToString('N'))
     $downloadUri = "https://gitee.com/api/v5/repos/$GiteeOwner/$GiteeRepository/releases/$ReleaseId/attach_files/$AttachmentId/download"
     try {
-        try { Invoke-CurlDownload -Uri $downloadUri -Destination $destination -AssetName $AssetName }
+        # The upload response/checkpoint URL is also the URL clients use. Verify
+        # those exact public bytes first; a second metadata/list call is unnecessary.
+        $primaryUri = if ([string]::IsNullOrWhiteSpace($FallbackUrl)) { $downloadUri } else { $FallbackUrl }
+        try { Invoke-CurlDownload -Uri $primaryUri -Destination $destination -AssetName $AssetName }
         catch {
             if ([string]::IsNullOrWhiteSpace($FallbackUrl)) { throw }
             Remove-Item -LiteralPath $destination -Force -ErrorAction SilentlyContinue
-            Write-Host "[Gitee] Single-attachment download endpoint was unavailable for $AssetName; checking its returned direct URL."
-            Invoke-CurlDownload -Uri $FallbackUrl -Destination $destination -AssetName $AssetName
+            Write-Host "[Gitee] Direct URL unavailable for $AssetName; trying the saved attachment ID."
+            Invoke-CurlDownload -Uri $downloadUri -Destination $destination -AssetName $AssetName
         }
         return $destination
     } catch {
@@ -361,6 +447,7 @@ function Test-GiteeAttachment {
         $downloaded = Get-GiteeAssetReadback -ReleaseId $ReleaseId -AttachmentId ([long]$Attachment.id) -FallbackUrl $fallbackUrl -AssetName $Name
         Move-Item -LiteralPath $downloaded -Destination $remotePath -Force
         Test-DownloadedAsset -RemotePath $remotePath -LocalPath $LocalPath -AssetName $Name -ArchiveSha256 $ArchiveSha256
+        $script:verifiedAssets["Gitee/$Name"] = Get-ReleaseFileSha256 $remotePath
         Write-Host "[Gitee] Verified $Name ($localSize bytes) by attachment ID $($Attachment.id)."
         return $fallbackUrl
     } finally {
@@ -392,6 +479,7 @@ function Find-GiteeAssetForRecovery {
     )
 
     $matches = @(Get-GiteeAttachments | Where-Object { $_.name -ceq $Name })
+    if ($matches.Count -gt 1) { throw "Gitee has duplicate attachments named $Name; refusing to select one silently." }
     foreach ($candidate in $matches) {
         $result = Get-VerifiedGiteeCandidate -Candidate $candidate -LocalPath $LocalPath -Name $Name -ArchiveSha256 $ArchiveSha256
         return $result
@@ -409,9 +497,33 @@ function Upload-GiteeAsset {
     $asset = Get-Item -LiteralPath $LocalPath
     try {
         Write-Host "[Gitee] Uploading $Name ($($asset.Length) bytes) from the local release cache."
-        $curlOutput = $curlConfig | & $curl --config - --silent --show-error --http1.1 --connect-timeout 20 --max-time 600 --fail-with-body --request POST --form "file=@$($asset.FullName);filename=$Name" --output $responsePath --write-out 'http=%{http_code} seconds=%{time_total}' "https://gitee.com/api/v5/repos/$GiteeOwner/$GiteeRepository/releases/$($script:releaseState.giteeReleaseId)/attach_files" 2>&1
-        $stats = $curlOutput | Out-String
-        $exitCode = $LASTEXITCODE
+        for ($attempt = 1; $attempt -le 4; $attempt++) {
+            $curlOutput = $curlConfig | & $curl --config - --silent --show-error --http1.1 --connect-timeout 20 --max-time 180 --fail-with-body --request POST --form "file=@$($asset.FullName);filename=$Name" --dump-header "$responsePath.headers" --output $responsePath --write-out 'http=%{http_code} seconds=%{time_total}' "https://gitee.com/api/v5/repos/$GiteeOwner/$GiteeRepository/releases/$($script:releaseState.giteeReleaseId)/attach_files" 2>&1
+            $stats = $curlOutput | Out-String
+            $exitCode = $LASTEXITCODE
+            # Only requests rejected before upload can be repeated without a
+            # server identity. A timeout/reset/5xx must go through reconciliation.
+            $rejected = $stats -match 'http=429\b' -or $exitCode -in @(6, 7)
+            if (-not $rejected -or $attempt -eq 4) { break }
+            $retryAfter = ''
+            if (Test-Path -LiteralPath "$responsePath.headers") {
+                $retryMatch = [regex]::Match((Get-Content -LiteralPath "$responsePath.headers" -Raw), '(?im)^Retry-After:\s*([^\r\n]+)')
+                if ($retryMatch.Success) { $retryAfter = $retryMatch.Groups[1].Value }
+            }
+            $delay = Get-ReleaseRetryDelay -Attempt $attempt -RetryAfter $retryAfter
+            if ($delay -gt 60) { throw "Gitee upload Retry-After for $Name exceeds this run's retry budget." }
+            Write-Host "[Retry] Gitee rejected $Name before upload; waiting $delay seconds ($attempt/4)."
+            Start-Sleep -Seconds $delay
+        }
+        $attachment = $null
+        if (Test-Path -LiteralPath $responsePath) {
+            try { $attachment = Get-Content -LiteralPath $responsePath -Raw | ConvertFrom-Json -AsHashtable -ErrorAction Stop } catch { }
+        }
+        # A complete response containing an ID can survive a trailing connection
+        # error. Save and verify it before considering an attachment-list lookup.
+        if ($null -ne $attachment -and [long]$attachment.id -gt 0 -and [string]$attachment.name -ceq $Name) {
+            $exitCode = 0
+        }
         if ($exitCode -ne 0) {
             # The response may be lost after the server stores the attachment. Recover once by name and hash.
             try {
@@ -442,7 +554,7 @@ function Upload-GiteeAsset {
         Save-ReleaseState -Path $statePath -State $script:releaseState
         Write-Host "[Gitee] Uploaded and verified $Name (HTTP stats: $($stats.Trim()))."
     } finally {
-        Remove-Item -LiteralPath $responsePath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $responsePath, "$responsePath.headers" -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -457,6 +569,17 @@ function Ensure-GiteeAsset {
     $record = $script:releaseState.giteeAssets[$Name]
     if ($null -ne $record -and -not [string]::IsNullOrWhiteSpace([string]$record.attachmentId)) {
         $id = [long]$record.attachmentId
+        $fallback = [string]$record.downloadUrl
+        if (-not [string]::IsNullOrWhiteSpace($fallback)) {
+            # A saved identity is never discarded because an auxiliary API is
+            # unavailable. Hash/size failures remain fatal, even if listing works.
+            $attachment = @{ id = $id; name = $Name; browser_download_url = $fallback }
+            $url = Test-GiteeAttachment -Attachment $attachment -ReleaseId ([long]$script:releaseState.giteeReleaseId) -LocalPath $LocalPath -Name $Name -ArchiveSha256 $ArchiveSha256
+            Save-GiteeAttachmentCheckpoint -State $script:releaseState -Name $Name -AttachmentId ([string]$id) -DownloadUrl $url -Status 'verified'
+            Save-ReleaseState -Path $statePath -State $script:releaseState
+            Write-Host "[Gitee] Reused attachment ID $id for $Name without a list query or upload."
+            return
+        }
         $lookup = Get-GiteeAttachmentById -ReleaseId ([long]$script:releaseState.giteeReleaseId) -AttachmentId $id
         if ($lookup.Available -and $null -ne $lookup.Attachment) {
             $url = Test-GiteeAttachment -Attachment $lookup.Attachment -ReleaseId ([long]$script:releaseState.giteeReleaseId) -LocalPath $LocalPath -Name $Name -ArchiveSha256 $ArchiveSha256
@@ -464,29 +587,7 @@ function Ensure-GiteeAsset {
             Save-ReleaseState -Path $statePath -State $script:releaseState
             return
         }
-        $fallback = [string]$record.downloadUrl
-        if (-not [string]::IsNullOrWhiteSpace($fallback)) {
-            try {
-                $readback = Get-GiteeAssetReadback -ReleaseId ([long]$script:releaseState.giteeReleaseId) -AttachmentId $id -FallbackUrl $fallback -AssetName $Name
-                try {
-                    Test-DownloadedAsset -RemotePath $readback -LocalPath $LocalPath -AssetName $Name -ArchiveSha256 $ArchiveSha256
-                    Save-GiteeAttachmentCheckpoint -State $script:releaseState -Name $Name -AttachmentId ([string]$id) -DownloadUrl $fallback -Status 'verified'
-                    Save-ReleaseState -Path $statePath -State $script:releaseState
-                    Write-Host "[Gitee] Verified cached attachment ID $id for $Name without using the attachment list API."
-                    return
-                } finally { Remove-Item -LiteralPath $readback -Force -ErrorAction SilentlyContinue }
-            } catch {
-                if (-not $lookup.Available) { Write-Host "[Gitee] Cached attachment ID $id could not be verified directly; checking the recovery list before any new upload." }
-            }
-        }
-        if (-not $lookup.Available -and [string]::IsNullOrWhiteSpace($fallback)) {
-            throw "Gitee single-attachment lookup is temporarily unavailable for $Name (ID $id); refusing to upload a duplicate."
-        }
-        # The known ID is missing or its saved URL no longer serves the expected bytes. Recover before any new upload.
-        $script:releaseState.giteeAssets.Remove($Name)
-        Save-GiteeAttachmentCheckpoint -State $script:releaseState -Name $Name -AttachmentId '' -DownloadUrl '' -Status 'pending'
-        Save-ReleaseState -Path $statePath -State $script:releaseState
-        $record = $script:releaseState.giteeAssets[$Name]
+        throw "Gitee saved attachment $Name (ID $id) cannot be verified; preserving its checkpoint and refusing another upload."
     }
 
     $mustRecover = ($null -ne $record -and [string]$record.status -eq 'pending') -or
@@ -583,7 +684,8 @@ function Publish-GiteeRelease([System.Collections.IDictionary]$Release) {
         $errorSummary = Get-GiteeResponseErrorSummary $response
         throw "Gitee stable-release update returned HTTP $($response.StatusCode)$errorSummary."
     }
-    $verified = Get-GiteeReleaseByTag
+    try { $verified = $response.Content | ConvertFrom-Json -AsHashtable -ErrorAction Stop }
+    catch { $verified = Get-GiteeReleaseByTag }
     if ($null -eq $verified -or [long]$verified.id -ne $releaseId -or [bool]$verified.prerelease) {
         throw 'Gitee Release stable-state readback failed.'
     }
@@ -595,6 +697,7 @@ function Publish-GitHubRelease {
     $release = Get-GitHubRelease
     if ($null -eq $release) { throw "GitHub Release $Tag is missing before publication." }
     if ($release.isPrerelease) { throw "GitHub Release $Tag is a prerelease." }
+    if (-not $release.isDraft) { return $release }
     if ($release.isDraft) {
         $result = Invoke-Gh -Arguments @('release', 'edit', $Tag, '--repo', $GitHubRepository, '--draft=false')
         Write-Host "[GitHub] Published stable Release $Tag after manifest verification."
@@ -610,16 +713,181 @@ function Get-GiteeReleasePageUrl {
 
 function Get-GiteeArchiveDownloadUrl {
     $record = $script:releaseState.giteeAssets[$expectedArchiveName]
-    if ($null -ne $record -and -not [string]::IsNullOrWhiteSpace([string]$record.downloadUrl)) { return Assert-SafeGiteeDownloadUrl ([string]$record.downloadUrl) }
-    $lookup = Get-GiteeAttachmentById -ReleaseId ([long]$script:releaseState.giteeReleaseId) -AttachmentId ([long]$record.attachmentId)
-    if ($lookup.Available -and $null -ne $lookup.Attachment) { return Assert-SafeGiteeDownloadUrl ([string]$lookup.Attachment.browser_download_url) }
-    throw 'Gitee archive download URL was not recorded after attachment verification.'
+    if ($null -eq $record -or [long]$record.attachmentId -le 0) { throw 'Gitee archive identity was not recorded after verification.' }
+    # Shipped clients accept /attach_files/ URLs. Gitee now returns a different
+    # browser_download_url; derive this legacy alias from the verified identity,
+    # then prove it serves the same complete bytes before publishing it.
+    $uri = "https://gitee.com/$GiteeOwner/$GiteeRepository/attach_files/$($record.attachmentId)/download"
+    $temporary = Join-Path $stateDirectory ('gitee-client-url-' + [guid]::NewGuid().ToString('N'))
+    try {
+        Invoke-ReleaseDownload -Uri $uri -Destination $temporary -AssetName $expectedArchiveName
+        Test-DownloadedAsset -RemotePath $temporary -LocalPath $bundle.ArchivePath -AssetName $expectedArchiveName -ArchiveSha256 $bundle.ArchiveSha256
+    } finally { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
+    return $uri
+}
+
+function Test-ClientManifest([switch]$Live) {
+    $dotnet = & (Join-Path $PSScriptRoot 'resolve-dotnet.ps1')
+    $arguments = @('run', '--project', (Join-Path $PSScriptRoot 'release-pipeline/ClientManifestCheck.csproj'), '-c', 'Release', '--', $finalManifestPath, $version)
+    if ($Live) { $arguments += '--live' }
+    & $dotnet @arguments
+    if ($LASTEXITCODE -ne 0) { throw 'The actual published-tag client rejected the manifest or live update source.' }
+}
+
+function Repair-ClientManifest {
+    if (-not $RepairManifestSha256) { return }
+    $oldHash = $RepairManifestSha256.ToLowerInvariant()
+    $newHash = Get-ReleaseFileSha256 $finalManifestPath
+    $journal = $script:releaseState.manifestRepair
+    if ($null -ne $journal -and ($journal.oldSha256 -cne $oldHash -or $journal.newSha256 -cne $newHash)) {
+        throw 'Manifest repair journal disagrees with the reviewed old/new content.'
+    }
+    if ($null -eq $journal) {
+        $journal = @{oldSha256=$oldHash;newSha256=$newHash;mirrors=@{}}
+        $script:releaseState.manifestRepair = $journal
+    }
+    $backupDirectory = Join-Path $stateDirectory "manifest-repair-$oldHash"
+    New-Item -ItemType Directory -Path $backupDirectory -Force | Out-Null
+    $candidates = @{}
+    foreach ($mirror in @('GitHub', 'Gitee')) {
+        if ($mirror -ceq 'GitHub') { $asset = Get-GitHubAsset 'latest.json' }
+        else {
+            $assets = @(Get-GiteeAttachments | Where-Object { $_.name -ceq 'latest.json' })
+            if ($assets.Count -gt 1) { throw 'Cannot repair duplicate Gitee manifests.' }
+            $asset = if ($assets.Count -eq 1) { $assets[0] } else { $null }
+        }
+        if ($null -eq $asset) {
+            if ($journal.mirrors[$mirror].status -notin @('delete-pending','deleted')) { throw "$mirror manifest missing without a prior reviewed repair intent." }
+            $candidates[$mirror] = @{absent=$true}
+            continue
+        }
+        $readbackDirectory = Join-Path $backupDirectory $mirror
+        New-Item -ItemType Directory -Path $readbackDirectory -Force | Out-Null
+        $path = Join-Path $readbackDirectory 'latest.json'
+        if ($mirror -ceq 'GitHub') { $path = Download-GitHubAsset 'latest.json' $readbackDirectory }
+        else { Invoke-ReleaseDownload -Uri ([string]$asset.browser_download_url) -Destination $path -AssetName 'latest.json repair preflight' }
+        if ((Get-ReleaseFileSha256 $path) -ceq $newHash) {
+            $candidates[$mirror] = @{complete=$true;asset=$asset}
+            continue
+        }
+        Assert-ManifestUrlRepair -OldPath $path -NewPath $finalManifestPath -ExpectedOldSha256 $oldHash -Tag $Tag -GiteeOwner $GiteeOwner -GiteeRepository $GiteeRepository -ArchiveAttachmentId ([long]$script:releaseState.giteeAssets[$expectedArchiveName].attachmentId)
+        $original = Join-Path $backupDirectory "$mirror-original-latest.json"
+        if (-not (Test-Path -LiteralPath $original)) { Copy-Item -LiteralPath $path -Destination $original }
+        $candidates[$mirror] = @{asset=$asset}
+    }
+    # Both old/new manifests have been checked before deleting either old asset.
+    # This explicit, hash-bound exception applies only to latest.json, never to
+    # an archive, sidecar, tag or entire Release.
+    foreach ($mirror in @('GitHub','Gitee')) {
+        $candidate = $candidates[$mirror]
+        if ($candidate.complete) {
+            if ($mirror -ceq 'Gitee') {
+                Save-GiteeAttachmentCheckpoint -State $script:releaseState -Name 'latest.json' -AttachmentId ([string]$candidate.asset.id) -DownloadUrl ([string]$candidate.asset.browser_download_url) -Status uploaded
+            }
+            $journal.mirrors[$mirror] = @{status='complete'}
+            Save-ReleaseState -Path $statePath -State $script:releaseState
+            continue
+        }
+        if (-not $candidate.absent) {
+            $asset = $candidate.asset
+            $identity = if ($mirror -ceq 'GitHub') { [string]$asset.apiUrl } else { [string]$asset.id }
+            $journal.mirrors[$mirror] = @{status='delete-pending';identity=$identity}
+            Save-ReleaseState -Path $statePath -State $script:releaseState
+            if ($mirror -ceq 'GitHub') {
+                $null = Invoke-Gh -Arguments @('api', '--method', 'DELETE', $identity) -AllowFailure
+                if ($null -ne (Get-GitHubAsset 'latest.json')) { throw 'GitHub old manifest deletion was not confirmed; refusing duplicate upload.' }
+            } else {
+                try { $null = Invoke-ReleaseHttp -Uri "https://gitee.com/api/v5/repos/$GiteeOwner/$GiteeRepository/releases/$($script:releaseState.giteeReleaseId)/attach_files/$identity" -Method Delete -Headers (Get-GiteeHeaders) }
+                catch { Write-Host '[Manifest repair] Delete response interrupted; reconciling the exact asset before continuing.' }
+                if (@(Get-GiteeAttachments | Where-Object { $_.name -ceq 'latest.json' }).Count -ne 0) { throw 'Gitee old manifest deletion was not confirmed; refusing duplicate upload.' }
+            }
+        }
+        $journal.mirrors[$mirror].status = 'deleted'
+        if ($mirror -ceq 'Gitee') {
+            Save-GiteeAttachmentCheckpoint -State $script:releaseState -Name 'latest.json' -AttachmentId '' -DownloadUrl '' -Status pending
+        }
+        Save-ReleaseState -Path $statePath -State $script:releaseState
+        Write-Host "[Manifest repair] $mirror reviewed old manifest removed; archive/sidecar assets retained."
+        if ($mirror -ceq 'GitHub') { Ensure-GitHubAsset -LocalPath $finalManifestPath -Name 'latest.json' -ArchiveSha256 $bundle.ArchiveSha256 }
+        else { Ensure-GiteeAsset -LocalPath $finalManifestPath -Name 'latest.json' -ArchiveSha256 $bundle.ArchiveSha256 }
+        $journal.mirrors[$mirror].status = 'complete'
+        Save-ReleaseState -Path $statePath -State $script:releaseState
+    }
 }
 
 function Get-ValidatedGitSha([string]$Ref) {
     return (Invoke-GitChecked -Arguments @('rev-parse', $Ref)).Trim().ToLowerInvariant()
 }
 
+function Assert-VerifiedMirror([string]$Mirror) {
+    foreach ($path in @($bundle.ArchivePath, $bundle.ChecksumPath)) {
+        $name = Split-Path -Leaf $path
+        if ($script:verifiedAssets["$Mirror/$name"] -cne (Get-ReleaseFileSha256 $path)) {
+            throw "$Mirror has no complete download and SHA-256 proof for $name in this run."
+        }
+    }
+    Write-Host "[$Mirror] Archive and checksum have complete size/SHA-256 readback evidence from this run."
+}
+
+function Assert-ArchiveContents([string]$Path) {
+    $sevenZip = 'C:\Program Files\7-Zip\7z.exe'
+    $testOutput = & $sevenZip t $Path 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "Release archive integrity test failed: $testOutput" }
+    $listing = & $sevenZip l -slt $Path 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw 'Could not inspect release archive contents.' }
+    $files = @([regex]::Matches($listing, '(?m)^Path = ([^\r\n]+)') | ForEach-Object { $_.Groups[1].Value.Replace('/', '\') })
+    foreach ($required in @('NetBootDhcpTool.exe', 'config\appsettings.json', 'config\favorites.json', 'i18n\zh-CN.json', 'i18n\en-US.json', 'assets\app.ico', 'README.md', 'docs\RELEASE_NOTES.md', 'PresentationNative_cor3.dll', 'wpfgfx_cor3.dll')) {
+        if ($required -cnotin $files) { throw "Release archive is incomplete; missing $required." }
+    }
+    Write-Host '[Build] Archive CRC and required application files verified.'
+}
+
+function Assert-PublicRelease {
+    $directory = Join-Path $stateDirectory ('public-readback-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    try {
+        foreach ($mirror in @('GitHub', 'Gitee')) {
+            foreach ($path in @($bundle.ArchivePath, $bundle.ChecksumPath, $finalManifestPath)) {
+                $name = Split-Path -Leaf $path
+                $uri = if ($mirror -ceq 'GitHub') { "https://github.com/$GitHubRepository/releases/download/$Tag/$name" } else { [string]$script:releaseState.giteeAssets[$name].downloadUrl }
+                $download = Join-Path $directory "$mirror-$name"
+                Invoke-ReleaseDownload -Uri $uri -Destination $download -AssetName $name
+                Test-DownloadedAsset -RemotePath $download -LocalPath $path -AssetName $name -ArchiveSha256 $bundle.ArchiveSha256
+                Write-Host "[Final Verify] Anonymous $mirror $name download: size and SHA-256 match."
+            }
+        }
+        $latestPath = Join-Path $directory 'github-latest.json'
+        Invoke-ReleaseDownload -Uri "https://github.com/$GitHubRepository/releases/latest/download/latest.json" -Destination $latestPath -AssetName 'latest.json (client endpoint)'
+        Test-DownloadedAsset -RemotePath $latestPath -LocalPath $finalManifestPath -AssetName 'latest.json' -ArchiveSha256 $bundle.ArchiveSha256
+        $latest = Invoke-ReleaseHttp -Uri "https://gitee.com/api/v5/repos/$GiteeOwner/$GiteeRepository/releases/latest"
+        if ($latest.StatusCode -ne 200) { throw "Gitee client latest-release endpoint returned HTTP $($latest.StatusCode)." }
+        $latestRelease = $latest.Content | ConvertFrom-Json -AsHashtable -ErrorAction Stop
+        if ($latestRelease.tag_name -cne $Tag -or [bool]$latestRelease.prerelease -or [long]$latestRelease.id -ne [long]$script:releaseState.giteeReleaseId) {
+            throw 'Gitee client latest-release endpoint points to the wrong version or Release.'
+        }
+        # Only this auxiliary inventory request can be downgraded, and only after
+        # both complete public bundles and the client latest endpoints passed.
+        $attachments = $null
+        try { $attachments = @(Get-GiteeAttachments) }
+        catch { Add-ReleaseWarning 'Gitee attachment inventory unavailable after both public bundles passed full download/size/SHA-256 verification; saved attachment IDs were retained.' }
+        if ($null -ne $attachments) {
+            foreach ($name in @($bundle.ArchiveName, "$($bundle.ArchiveName).sha256", 'latest.json')) {
+                $matching = @($attachments | Where-Object { $_.name -ceq $name })
+                if ($matching.Count -ne 1) { throw "Gitee inventory has $($matching.Count) attachments named $name; expected exactly one." }
+                if ([string]$matching[0].id -cne [string]$script:releaseState.giteeAssets[$name].attachmentId -or
+                    [string]$matching[0].browser_download_url -cne [string]$script:releaseState.giteeAssets[$name].downloadUrl) {
+                    throw "Gitee inventory for $name disagrees with its verified attachment identity/URL."
+                }
+            }
+            Write-Host '[Final Verify] Gitee inventory: exactly one of each asset; client manifest URL matches verified bytes.'
+        }
+    } finally {
+        Remove-OwnedTemporaryDirectory -Path $directory -ExpectedParent $stateDirectory -RequiredNamePrefix 'public-readback-'
+    }
+}
+
+try {
+Start-ReleaseStage 'Build'
 Set-Location $repoRoot
 $headCommit = Get-ValidatedGitSha 'HEAD'
 if ($headCommit -cne $SourceCommit.ToLowerInvariant()) { throw "Checked-out HEAD $headCommit does not match validated CI commit $SourceCommit." }
@@ -661,20 +929,28 @@ if ($cacheIsPresent) {
 $script:bundle = $bundle
 $script:baseManifest = $bundle.Manifest
 if ($bundle.Version -cne $version -or $bundle.ArchiveName -cne $archiveName) { throw 'Cached release bundle does not match this workflow input.' }
+Assert-ArchiveContents $bundle.ArchivePath
 
 # Create local notes before creating either public Release; the note source remains the project change log.
 $script:releaseState = Read-ReleaseState -Path $statePath -Tag $Tag -SourceCommit $SourceCommit -ArchiveSha256 $bundle.ArchiveSha256
-Sync-GiteeSource
+Start-ReleaseStage 'GitHub Publish'
 $null = Get-OrCreateGitHubRelease
-$giteeRelease = Ensure-GiteeRelease -BaseManifest $script:baseManifest
 
 # Upload the exact same cached archive and sidecar to both hosts. Reuse is allowed only after full remote readback.
 Ensure-GitHubAsset -LocalPath $bundle.ArchivePath -Name $bundle.ArchiveName -ArchiveSha256 $bundle.ArchiveSha256
 Ensure-GitHubAsset -LocalPath $bundle.ChecksumPath -Name "$($bundle.ArchiveName).sha256" -ArchiveSha256 $bundle.ArchiveSha256
+Start-ReleaseStage 'GitHub Verify'
+Assert-VerifiedMirror 'GitHub'
+Start-ReleaseStage 'Gitee Publish'
+Sync-GiteeSource
+$giteeRelease = Ensure-GiteeRelease -BaseManifest $script:baseManifest
 Ensure-GiteeAsset -LocalPath $bundle.ChecksumPath -Name "$($bundle.ArchiveName).sha256" -ArchiveSha256 $bundle.ArchiveSha256
 Ensure-GiteeAsset -LocalPath $bundle.ArchivePath -Name $bundle.ArchiveName -ArchiveSha256 $bundle.ArchiveSha256
+Start-ReleaseStage 'Gitee Verify'
+Assert-VerifiedMirror 'Gitee'
 
 # latest.json is created only after both remote archive and checksum pairs pass full readback.
+Start-ReleaseStage 'Manifest Publish'
 $giteeArchiveUrl = Get-GiteeArchiveDownloadUrl
 $giteeReleasePageUrl = Get-GiteeReleasePageUrl
 $finalManifestDirectory = Join-Path $stateDirectory 'final-manifest'
@@ -682,28 +958,38 @@ New-Item -ItemType Directory -Path $finalManifestDirectory -Force | Out-Null
 $finalManifestPath = Join-Path $finalManifestDirectory 'latest.json'
 $finalManifest = New-DualSourceManifest -BaseManifestPath $bundle.ManifestPath -Tag $Tag -GitHubRepository $GitHubRepository -GiteeReleasePageUrl $giteeReleasePageUrl -GiteeArchiveDownloadUrl $giteeArchiveUrl -OutputPath $finalManifestPath
 $finalManifestBundleHash = Get-ReleaseFileSha256 $finalManifestPath
+Test-ClientManifest
+Repair-ClientManifest
 
 Ensure-GiteeAsset -LocalPath $finalManifestPath -Name 'latest.json' -ArchiveSha256 $bundle.ArchiveSha256
 Ensure-GitHubAsset -LocalPath $finalManifestPath -Name 'latest.json' -ArchiveSha256 $bundle.ArchiveSha256
 
 $finalGiteeManifest = $script:releaseState.giteeAssets['latest.json']
 if ($null -eq $finalGiteeManifest -or $finalGiteeManifest.status -ne 'verified') { throw 'Gitee latest.json did not reach the verified state.' }
-$githubManifestDirectory = Join-Path $stateDirectory ("github-manifest-readback-" + [guid]::NewGuid().ToString('N'))
-try {
-    $githubManifestPath = Download-GitHubAsset 'latest.json' $githubManifestDirectory
-    if ((Get-ReleaseFileSha256 $githubManifestPath) -ne $finalManifestBundleHash) { throw 'GitHub latest.json does not match the verified Gitee manifest.' }
-} finally {
-    Remove-OwnedTemporaryDirectory -Path $githubManifestDirectory -ExpectedParent $stateDirectory -RequiredNamePrefix 'github-manifest-readback-'
+foreach ($mirror in @('GitHub', 'Gitee')) {
+    if ($script:verifiedAssets["$mirror/latest.json"] -cne $finalManifestBundleHash) { throw "$mirror latest.json lacks matching full readback evidence from this run." }
 }
 
+Start-ReleaseStage 'Final Verify'
 $githubRelease = Publish-GitHubRelease
 $giteeRelease = Publish-GiteeRelease -Release $giteeRelease
 if ([bool]$giteeRelease.prerelease -or $githubRelease.isDraft -or $githubRelease.isPrerelease) {
     throw "One or both $Tag Releases did not reach the stable published state."
 }
+Assert-PublicRelease
+Test-ClientManifest -Live
 
 Write-Host "Formal release completed and remotely verified: $Tag"
 Write-Host "Archive SHA-256: $($bundle.ArchiveSha256)"
 Write-Host "Gitee archive: $giteeArchiveUrl"
 Write-Host "GitHub archive: https://github.com/$GitHubRepository/releases/download/$Tag/$archiveName"
 Write-Host 'GitHub and Gitee latest.json contain the same verified dual-source manifest.'
+Write-ReleaseSummary -Succeeded $true
+# Actions propagates LASTEXITCODE after pwsh exits. Only reset a handled native
+# failure after every mandatory stage passed, so an auxiliary fallback cannot
+# turn a fully verified release red; exceptions above still fail the workflow.
+$global:LASTEXITCODE = 0
+} catch {
+    Write-ReleaseSummary -Succeeded $false
+    throw
+}

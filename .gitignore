@@ -4,6 +4,7 @@ release/
 logs/*.log
 artifacts/performance/
 artifacts/acceptance/
+artifacts/release-repair/
 .dotnet/
 .vs/
 *.user

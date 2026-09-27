@@ -8,6 +8,10 @@ on:
         description: Stable tag whose exact main commit already passed Windows CI
         required: true
         type: string
+      repair_manifest_sha256:
+        description: Optional exact old manifest SHA-256 for a reviewed client-URL-only repair
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -97,7 +101,7 @@ jobs:
           if ($env:PUBLISHER_COMMIT -notmatch '^[a-fA-F0-9]{40}$') { throw 'Workflow publisher commit is not a full Git SHA.' }
           git fetch origin $env:PUBLISHER_COMMIT --no-tags
           if ($LASTEXITCODE -ne 0) { throw 'Could not fetch the CI-verified workflow commit for release tooling.' }
-          $releaseToolFiles = @('build/publish-release.ps1', 'build/release-pipeline/ReleaseState.psm1', 'build/publish.ps1')
+          $releaseToolFiles = @('build/publish-release.ps1', 'build/release-pipeline/ReleaseState.psm1', 'build/release-pipeline/ReleaseTransport.psm1', 'build/release-pipeline/ClientManifestCheck.csproj', 'build/release-pipeline/ClientManifestCheck.cs', 'build/publish.ps1')
           foreach ($toolPath in $releaseToolFiles) {
             git cat-file -e "${env:PUBLISHER_COMMIT}:$toolPath"
             if ($LASTEXITCODE -ne 0) { throw "The workflow commit does not contain release tool $toolPath." }
@@ -119,13 +123,14 @@ jobs:
         with:
           dotnet-version: 10.0.401
 
-      - name: Publish the cached package to GitHub and Gitee
+      - name: Build, publish and verify both mirrors (seven-stage summary)
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
           RELEASE_TAG: ${{ inputs.release_tag }}
           RELEASE_COMMIT: ${{ needs.verify-ci.outputs.release_commit }}
+          REPAIR_MANIFEST_SHA256: ${{ inputs.repair_manifest_sha256 }}
           # The publisher supplies Gitee credentials through GIT_ASKPASS. Ignore
           # machine-wide credential helpers so this runner never blocks on an
           # interactive Windows Credential Manager prompt.
@@ -138,4 +143,4 @@ jobs:
           $workspace = [System.IO.Path]::GetFullPath($env:GITHUB_WORKSPACE)
           $runnerWork = Split-Path -Parent (Split-Path -Parent $workspace)
           $stateRoot = Join-Path $runnerWork '_release-state\NetBootDhcpTool'
-          .\build\publish-release.ps1 -Tag $env:RELEASE_TAG -SourceCommit $env:RELEASE_COMMIT -StateRoot $stateRoot
+          .\build\publish-release.ps1 -Tag $env:RELEASE_TAG -SourceCommit $env:RELEASE_COMMIT -StateRoot $stateRoot -RepairManifestSha256 $env:REPAIR_MANIFEST_SHA256
