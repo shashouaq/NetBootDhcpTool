@@ -12,10 +12,10 @@
 ## v1.0.18 / 2026-09-27
 
 - Date: 2026-09-27
-- Type: Gitee update discovery compatibility fix / T19
+- Type: Gitee update discovery compatibility fix / T19 complete
 - Affected files/modules: `src/NetBootDhcpTool.Core/VersionUpdateService.cs`, `src/NetBootDhcpTool.UnitTests/VersionUpdateSourceTests.cs`, `src/NetBootDhcpTool.UnitTests/VersionUpdateDownloadTests.cs`, `src/NetBootDhcpTool.App/NetBootDhcpTool.App.csproj`, `README.md`, `docs/MAINTENANCE_GUIDE.md`, `docs/RELEASE_PROCESS.md`, `docs/RELEASE_NOTES.md`, `docs/tasks/T19.md`, `docs/TODO.md`
 - Concrete change: Accept Gitee's exact-repository canonical `/releases/download/<tag>/latest.json` and versioned `.7z` URLs while retaining legacy `/attach_files/<id>/download` aliases. Reject malformed and mismatched tag/archive URLs and Gitee URLs with credentials, query strings, or fragments; require canonical archive URLs to match the manifest version during metadata evaluation and download. Preserve Gitee-first discovery, GitHub fallback, source-speed selection, and SHA-256 verification.
-- Verification: Pinned .NET 10.0.401 unit tests passed with 193 tests successful and one configured performance test skipped, including a Gitee-only discovery regression, malformed/mismatched URL cases, and a complete verified download from the canonical Gitee URL. Full Windows CI and formal-release evidence are recorded in [T19](tasks/T19.md).
+- Verification: Pinned .NET 10.0.401 Release solution and ClientManifestCheck builds had 0 warnings/errors; MSTest passed 193 tests with one configured performance-category skip; network/persistence smoke `OK`, non-admin UI smoke `UI_SMOKE_OK`, and maintenance checks passed (295 localization keys, 63/63 help buttons). Exact-commit CI `36302211641` and formal release `36302353139` both succeeded. All seven release stages passed; anonymous full readback verified three unique assets on each host. Both 56,975,532-byte packages have SHA-256 `e23dccb0bbc30253a13296fa259e60f2a3f8354db0d333cbca7f1b01e1a18a4f`; both 2,782-byte manifests match with SHA-256 `ce446161c885163f2d731eb0ca4eadde4affd86ab8deb319f1ce6517d34a2093`. The published-tag client returned `CLIENT_LIVE_OK`; a separate real Gitee-only `VersionUpdateService` check also found v1.0.18 with both mirrors measured. Complete records are in [T19](tasks/T19.md).
 - User impact: Clients can discover updates from Gitee without relying on the GitHub manifest fallback; both approved mirrors remain speed-tested and checksum-verified.
 
 ## v1.0.17 / 2026-09-27

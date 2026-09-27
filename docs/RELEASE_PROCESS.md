@@ -100,7 +100,7 @@ For the specifically reviewed v1.0.17 manifest URL defect, the optional `repair_
 
 For every release, verify the exact source commit and tag, the green exact-commit CI run, the stable GitHub and Gitee Release pages, the archive and sidecar SHA-256 values on both hosts, and identical dual-source manifests. The publisher performs full archive readback from each host and checks the GitHub manifest readback; do not claim publication while that workflow is incomplete.
 
-The v1.0.17 package remained unchanged during the workflow repair. Final ordinary same-tag run `36295609878` succeeded with all seven stages and no uploads; both manifests were repaired separately under an exact old-SHA constraint. The old-client Gitee-only limitation identified there is fixed in v1.0.18. Full hashes, attachment IDs, actual-client source checks, and formal release results are recorded in [T19](tasks/T19.md). v1.0.14/v1.0.16 records remain historical evidence. The app continues to probe both download sources and select by measured speed.
+The v1.0.17 package remained unchanged during the workflow repair. Final ordinary same-tag run `36295609878` succeeded with all seven stages and no uploads; both manifests were repaired separately under an exact old-SHA constraint. The old-client Gitee-only limitation identified there was fixed and formally published in v1.0.18. Exact CI `36302211641`, seven-stage Release `36302353139`, remote hashes, attachment IDs, and both default and Gitee-only client checks are recorded in [T19](tasks/T19.md). v1.0.14/v1.0.16 records remain historical evidence. The app continues to probe both download sources and select by measured speed.
 
 ## Gitee Distribution
 

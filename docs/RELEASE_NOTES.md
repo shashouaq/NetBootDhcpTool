@@ -10,6 +10,12 @@ NetBoot DHCP Tool v1.0.18 fixes Gitee-only update discovery for clients that rec
 - Require a canonical Gitee archive URL's release tag and archive version to match the manifest version; reject unrelated hosts, malformed paths, mismatched versions, credentials, query strings, and fragments.
 - Keep Gitee-first metadata discovery, GitHub fallback, measured dual-source selection, and archive SHA-256 verification.
 
+### Validation
+
+- Exact-commit Windows CI `36302211641` and formal release `36302353139` passed; all seven publish and verification stages succeeded.
+- GitHub and Gitee each serve the same 56,975,532-byte `.7z` archive with SHA-256 `e23dccb0bbc30253a13296fa259e60f2a3f8354db0d333cbca7f1b01e1a18a4f`. The identical 2,782-byte `latest.json` files have SHA-256 `ce446161c885163f2d731eb0ca4eadde4affd86ab8deb319f1ce6517d34a2093`.
+- The published-tag client passed its live dual-source check, and an independent Gitee-only live check discovered v1.0.18 from Gitee's canonical manifest URL.
+
 ## v1.0.16
 
 NetBoot DHCP Tool v1.0.16 validates the new formal release path while preserving the existing portable archive format and update behavior.
