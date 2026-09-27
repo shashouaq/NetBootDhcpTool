@@ -11,6 +11,7 @@ public sealed class VersionUpdateSourceTests
 {
     private const string GiteeArchiveUrl = "https://gitee.com/joel20230302/NetBootDhcpTool/attach_files/123456";
     private const string GithubArchiveUrl = "https://github.com/shashouaq/NetBootDhcpTool/releases/download/v1.0.14/NetBootDhcpTool-v1.0.14.7z";
+    private const string GithubArchiveV18Url = "https://github.com/shashouaq/NetBootDhcpTool/releases/download/v1.0.18/NetBootDhcpTool-v1.0.18.7z";
     private const string GiteeManifestUrl = "https://gitee.com/joel20230302/NetBootDhcpTool/attach_files/654321";
 
     [TestMethod]
@@ -81,6 +82,88 @@ public sealed class VersionUpdateSourceTests
         Assert.AreEqual(0, result.DownloadSpeeds.Count);
         Assert.AreEqual(4, requests.Count);
         Assert.AreEqual(0, requests.Count(request => request.Headers.Range != null));
+    }
+
+    [TestMethod]
+    public async Task GiteeCanonicalReleaseDownloadUrlsSupportIndependentDiscovery()
+    {
+        const string giteeManifestUrl = "https://gitee.com/joel20230302/NetBootDhcpTool/releases/download/v1.0.18/latest.json";
+        const string giteeArchiveUrl = "https://gitee.com/joel20230302/NetBootDhcpTool/releases/download/v1.0.18/NetBootDhcpTool-v1.0.18.7z";
+        const string githubArchiveUrl = "https://github.com/shashouaq/NetBootDhcpTool/releases/download/v1.0.18/NetBootDhcpTool-v1.0.18.7z";
+        var requests = new ConcurrentQueue<string>();
+        var manifest = $$"""
+            {
+              "version": "1.0.18",
+              "archiveName": "NetBootDhcpTool-v1.0.18.7z",
+              "archiveSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "downloadUrl": "{{giteeArchiveUrl}}",
+              "downloadMirrors": ["{{githubArchiveUrl}}"],
+              "releasePageUrl": "https://gitee.com/joel20230302/NetBootDhcpTool/releases/tag/v1.0.18"
+            }
+            """;
+        var githubManifest = $$"""
+            {
+              "version": "1.0.18",
+              "archiveName": "NetBootDhcpTool-v1.0.18.7z",
+              "archiveSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "downloadUrl": "{{githubArchiveUrl}}",
+              "releasePageUrl": "https://github.com/shashouaq/NetBootDhcpTool/releases/tag/v1.0.18"
+            }
+            """;
+        using var client = new HttpClient(new DelegateHandler((request, _) =>
+        {
+            var uri = request.RequestUri!;
+            requests.Enqueue(uri.AbsoluteUri);
+            if (uri.AbsoluteUri == VersionUpdateService.GiteeLatestReleaseApiUrl)
+                return Task.FromResult(Json("{\"id\":123,\"tag_name\":\"v1.0.18\",\"prerelease\":false}"));
+            if (uri.AbsolutePath.EndsWith("/attach_files", StringComparison.Ordinal))
+                return Task.FromResult(Json($"[{{\"name\":\"latest.json\",\"browser_download_url\":\"{giteeManifestUrl}\"}}]"));
+            if (uri.AbsoluteUri == giteeManifestUrl) return Task.FromResult(Json(manifest));
+            if (uri.AbsoluteUri == VersionUpdateService.DefaultManifestUrl) return Task.FromResult(Json(githubManifest));
+            if (request.Headers.Range?.Ranges.SingleOrDefault() is { From: 0, To: 65535 })
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(Enumerable.Repeat((byte)42, 65536).ToArray()) });
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
+        }));
+        using var service = new VersionUpdateService(client, manifestUrl: VersionUpdateService.GiteeLatestReleaseApiUrl);
+
+        var result = await service.CheckAsync(new Version(1, 0, 17));
+
+        Assert.IsTrue(result.Succeeded, result.Error);
+        Assert.AreEqual(new Version(1, 0, 18), result.LatestVersion);
+        Assert.IsTrue(result.IsNewVersion);
+        CollectionAssert.AreEquivalent(new[] { giteeArchiveUrl, githubArchiveUrl }, result.DownloadUrls.ToArray());
+        Assert.IsTrue(requests.Contains(giteeManifestUrl), "The Gitee API's canonical latest.json download URL should be fetched directly.");
+        Assert.IsFalse(requests.Contains(VersionUpdateService.DefaultManifestUrl), "A Gitee-only check must succeed without the GitHub fallback manifest.");
+    }
+
+    [TestMethod]
+    [DataRow("https://gitee.com/joel20230302/NetBootDhcpTool/releases/download/v1.0.17/NetBootDhcpTool-v1.0.18.7z")]
+    [DataRow("https://gitee.com/joel20230302/NetBootDhcpTool/releases/download/v1.0.18/NetBootDhcpTool-v1.0.17.7z")]
+    [DataRow("https://gitee.com/joel20230302/NetBootDhcpTool/releases/download/v1.0.17/NetBootDhcpTool-v1.0.17.7z")]
+    [DataRow("https://gitee.com/joel20230302/NetBootDhcpTool/releases/download/v1.0.18/NetBootDhcpTool-v1.0.18.7z/extra")]
+    [DataRow("https://gitee.com.evil.example/joel20230302/NetBootDhcpTool/releases/download/v1.0.18/NetBootDhcpTool-v1.0.18.7z")]
+    [DataRow("https://gitee.com/joel20230302/NetBootDhcpTool/releases/download/v1.0.18/NetBootDhcpTool-v1.0.18.7z?mirror=elsewhere")]
+    [DataRow("https://attacker@gitee.com/joel20230302/NetBootDhcpTool/releases/download/v1.0.18/NetBootDhcpTool-v1.0.18.7z")]
+    [DataRow("https://gitee.com:8443/joel20230302/NetBootDhcpTool/releases/download/v1.0.18/NetBootDhcpTool-v1.0.18.7z")]
+    [DataRow("https://gitee.com/joel20230302/NetBootDhcpTool/releases/download/v1.0.18/NetBootDhcpTool-v1.0.18.7z#other")]
+    [DataRow("https://gitee.com/joel20230302/NetBootDhcpTool/releases/download/v1.0.18/%2e%2e/NetBootDhcpTool-v1.0.18.7z")]
+    public void EvaluateRejectsNonCanonicalOrMismatchedGiteeReleasePaths(string giteeUrl)
+    {
+        var json = $$"""
+            {
+              "version": "1.0.18",
+              "archiveName": "NetBootDhcpTool-v1.0.18.7z",
+              "archiveSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "downloadUrl": "{{giteeUrl}}",
+              "downloadMirrors": ["{{GithubArchiveV18Url}}"],
+              "releasePageUrl": "https://gitee.com/joel20230302/NetBootDhcpTool/releases/tag/v1.0.18"
+            }
+            """;
+
+        var result = VersionUpdateService.Evaluate(json, new Version(1, 0, 17));
+
+        Assert.IsFalse(result.Succeeded);
+        StringAssert.Contains(result.Error, "not an approved");
     }
 
     [TestMethod]

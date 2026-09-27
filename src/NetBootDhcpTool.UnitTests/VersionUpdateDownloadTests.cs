@@ -163,6 +163,48 @@ public sealed class VersionUpdateDownloadTests
     }
 
     [TestMethod]
+    public async Task CanonicalGiteeReleaseUrlCanDownloadAndVerifyTheUpdatePackage()
+    {
+        const string giteeUrl = "https://gitee.com/joel20230302/NetBootDhcpTool/releases/download/v1.0.18/NetBootDhcpTool-v1.0.18.7z";
+        const string githubUrl = "https://github.com/shashouaq/NetBootDhcpTool/releases/download/v1.0.18/NetBootDhcpTool-v1.0.18.7z";
+        var root = CreateTempDirectory();
+        try
+        {
+            var destination = Path.Combine(root, "update.7z");
+            var package = Enumerable.Range(0, 8192).Select(x => (byte)(x % 251)).ToArray();
+            var sha256 = Convert.ToHexString(SHA256.HashData(package)).ToLowerInvariant();
+            var manifest = $$"""
+                {
+                  "version": "1.0.18",
+                  "archiveName": "NetBootDhcpTool-v1.0.18.7z",
+                  "archiveSha256": "{{sha256}}",
+                  "downloadUrl": "{{giteeUrl}}",
+                  "downloadMirrors": ["{{githubUrl}}"],
+                  "releasePageUrl": "https://gitee.com/joel20230302/NetBootDhcpTool/releases/tag/v1.0.18"
+                }
+                """;
+            var update = VersionUpdateService.Evaluate(manifest, new Version(1, 0, 17));
+            Assert.IsTrue(update.Succeeded, update.Error);
+            using var client = new HttpClient(new DelegateHandler((request, _) =>
+            {
+                Assert.AreEqual(giteeUrl, request.RequestUri!.AbsoluteUri);
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(package) });
+            }));
+            using var service = new VersionUpdateService(client);
+
+            var result = await service.DownloadAsync(update, destination);
+
+            Assert.AreEqual(giteeUrl, result.DownloadUrl);
+            Assert.AreEqual(sha256, result.Sha256);
+            CollectionAssert.AreEqual(package, await File.ReadAllBytesAsync(destination));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [TestMethod]
     public async Task IdlePreferredMirrorFallsBackAfterPartialDownload()
     {
         var root = CreateTempDirectory();

@@ -1,6 +1,6 @@
 # NetBoot DHCP Tool
 
-Version: 1.0.17
+Version: 1.0.18
 
 Authors: Joel & Codex
 

@@ -16,7 +16,7 @@ The 2026-09-23 audit baseline and unperformed real-network checks are recorded i
 - Gitee distribution repository: `https://gitee.com/joel20230302/NetBootDhcpTool`
 - Default branch: `main`
 - Release tag format: `v<version>`
-- Current application version: `1.0.17`
+- Current application version: `1.0.18`
 - Target framework: .NET 10; the repository pins SDK `10.0.401` in `global.json` with `latestFeature` roll-forward.
 - Resolve the SDK through `build/resolve-dotnet.ps1`; it honors the repository pin and bootstraps that SDK when needed. The first run may need network access.
 - GitHub fallback manifest URL:

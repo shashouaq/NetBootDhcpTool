@@ -1,5 +1,15 @@
 # Release Notes
 
+## v1.0.18
+
+NetBoot DHCP Tool v1.0.18 fixes Gitee-only update discovery for clients that receive canonical Release download URLs from Gitee's metadata API.
+
+### Changes
+
+- Accept the exact project's canonical Gitee `latest.json` and versioned `.7z` Release URLs alongside the existing attachment-ID aliases.
+- Require a canonical Gitee archive URL's release tag and archive version to match the manifest version; reject unrelated hosts, malformed paths, mismatched versions, credentials, query strings, and fragments.
+- Keep Gitee-first metadata discovery, GitHub fallback, measured dual-source selection, and archive SHA-256 verification.
+
 ## v1.0.16
 
 NetBoot DHCP Tool v1.0.16 validates the new formal release path while preserving the existing portable archive format and update behavior.

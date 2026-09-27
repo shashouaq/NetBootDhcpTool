@@ -208,7 +208,7 @@ public sealed class VersionUpdateService : IDisposable
             var manifest = JsonSerializer.Deserialize<UpdateManifest>(json, JsonStore.Options)
                 ?? throw new InvalidDataException("Update manifest is empty");
             if (!TryParseVersion(manifest.Version, out var latest)) throw new InvalidDataException("Update manifest version is invalid");
-            var downloadUrls = GetSafeDownloadUrls(manifest);
+            var downloadUrls = GetSafeDownloadUrls(manifest, latest);
             if (!IsSafeReleasePageUrl(manifest.ReleasePageUrl)) throw new InvalidDataException("Update release page URL is not an approved HTTPS release URL");
             if (!IsSha256(manifest.ArchiveSha256)) throw new InvalidDataException("Update archive checksum is invalid");
 
@@ -236,7 +236,7 @@ public sealed class VersionUpdateService : IDisposable
     public async Task<UpdateDownloadResult> DownloadAsync(UpdateCheckResult update, string destinationPath, IProgress<UpdateDownloadProgress>? progress = null, CancellationToken ct = default)
     {
         IReadOnlyList<string> downloadUrls = update.DownloadUrls.Count > 0 ? update.DownloadUrls : [update.DownloadUrl];
-        if (!update.Succeeded || downloadUrls.Count == 0 || downloadUrls.Any(url => !IsSafeDownloadUrl(url)))
+        if (!update.Succeeded || downloadUrls.Count == 0 || downloadUrls.Any(url => !IsSafeDownloadUrl(url, update.LatestVersion)))
             throw new InvalidDataException("Update download URL is invalid");
         if (!IsSha256(update.ArchiveSha256)) throw new InvalidDataException("Update archive checksum is invalid");
 
@@ -413,7 +413,7 @@ public sealed class VersionUpdateService : IDisposable
                 continue;
 
             var manifestUrl = urlElement.GetString();
-            if (!IsSafeDownloadUrl(manifestUrl))
+            if (!IsSafeDownloadUrl(manifestUrl, releaseVersion))
                 throw new InvalidDataException("Gitee latest manifest attachment URL is not approved");
             var manifestJson = await GetJsonAsync(new Uri(manifestUrl!, UriKind.Absolute), ct);
             using var manifestDocument = JsonDocument.Parse(manifestJson);
@@ -442,15 +442,15 @@ public sealed class VersionUpdateService : IDisposable
         && uri.Host.Equals("gitee.com", StringComparison.OrdinalIgnoreCase)
         && uri.AbsolutePath.Equals("/api/v5/repos/joel20230302/NetBootDhcpTool/releases/latest", StringComparison.OrdinalIgnoreCase);
 
-    private static List<string> GetSafeDownloadUrls(UpdateManifest manifest)
+    private static List<string> GetSafeDownloadUrls(UpdateManifest manifest, Version expectedVersion)
     {
-        if (!IsSafeDownloadUrl(manifest.DownloadUrl))
+        if (!IsSafeDownloadUrl(manifest.DownloadUrl, expectedVersion))
             throw new InvalidDataException("Update download URL is not an approved HTTPS GitHub or Gitee release asset URL");
 
         var urls = new List<string> { manifest.DownloadUrl! };
         foreach (var mirror in manifest.DownloadMirrors ?? [])
         {
-            if (IsSafeDownloadUrl(mirror)
+            if (IsSafeDownloadUrl(mirror, expectedVersion)
                 && Uri.TryCreate(mirror, UriKind.Absolute, out var mirrorUri)
                 && !urls.Any(url => Uri.TryCreate(url, UriKind.Absolute, out var existingUri)
                     && existingUri.Host.Equals(mirrorUri.Host, StringComparison.OrdinalIgnoreCase)))
@@ -459,7 +459,7 @@ public sealed class VersionUpdateService : IDisposable
         return urls;
     }
 
-    private static bool IsSafeDownloadUrl(string? text)
+    private static bool IsSafeDownloadUrl(string? text, Version? expectedVersion = null)
     {
         if (!Uri.TryCreate(text, UriKind.Absolute, out var uri)
             || !uri.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)) return false;
@@ -468,7 +468,25 @@ public sealed class VersionUpdateService : IDisposable
             return uri.AbsolutePath.StartsWith("/shashouaq/NetBootDhcpTool/releases/download/", StringComparison.OrdinalIgnoreCase);
 
         if (uri.Host.Equals("gitee.com", StringComparison.OrdinalIgnoreCase))
-            return uri.AbsolutePath.StartsWith("/joel20230302/NetBootDhcpTool/attach_files/", StringComparison.OrdinalIgnoreCase);
+        {
+            if (!string.IsNullOrEmpty(uri.UserInfo) || !uri.IsDefaultPort || !string.IsNullOrEmpty(uri.Query) || !string.IsNullOrEmpty(uri.Fragment))
+                return false;
+
+            var path = uri.AbsolutePath;
+            if (System.Text.RegularExpressions.Regex.IsMatch(path,
+                    @"^/joel20230302/NetBootDhcpTool/attach_files/[0-9]+(?:/download)?$",
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant))
+                return true;
+
+            var releaseAsset = System.Text.RegularExpressions.Regex.Match(path,
+                @"^/joel20230302/NetBootDhcpTool/releases/download/v(?<version>[0-9]+\.[0-9]+\.[0-9]+)/(?<name>latest\.json|NetBootDhcpTool-v(?<archiveVersion>[0-9]+\.[0-9]+\.[0-9]+)\.7z)$",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+            return releaseAsset.Success
+                && (!releaseAsset.Groups["archiveVersion"].Success
+                    || releaseAsset.Groups["archiveVersion"].Value.Equals(releaseAsset.Groups["version"].Value, StringComparison.OrdinalIgnoreCase))
+                && (expectedVersion is null
+                    || releaseAsset.Groups["version"].Value.Equals(expectedVersion.ToString(3), StringComparison.OrdinalIgnoreCase));
+        }
 
         return false;
     }
