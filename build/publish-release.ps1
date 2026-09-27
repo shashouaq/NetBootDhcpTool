@@ -896,10 +896,14 @@ function Assert-ArchiveContents([string]$Path) {
     if ($LASTEXITCODE -ne 0) { throw "Release archive integrity test failed: $testOutput" }
     $listing = & $sevenZip l -slt $Path 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) { throw 'Could not inspect release archive contents.' }
-    $archiveEntry = [System.IO.Path]::GetFullPath($Path).Replace('/', '\')
-    $files = @([regex]::Matches($listing, '(?m)^Path = ([^\r\n]+)') | ForEach-Object { $_.Groups[1].Value.Replace('/', '\') } | Where-Object { $_ -ine $archiveEntry })
+    # 7-Zip's technical listing starts with a Path record for the archive
+    # itself. Its rendered path can differ across versions, so discard the
+    # first Path record instead of comparing it with the caller's path.
+    $pathMatches = @([regex]::Matches($listing, '(?m)^Path = ([^\r\n]+)'))
+    $files = @($pathMatches | Select-Object -Skip 1 | ForEach-Object { $_.Groups[1].Value.Trim().Replace('/', '\').TrimEnd('\') })
     $rootPrefix = 'NetBootDhcpTool\'
-    if ($files | Where-Object { $_ -cne 'NetBootDhcpTool' -and $_ -notlike "$rootPrefix*" }) { throw 'Portable archive contains entries outside the fixed NetBootDhcpTool top-level directory.' }
+    $outsideEntries = @($files | Where-Object { $_ -cne 'NetBootDhcpTool' -and $_ -notlike "$rootPrefix*" })
+    if ($outsideEntries.Count -gt 0) { throw "Portable archive contains entries outside the fixed NetBootDhcpTool top-level directory: $($outsideEntries -join ', ')." }
     foreach ($required in @('NetBootDhcpTool\NetBootDhcpTool.exe', 'NetBootDhcpTool\NetBootDhcpTool.Updater.exe', 'NetBootDhcpTool\install-manifest.json', 'NetBootDhcpTool\config\appsettings.json', 'NetBootDhcpTool\config\favorites.json', 'NetBootDhcpTool\i18n\zh-CN.json', 'NetBootDhcpTool\i18n\en-US.json', 'NetBootDhcpTool\assets\app.ico', 'NetBootDhcpTool\README.md', 'NetBootDhcpTool\docs\RELEASE_NOTES.md', 'NetBootDhcpTool\PresentationNative_cor3.dll', 'NetBootDhcpTool\wpfgfx_cor3.dll')) {
         if ($required -cnotin $files) { throw "Release archive is incomplete; missing $required." }
     }

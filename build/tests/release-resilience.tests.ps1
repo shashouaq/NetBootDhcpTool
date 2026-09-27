@@ -275,6 +275,19 @@ try {
             if ($LASTEXITCODE -ne 0) { throw 'Archive fixture failed' }
         } finally { Pop-Location }
         Assert-Fails { Assert-ArchiveContents $incomplete } 'archive is incomplete'
+
+        $outsideRoot = Join-Path $tempRoot 'outside-root.7z'
+        $outsidePayload = Join-Path $tempRoot 'outside-root-payload'
+        $outsideProduct = Join-Path $outsidePayload 'NetBootDhcpTool'
+        New-Item -ItemType Directory -Path $outsideProduct -Force | Out-Null
+        Copy-Item -LiteralPath $finalManifestPath -Destination (Join-Path $outsideProduct 'latest.json')
+        [IO.File]::WriteAllText((Join-Path $outsidePayload 'unexpected.txt'), 'outside product root')
+        Push-Location $outsidePayload
+        try {
+            & 'C:\Program Files\7-Zip\7z.exe' a $outsideRoot 'NetBootDhcpTool' 'unexpected.txt' | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Outside-root archive fixture failed' }
+        } finally { Pop-Location }
+        Assert-Fails { Assert-ArchiveContents $outsideRoot } 'outside the fixed NetBootDhcpTool top-level directory'
     }
     Write-Output 'RELEASE_RESILIENCE_TESTS_OK'
     $global:LASTEXITCODE = 0
