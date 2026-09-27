@@ -100,7 +100,7 @@ For the specifically reviewed v1.0.17 manifest URL defect, the optional `repair_
 
 For every release, verify the exact source commit and tag, the green exact-commit CI run, the stable GitHub and Gitee Release pages, the archive and sidecar SHA-256 values on both hosts, and identical dual-source manifests. The publisher performs full archive readback from each host and checks the GitHub manifest readback; do not claim publication while that workflow is incomplete.
 
-The v1.0.14 publication used the former GitHub-hosted sync path; its measured full downloads and variable 64 KiB client probes are historical evidence only. v1.0.16 passed the self-hosted publication workflow and an idempotent same-tag rerun; exact run IDs and hashes are recorded in [T19](tasks/T19.md). The app continues to probe the Gitee and GitHub sources independently and select by measured speed. It does not pin users to one host.
+The current v1.0.17 package remained unchanged during the workflow repair. Final ordinary same-tag run `36295609878` succeeded with all seven stages and no uploads; both manifests were repaired separately under an exact old-SHA constraint. Full hashes, attachment IDs, actual-client download evidence and the remaining old-client Gitee-only discovery limitation are recorded in [T19](tasks/T19.md). v1.0.14/v1.0.16 records remain historical evidence. The app continues to probe both download sources and select by measured speed.
 
 ## Gitee Distribution
 
