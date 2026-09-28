@@ -1,6 +1,9 @@
 $ErrorActionPreference = 'Stop'
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 . (Join-Path $repoRoot 'scripts\Publish-GiteeMirror.ps1') -Tag 'v1.0.20' -LibraryOnly
+$priorGitHubToken = $env:GITHUB_TOKEN
+$priorGhToken = $env:GH_TOKEN
+$env:GITHUB_TOKEN = 'test-github-token'
 
 $testRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('netboot-gitee-mirror-tests-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $testRoot -Force | Out-Null
@@ -121,8 +124,10 @@ function Invoke-MirrorHttp {
         $global:GiteeMirrorMock.Attachments.Add($attachment)
         $content = ConvertTo-Json -InputObject $attachment -Compress
     } elseif ($uriObject.Host -eq 'api.github.com' -and $uriObject.AbsolutePath -match '/releases/tags/v1\.0\.20$') {
+        Assert-True ($Headers.Authorization -ceq 'Bearer test-github-token') 'GitHub Release REST requests must use the supplied read-only token.'
         $content = ConvertTo-Json -InputObject $global:GiteeMirrorMock.Fixture.Release -Depth 8 -Compress
     } elseif ($uriObject.Host -eq 'api.github.com' -and $uriObject.AbsolutePath -match '/git/ref/tags/v1\.0\.20$') {
+        Assert-True ($Headers.Authorization -ceq 'Bearer test-github-token') 'GitHub tag REST requests must use the supplied read-only token.'
         $content = '{"object":{"type":"commit","sha":"0123456789012345678901234567890123456789"}}'
     } elseif ($uriObject.Host -eq 'gitee.com' -and $uriObject.AbsolutePath -match '/releases/tags/v1\.0\.20$') {
         if ($null -eq $global:GiteeMirrorMock.Release) { $content = 'null' }
@@ -141,6 +146,7 @@ function Invoke-MirrorHttp {
         $global:GiteeMirrorMock.Release.prerelease = $false
         $content = ConvertTo-Json -InputObject $global:GiteeMirrorMock.Release -Depth 8 -Compress
     } elseif ($uriObject.Host -eq 'github.com' -and $global:GiteeMirrorMock.Fixture.SourceMap.ContainsKey($Uri)) {
+        Assert-True (-not $Headers.ContainsKey('Authorization')) 'Public Release downloads must not receive the GitHub API token.'
         $source = $global:GiteeMirrorMock.Fixture.SourceMap[$Uri]
         if ($OutFile) { Copy-Item -LiteralPath $source -Destination $OutFile | Out-Null }
         else { $content = [System.IO.File]::ReadAllText($source) }
@@ -205,6 +211,8 @@ try {
 
     Write-Output 'GITEE_MIRROR_TESTS_OK create=1 resume=1 mismatched_sha_hard_fail=1 duplicates_preserved=1'
 } finally {
+    if ($null -eq $priorGitHubToken) { Remove-Item Env:GITHUB_TOKEN -ErrorAction SilentlyContinue } else { $env:GITHUB_TOKEN = $priorGitHubToken }
+    if ($null -eq $priorGhToken) { Remove-Item Env:GH_TOKEN -ErrorAction SilentlyContinue } else { $env:GH_TOKEN = $priorGhToken }
     $testRsa.Dispose()
     Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Variable GiteeMirrorMock -Scope Global -ErrorAction SilentlyContinue

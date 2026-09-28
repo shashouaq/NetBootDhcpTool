@@ -86,11 +86,19 @@ function Get-MirrorJson([string]$Content, [string]$Context) {
     catch { throw "$Context returned invalid JSON." }
 }
 
-function Get-GitHubReleaseForMirror([string]$Tag, [string]$Repository) {
+function Get-GitHubMirrorApiHeaders {
     $headers = @{ Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28'; 'User-Agent' = 'NetBootDhcpTool-GiteeMirror/1.0' }
+    $token = if (-not [string]::IsNullOrWhiteSpace($env:GITHUB_TOKEN)) { $env:GITHUB_TOKEN } else { $env:GH_TOKEN }
+    if (-not [string]::IsNullOrWhiteSpace($token) -and $token -notmatch '[\r\n]') {
+        $headers.Authorization = "Bearer $token"
+    }
+    return $headers
+}
+
+function Get-GitHubReleaseForMirror([string]$Tag, [string]$Repository) {
     $uri = "https://api.github.com/repos/$Repository/releases/tags/$([uri]::EscapeDataString($Tag))"
-    $response = Invoke-MirrorHttp -Uri $uri -Headers $headers
-    if ($response.StatusCode -ne 200) { throw "GitHub Release lookup returned HTTP $($response.StatusCode) for $Tag." }
+    $response = Invoke-MirrorHttp -Uri $uri -Headers (Get-GitHubMirrorApiHeaders)
+    if ($response.StatusCode -ne 200) { throw "GitHub Release lookup returned HTTP $($response.StatusCode) for $Tag. Provide a read-only GitHub API token or retry after the API limit resets." }
     $release = Get-MirrorJson $response.Content 'GitHub Release lookup'
     if ($release.tag_name -cne $Tag -or [bool]$release.draft -or [bool]$release.prerelease) {
         throw "GitHub Release $Tag is not a stable, published Release."
@@ -195,7 +203,7 @@ function Assert-MirrorManifestSignature([byte[]]$ManifestBytes, [string]$Signatu
 }
 
 function Get-GitHubTagCommitForMirror([string]$Tag, [string]$Repository) {
-    $headers = @{ Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28'; 'User-Agent' = 'NetBootDhcpTool-GiteeMirror/1.0' }
+    $headers = Get-GitHubMirrorApiHeaders
     $referenceResponse = Invoke-MirrorHttp -Uri "https://api.github.com/repos/$Repository/git/ref/tags/$([uri]::EscapeDataString($Tag))" -Headers $headers
     if ($referenceResponse.StatusCode -ne 200) { throw "GitHub tag ref lookup returned HTTP $($referenceResponse.StatusCode)." }
     $reference = Get-MirrorJson $referenceResponse.Content 'GitHub tag ref'

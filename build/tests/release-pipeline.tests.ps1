@@ -191,8 +191,9 @@ try {
         throw 'Gitee Mirror must use ordinary REST/Release HTTPS and normal certificate validation.'
     }
     if ($giteeWorkflow -notmatch 'workflow_dispatch:' -or $giteeWorkflow -notmatch 'workflow_run:' -or
-        $giteeWorkflow -notmatch "conclusion == 'success'" -or $giteeWorkflow -notmatch 'secrets\.GITEE_TOKEN') {
-        throw 'Gitee mirror needs an independent manual retry and a success-only trigger with a separate Gitee token.'
+        $giteeWorkflow -notmatch "conclusion == 'success'" -or $giteeWorkflow -notmatch 'secrets\.GITEE_TOKEN' -or
+        $giteeWorkflow -notmatch 'GITHUB_TOKEN: \$\{\{ github\.token \}\}') {
+        throw 'Gitee mirror needs an independent manual retry, success-only trigger, separate Gitee token and read-only GitHub API token.'
     }
     if ($giteeWorkflow -match '(?m)^\s+needs:\s*Formal Release') { throw 'Gitee mirror status must not gate or change GitHub Formal Release status.' }
     foreach ($requiredGithubBehavior in @('Test-GitHubAssetReadback', 'Ensure-GitHubAsset', 'stable Release promotion returned', 'make_latest = ''true''')) {
