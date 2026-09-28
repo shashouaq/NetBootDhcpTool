@@ -346,6 +346,7 @@ function Get-GiteeReleaseForMirror([string]$Tag, [string]$Owner, [string]$Reposi
     if ($response.StatusCode -eq 404) { return $null }
     if ($response.StatusCode -ne 200) { throw "Gitee Release lookup returned HTTP $($response.StatusCode)." }
     $release = Get-MirrorJson $response.Content 'Gitee Release lookup'
+    if ($null -eq $release) { return $null }
     if ([string]$release.tag_name -cne $Tag) { throw 'Gitee returned a Release with a different tag.' }
     return $release
 }

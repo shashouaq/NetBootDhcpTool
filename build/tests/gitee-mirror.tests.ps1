@@ -122,7 +122,7 @@ function Invoke-MirrorHttp {
     } elseif ($uriObject.Host -eq 'api.github.com' -and $uriObject.AbsolutePath -match '/git/ref/tags/v1\.0\.20$') {
         $content = '{"object":{"type":"commit","sha":"0123456789012345678901234567890123456789"}}'
     } elseif ($uriObject.Host -eq 'gitee.com' -and $uriObject.AbsolutePath -match '/releases/tags/v1\.0\.20$') {
-        if ($null -eq $global:GiteeMirrorMock.Release) { $status = 404 }
+        if ($null -eq $global:GiteeMirrorMock.Release) { $content = 'null' }
         else { $content = ConvertTo-Json -InputObject $global:GiteeMirrorMock.Release -Depth 8 -Compress }
     } elseif ($uriObject.Host -eq 'gitee.com' -and $uriObject.AbsolutePath -match '/releases/latest$') {
         if ($null -eq $global:GiteeMirrorMock.Release -or $global:GiteeMirrorMock.Release.prerelease) { $status = 404 }
