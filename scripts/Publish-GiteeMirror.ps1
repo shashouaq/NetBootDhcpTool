@@ -23,7 +23,7 @@ function Invoke-MirrorHttp {
         [string]$OutFile,
         [string]$UploadFile,
         [hashtable]$FormFields = @{},
-        [ValidateRange(1, 180)][int]$TimeoutSec = 45
+        [ValidateRange(1, 900)][int]$TimeoutSec = 45
     )
 
     if ($UploadFile) {
@@ -489,7 +489,7 @@ function Publish-GiteeMirror {
             if ($matches.Count -gt 1) { throw "Gitee Release has duplicate attachments named $name; refusing to delete or overwrite any of them." }
             if ($matches.Count -eq 0) {
                 $uploadUri = "https://gitee.com/api/v5/repos/$GiteeOwner/$GiteeRepository/releases/$releaseId/attach_files"
-                $upload = Invoke-MirrorHttp -Uri $uploadUri -Method Post -Headers $headers -UploadFile $local.Path -FormFields @{ access_token = $Token } -TimeoutSec 180
+                $upload = Invoke-MirrorHttp -Uri $uploadUri -Method Post -Headers $headers -UploadFile $local.Path -FormFields @{ access_token = $Token } -TimeoutSec 900
                 if ($upload.StatusCode -notin @(200, 201)) {
                     $recovered = @(Get-GiteeAttachmentsForMirror $releaseId $GiteeOwner $GiteeRepository $Token | Where-Object { [string]$_.name -ceq $name })
                     if ($recovered.Count -ne 1) { throw "Gitee upload for $name returned HTTP $($upload.StatusCode); no unique attachment was recovered. Rerun after the API is available." }

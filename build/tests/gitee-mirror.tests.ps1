@@ -101,13 +101,14 @@ function Invoke-MirrorHttp {
         [string]$OutFile,
         [string]$UploadFile,
         [hashtable]$FormFields = @{},
-        [ValidateRange(1, 180)][int]$TimeoutSec = 45
+        [ValidateRange(1, 900)][int]$TimeoutSec = 45
     )
     $uriObject = [uri]$Uri
     $content = ''
     $status = 200
     if ($UploadFile) {
         Assert-True ($FormFields.access_token -ceq 'test-token') 'Gitee multipart upload must include its access_token form field.'
+        Assert-True ($TimeoutSec -ge 900) 'Gitee package uploads must allow enough time for large release assets.'
         $global:GiteeMirrorMock.UploadCount++
         $name = [System.IO.Path]::GetFileName($UploadFile)
         $id = $global:GiteeMirrorMock.NextAttachmentId++
