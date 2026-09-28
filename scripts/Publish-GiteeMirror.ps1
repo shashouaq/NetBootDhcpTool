@@ -35,14 +35,14 @@ function Invoke-MirrorHttp {
         $escapedToken = ([string]$FormFields['access_token']).Replace('\', '\\').Replace('"', '\"')
         $curlConfig = 'form = "access_token={0}"' -f $escapedToken
         try {
-            $curlOutput = $curlConfig | & $curl --config - --silent --show-error --http1.1 --connect-timeout 20 --max-time $TimeoutSec --fail-with-body --request POST --form "file=@$UploadFile;filename=$([System.IO.Path]::GetFileName($UploadFile))" --dump-header $headersPath --output $responsePath --write-out 'http=%{http_code} seconds=%{time_total}' $Uri 2>&1
+            $curlOutput = $curlConfig | & $curl --config - --silent --show-error --http1.1 --header 'Expect:' --connect-timeout 20 --max-time $TimeoutSec --fail-with-body --request POST --form "file=@$UploadFile;filename=$([System.IO.Path]::GetFileName($UploadFile))" --dump-header $headersPath --output $responsePath --write-out 'http=%{http_code} seconds=%{time_total}' $Uri 2>&1
             $exitCode = $LASTEXITCODE
             $stats = ($curlOutput | Out-String).Trim()
             $statusMatch = [regex]::Match($stats, '(?:^|\s)http=(?<status>\d{3})(?:\s|$)')
             $statusCode = if ($statusMatch.Success) { [int]$statusMatch.Groups['status'].Value } else { 0 }
             if ($statusCode -eq 0) { throw "Gitee attachment upload transport failed with curl exit code $exitCode." }
             $content = if (Test-Path -LiteralPath $responsePath -PathType Leaf) { [System.IO.File]::ReadAllText($responsePath) } else { '' }
-            return [pscustomobject]@{ StatusCode = $statusCode; Content = $content; Headers = @{} }
+            return [pscustomobject]@{ StatusCode = $statusCode; Content = $content; Headers = @{}; ExitCode = $exitCode }
         } finally {
             Remove-Item -LiteralPath $responsePath, $headersPath -Force -ErrorAction SilentlyContinue
         }
@@ -483,7 +483,7 @@ function Publish-GiteeMirror {
                 $upload = Invoke-MirrorHttp -Uri $uploadUri -Method Post -Headers $headers -UploadFile $local.Path -FormFields @{ access_token = $Token } -TimeoutSec 900
                 if ($upload.StatusCode -notin @(200, 201)) {
                     $recovered = @(Get-GiteeAttachmentsForMirror $releaseId $GiteeOwner $GiteeRepository $Token | Where-Object { [string]$_.name -ceq $name })
-                    if ($recovered.Count -ne 1) { throw "Gitee upload for $name returned HTTP $($upload.StatusCode); no unique attachment was recovered. Rerun after the API is available." }
+                    if ($recovered.Count -ne 1) { throw "Gitee upload for $name returned HTTP $($upload.StatusCode) (curl exit $($upload.ExitCode)); no unique attachment was recovered. Rerun after the API is available." }
                     $matches = $recovered
                     Write-Host "[Gitee] Recovered $name after an ambiguous upload response."
                 } else {
