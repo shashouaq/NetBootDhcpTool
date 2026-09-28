@@ -7,7 +7,7 @@
 - Date: 2026-09-28
 - Type: GitHub-hosted formal release and independent Gitee mirror / T19
 - Affected files/modules: formal-release.yml, gitee-mirror.yml, Publish-GitHubRelease.ps1, Prepare-GitHubRelease.ps1, Publish-GiteeMirror.ps1, VersionUpdateService.cs, VersionUpdateSourceTests.cs, release-pipeline.tests.ps1, gitee-mirror.tests.ps1, bilingual release documentation
-- Verification: Local build, UI smoke, 205 MSTest tests, release-pipeline tests and Gitee idempotency simulations passed; one configured performance test was skipped. Exact CI, GitHub formal release, Gitee mirror release and public client/readback verification are pending; record their run IDs and hashes here after completion.
+- Verification: Local build, UI smoke, 205 MSTest tests, release-pipeline tests and Gitee idempotency simulations passed; one configured performance test was skipped. Exact-tag CI `36371898055` and GitHub Formal Release `36372059244` passed; GitHub Release `397922004` is stable with all six assets read back and SHA-256 verified. Gitee Mirror remains pending: independent runs are recorded in T19; Release `1171280` is still prerelease with its two verified sidecars only, while large-asset upload from GitHub-hosted Runner ends with curl exit 55. Public Gitee package/manifest and client readback remain unverified.
 
 ### zh-CN
 
