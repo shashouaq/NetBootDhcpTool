@@ -17,8 +17,8 @@ function New-MirrorFixture {
     $files = [ordered]@{}
     $archiveName = 'NetBootDhcpTool-v1.0.20.7z'
     $fullName = 'NetBootDhcpTool-full-v1.0.20.zip'
-    [System.IO.File]::WriteAllBytes((Join-Path $Root $archiveName), [byte[]](1, 2, 3, 4, 5))
-    [System.IO.File]::WriteAllBytes((Join-Path $Root $fullName), [byte[]](9, 8, 7, 6, 5, 4))
+    [System.IO.File]::WriteAllBytes((Join-Path $Root $archiveName), [byte[]]::new(128))
+    [System.IO.File]::WriteAllBytes((Join-Path $Root $fullName), [byte[]]::new(256))
     foreach ($name in @($archiveName, $fullName)) {
         $hash = (Get-FileHash -LiteralPath (Join-Path $Root $name) -Algorithm SHA256).Hash.ToLowerInvariant()
         [System.IO.File]::WriteAllText((Join-Path $Root ($name + '.sha256')), "$hash  $name", [System.Text.Encoding]::ASCII)
@@ -77,6 +77,7 @@ function Reset-MirrorMock([object]$Fixture) {
         Fixture = $Fixture
         Release = $null
         Attachments = [System.Collections.Generic.List[object]]::new()
+        UploadNames = [System.Collections.Generic.List[string]]::new()
         GiteeFiles = @{}
         NextAttachmentId = 500
         UploadCount = 0
@@ -111,6 +112,7 @@ function Invoke-MirrorHttp {
         Assert-True ($TimeoutSec -ge 900) 'Gitee package uploads must allow enough time for large release assets.'
         $global:GiteeMirrorMock.UploadCount++
         $name = [System.IO.Path]::GetFileName($UploadFile)
+        $global:GiteeMirrorMock.UploadNames.Add($name)
         $id = $global:GiteeMirrorMock.NextAttachmentId++
         $destination = Join-Path $testRoot ('gitee-' + $id + '-' + $name)
         Copy-Item -LiteralPath $UploadFile -Destination $destination | Out-Null
@@ -164,6 +166,10 @@ try {
     Assert-True $first.Succeeded 'Initial mirror run did not succeed.'
     Assert-True ($global:GiteeMirrorMock.SourceSyncCount -eq 1) 'The source tag must be synchronized before Gitee Release creation.'
     Assert-True ($global:GiteeMirrorMock.UploadCount -eq $fixture.Assets.Count) 'Initial run did not upload each formal asset exactly once.'
+    Assert-True (($global:GiteeMirrorMock.UploadNames[0] -ceq 'NetBootDhcpTool-v1.0.20.7z.sha256') -and
+        ($global:GiteeMirrorMock.UploadNames[1] -ceq 'NetBootDhcpTool-full-v1.0.20.zip.sha256')) 'Small package sidecars should upload before large archives.'
+    Assert-True (($global:GiteeMirrorMock.UploadNames[-2] -ceq 'latest.json.sig') -and
+        ($global:GiteeMirrorMock.UploadNames[-1] -ceq 'latest.json')) 'Signed manifest assets must remain the final uploads.'
     Assert-True (-not $global:GiteeMirrorMock.Release.prerelease) 'Gitee Release was not promoted after validation.'
     Assert-True ($first.ArchiveSha256 -ceq $fixture.ArchiveHash) 'Final archive SHA-256 differs from the GitHub source.'
     $uploadCount = $global:GiteeMirrorMock.UploadCount
@@ -182,7 +188,7 @@ try {
     $global:GiteeMirrorMock.Attachments.Add([ordered]@{ id = 499; name = $fixture.ArchiveName; browser_download_url = "https://gitee.com/joel20230302/NetBootDhcpTool/releases/download/v1.0.20/$($fixture.ArchiveName)" })
     $mismatchFailed = $false
     try { $null = Publish-GiteeMirror -Tag $fixture.Tag -Token 'test-token' }
-    catch { $mismatchFailed = $_.Exception.Message -match 'readback size/SHA-256 mismatch' }
+    catch { $mismatchFailed = $_.Exception.Message -match 'size/SHA-256 (preflight )?mismatch' }
     Assert-True $mismatchFailed 'An existing same-name asset with different bytes must hard fail.'
     Assert-True ($global:GiteeMirrorMock.UploadCount -eq 0) 'Mismatched existing bytes must not trigger an upload.'
     Assert-True (Test-Path -LiteralPath $badPath) 'Mismatch handling must preserve the existing attachment bytes.'

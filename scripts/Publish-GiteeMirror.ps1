@@ -472,13 +472,42 @@ function Publish-GiteeMirror {
         if ($releaseId -le 0) { throw "Gitee Release ID is invalid for $Tag." }
         $headers = Get-GiteeApiHeaders $Token
 
-        $orderedNames = @($expected.AssetNames | Where-Object { $_ -notin @('latest.json', 'latest.json.sig') }) + @('latest.json.sig', 'latest.json')
+        $preflightAttachments = Get-GiteeAttachmentsForMirror $releaseId $GiteeOwner $GiteeRepository $Token
+        foreach ($attachment in $preflightAttachments) {
+            if ([string]$attachment.name -cnotin $expected.AssetNames) { throw "Gitee Release contains an undeclared attachment: $($attachment.name)." }
+        }
+        foreach ($name in $expected.AssetNames) {
+            $matches = @($preflightAttachments | Where-Object { [string]$_.name -ceq $name })
+            if ($matches.Count -gt 1) { throw "Gitee Release has duplicate attachments named $name; refusing to delete or overwrite any of them." }
+            if ($matches.Count -eq 1) {
+                $local = $localAssets[$name]
+                $preflightPath = Join-Path $temporaryRoot ('preflight-' + [guid]::NewGuid().ToString('N') + '-' + $name)
+                $downloadUrl = Get-GiteeMirrorDownloadUrl $matches[0] $releaseId $GiteeOwner $GiteeRepository $Tag $name
+                $preflight = Invoke-MirrorHttp -Uri $downloadUrl -Headers @{ 'User-Agent' = 'NetBootDhcpTool-GiteeMirror/1.0' } -OutFile $preflightPath -TimeoutSec 180
+                if ($preflight.StatusCode -ne 200 -or -not (Test-Path -LiteralPath $preflightPath -PathType Leaf) -or
+                    [long](Get-Item -LiteralPath $preflightPath).Length -ne $local.Size -or
+                    (Get-MirrorSha256 $preflightPath) -cne $local.Sha256) {
+                    throw "Gitee existing attachment size/SHA-256 preflight mismatch for $name; no missing attachments were uploaded."
+                }
+                Write-Host "[Gitee] Preflight verified existing $name before any upload."
+            }
+        }
+
+        $payloadNames = @(
+            $expected.AssetNames |
+                Where-Object { $_ -notin @('latest.json', 'latest.json.sig') } |
+                ForEach-Object { [pscustomobject]@{ Name = [string]$_; Size = [long]$localAssets[[string]$_].Size } } |
+                Sort-Object -Property Size, Name |
+                ForEach-Object { $_.Name }
+        )
+        $orderedNames = $payloadNames + @('latest.json.sig', 'latest.json')
         foreach ($name in $orderedNames) {
             $local = $localAssets[$name]
             $attachments = Get-GiteeAttachmentsForMirror $releaseId $GiteeOwner $GiteeRepository $Token
             $matches = @($attachments | Where-Object { [string]$_.name -ceq $name })
             if ($matches.Count -gt 1) { throw "Gitee Release has duplicate attachments named $name; refusing to delete or overwrite any of them." }
             if ($matches.Count -eq 0) {
+                Write-Host "[Gitee] Uploading $name ($($local.Size) bytes)."
                 $uploadUri = "https://gitee.com/api/v5/repos/$GiteeOwner/$GiteeRepository/releases/$releaseId/attach_files"
                 $upload = Invoke-MirrorHttp -Uri $uploadUri -Method Post -Headers $headers -UploadFile $local.Path -FormFields @{ access_token = $Token } -TimeoutSec 900
                 if ($upload.StatusCode -notin @(200, 201)) {
