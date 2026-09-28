@@ -27,33 +27,24 @@ function Invoke-MirrorHttp {
     )
 
     if ($UploadFile) {
-        $client = [System.Net.Http.HttpClient]::new()
-        $client.Timeout = [TimeSpan]::FromSeconds($TimeoutSec)
-        $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Post, $Uri)
-        $form = [System.Net.Http.MultipartFormDataContent]::new()
-        $fileStream = [System.IO.File]::OpenRead($UploadFile)
+        if ($Method -cne 'Post') { throw 'Gitee attachment upload requires POST.' }
+        if (-not $FormFields.ContainsKey('access_token')) { throw 'Gitee attachment upload requires its access_token form field.' }
+        $curl = (Get-Command curl.exe -ErrorAction Stop).Source
+        $responsePath = Join-Path ([System.IO.Path]::GetTempPath()) ('netboot-gitee-upload-' + [guid]::NewGuid().ToString('N') + '.json')
+        $headersPath = $responsePath + '.headers'
+        $escapedToken = ([string]$FormFields['access_token']).Replace('\', '\\').Replace('"', '\"')
+        $curlConfig = 'form = "access_token={0}"' -f $escapedToken
         try {
-            foreach ($name in $Headers.Keys) {
-                if ($name -ieq 'Authorization') { $request.Headers.Authorization = [System.Net.Http.Headers.AuthenticationHeaderValue]::Parse([string]$Headers[$name]) }
-                else { $null = $request.Headers.TryAddWithoutValidation([string]$name, [string]$Headers[$name]) }
-            }
-            foreach ($fieldName in $FormFields.Keys) {
-                $form.Add([System.Net.Http.StringContent]::new([string]$FormFields[$fieldName]), [string]$fieldName)
-            }
-            $fileContent = [System.Net.Http.StreamContent]::new($fileStream)
-            $fileContent.Headers.ContentType = [System.Net.Http.Headers.MediaTypeHeaderValue]::Parse('application/octet-stream')
-            $form.Add($fileContent, 'file', [System.IO.Path]::GetFileName($UploadFile))
-            $request.Content = $form
-            $response = $client.SendAsync($request, [System.Net.Http.HttpCompletionOption]::ResponseContentRead).GetAwaiter().GetResult()
-            try {
-                $content = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
-                return [pscustomobject]@{ StatusCode = [int]$response.StatusCode; Content = $content; Headers = $response.Headers }
-            } finally { $response.Dispose() }
+            $curlOutput = $curlConfig | & $curl --config - --silent --show-error --http1.1 --connect-timeout 20 --max-time $TimeoutSec --fail-with-body --request POST --form "file=@$UploadFile;filename=$([System.IO.Path]::GetFileName($UploadFile))" --dump-header $headersPath --output $responsePath --write-out 'http=%{http_code} seconds=%{time_total}' $Uri 2>&1
+            $exitCode = $LASTEXITCODE
+            $stats = ($curlOutput | Out-String).Trim()
+            $statusMatch = [regex]::Match($stats, '(?:^|\s)http=(?<status>\d{3})(?:\s|$)')
+            $statusCode = if ($statusMatch.Success) { [int]$statusMatch.Groups['status'].Value } else { 0 }
+            if ($statusCode -eq 0) { throw "Gitee attachment upload transport failed with curl exit code $exitCode." }
+            $content = if (Test-Path -LiteralPath $responsePath -PathType Leaf) { [System.IO.File]::ReadAllText($responsePath) } else { '' }
+            return [pscustomobject]@{ StatusCode = $statusCode; Content = $content; Headers = @{} }
         } finally {
-            $fileStream.Dispose()
-            $form.Dispose()
-            $request.Dispose()
-            $client.Dispose()
+            Remove-Item -LiteralPath $responsePath, $headersPath -Force -ErrorAction SilentlyContinue
         }
     }
 
