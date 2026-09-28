@@ -55,4 +55,18 @@ jobs:
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
           RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
         run: |
-          .\scripts\Publish-GiteeMirror.ps1 -Tag $env:RELEASE_TAG
+          try {
+            .\scripts\Publish-GiteeMirror.ps1 -Tag $env:RELEASE_TAG
+          }
+          catch {
+            $message = [string]$_.Exception.Message
+            if (-not [string]::IsNullOrEmpty($env:GITEE_TOKEN)) {
+              $message = $message.Replace($env:GITEE_TOKEN, '[redacted]')
+            }
+            $message = $message -replace '(?i)(access_token=)[^&\s]+', '$1[redacted]'
+            $message = $message -replace '[\r\n]+', ' '
+            if ($message.Length -gt 1200) { $message = $message.Substring(0, 1200) }
+            $message = $message.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error title=Gitee Mirror Failed::$message"
+            exit 1
+          }
