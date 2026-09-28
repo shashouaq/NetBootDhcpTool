@@ -13,8 +13,8 @@ jobs:
   build-and-test:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-dotnet@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-dotnet@v6
         with:
           dotnet-version: 10.0.401
       - name: Restore
@@ -33,6 +33,9 @@ jobs:
             Write-Output "::error title=Release pipeline test failure::$message $position"
             throw
           }
+      - name: Test independent Gitee mirror recovery
+        shell: pwsh
+        run: .\build\tests\gitee-mirror.tests.ps1
       - name: Build the actual-client manifest gate
         run: dotnet build .\build\release-pipeline\ClientManifestCheck.csproj -c Release
       - name: Build

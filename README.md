@@ -1,6 +1,6 @@
 # NetBoot DHCP Tool
 
-Version: 1.0.19
+Version: 1.0.20
 
 Authors: Joel & Codex
 
@@ -32,7 +32,7 @@ Every application action button has a small, visible-by-default round `?` help i
 
 ## Version Check
 
-The application displays its running version when it starts. It checks the public [Gitee releases](https://gitee.com/joel20230302/NetBootDhcpTool/releases) and the GitHub `latest.json` manifest, selecting the newest validated release. When an update is available, it probes up to 64 KB from each available mirror, prioritizes the faster source, and shows the results beside the update link and in its tooltip. For a signed release, the app downloads a Full package or an exact-baseline OTA package into `%LOCALAPPDATA%\NetBootDhcpTool\updates\staging`, verifies the release signature, package hash, installation inventory and every managed file, then shows **Restart to upgrade**. The separate updater waits for normal app shutdown, applies the transaction, verifies the installed files and starts the new version; a failed start restores the previous managed files. Existing unsigned manifests remain available as manual `.7z` downloads and never enable automatic installation. Downloads can be canceled, and a failed or idle mirror falls back to the other approved source. If speed remains below 3 KB/s for 10 seconds, the app only displays `1406829360@qq.com`.
+The application displays its running version when it starts. It checks the public [Gitee releases](https://gitee.com/joel20230302/NetBootDhcpTool/releases) and the GitHub `latest.json` manifest, selecting the newest validated release. When an update is available, it probes up to 64 KB only from mirrors whose signed manifest version, archive filename and SHA-256 match the selected formal release; stale or mismatched mirrors are excluded. It prioritizes the faster eligible source and shows the results beside the update link and in its tooltip. For a signed release, the app downloads a Full package or an exact-baseline OTA package into `%LOCALAPPDATA%\NetBootDhcpTool\updates\staging`, verifies the release signature, package hash, installation inventory and every managed file, then shows **Restart to upgrade**. The separate updater waits for normal app shutdown, applies the transaction, verifies the installed files and starts the new version; a failed start restores the previous managed files. Existing unsigned manifests remain available as manual `.7z` downloads and never enable automatic installation. Downloads can be canceled, and a failed or idle eligible mirror falls back to the other approved source. If speed remains below 3 KB/s for 10 seconds, the app only displays `1406829360@qq.com`.
 
 ## Build
 

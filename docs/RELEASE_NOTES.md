@@ -1,4 +1,22 @@
-# Release Notes
+﻿# Release Notes
+
+## v1.0.20
+
+### zh-CN
+
+NetBoot DHCP Tool v1.0.20 将正式发布与 Gitee 镜像同步拆开，提升发布可靠性。
+
+- 正式包在 GitHub-hosted Windows Runner 上只构建一次，GitHub 发布和完整性校验独立完成。
+- Gitee 镜像可在 GitHub 正式发布成功后单独重试和续传，不会让镜像故障回滚 GitHub 发布状态。
+- 更新检查只测速和下载签名信息与当前正式版本一致的镜像；过期或文件名、SHA-256 不匹配的镜像会自动排除。
+
+### en-US
+
+NetBoot DHCP Tool v1.0.20 separates formal publication from Gitee mirror synchronization for more reliable releases.
+
+- The formal package is built once on a GitHub-hosted Windows runner, followed by independent GitHub publication and full integrity verification.
+- Gitee mirroring can be retried or resumed after GitHub publication succeeds; mirror failures do not change the GitHub release state.
+- Update checks probe and download only mirrors whose signed metadata matches the current formal version; stale sources or filename/SHA-256 mismatches are excluded.
 
 ## v1.0.19
 

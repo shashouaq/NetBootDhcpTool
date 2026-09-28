@@ -1,6 +1,27 @@
-# Feature Change Log
+﻿# Feature Change Log
 
 ## Unreleased
+
+## v1.0.20 / 2026-09-28
+
+- Date: 2026-09-28
+- Type: GitHub-hosted formal release and independent Gitee mirror / T19
+- Affected files/modules: formal-release.yml, gitee-mirror.yml, Publish-GitHubRelease.ps1, Prepare-GitHubRelease.ps1, Publish-GiteeMirror.ps1, VersionUpdateService.cs, VersionUpdateSourceTests.cs, release-pipeline.tests.ps1, gitee-mirror.tests.ps1, bilingual release documentation
+- Verification: Local build, UI smoke, 205 MSTest tests, release-pipeline tests and Gitee idempotency simulations passed; one configured performance test was skipped. Exact CI, GitHub formal release, Gitee mirror release and public client/readback verification are pending; record their run IDs and hashes here after completion.
+
+### zh-CN
+
+NetBoot DHCP Tool v1.0.20 将正式发布与 Gitee 镜像同步拆开，提升发布可靠性。
+
+- 变更内容：正式 CI、唯一一次正式包构建、签名、GitHub Release 和公开完整性验证迁移到 GitHub-hosted Windows Runner。Gitee 镜像改为独立、可重试的 REST 工作流：下载已正式发布的 GitHub 附件，校验哈希和签名，复用匹配附件，只上传缺失文件，冲突时失败，并验证 Gitee 实际下载。镜像会先核对发布 Tag，并在不重写远端历史的前提下快进同步必要源码。客户端仅测速和下载签名清单与当前正式版本、归档名及 SHA-256 一致的来源。
+- 用户影响：Gitee 临时故障不再改变已成功的 GitHub 正式发布状态；后续可断点补传而无需重建。客户端会自动排除过期或不匹配的镜像。旧 self-hosted 工作流及脚本在新架构正式验收前保留。
+
+### en-US
+
+NetBoot DHCP Tool v1.0.20 separates formal publication from Gitee mirror synchronization for more reliable releases.
+
+- Concrete change: Move formal CI, the single package build, signing, GitHub Release and public integrity verification to GitHub-hosted Windows runners. Publish Gitee through an independent rerunnable REST workflow that downloads the already-published GitHub assets, verifies hashes and signature, reuses matching attachments, uploads only missing files, fails on conflicts, and verifies actual Gitee downloads. The mirror checks the release tag and fast-forwards required source refs without rewriting remote history. Clients probe and download only sources whose signed manifest matches the current formal version, archive name and SHA-256.
+- User impact: A temporary Gitee problem no longer changes a successful GitHub formal-release result. Gitee synchronization can resume later without rebuilding, and clients automatically exclude stale or mismatched mirrors. The former self-hosted workflow and scripts remain available until the new architecture passes formal release verification.
 
 ## v1.0.19 / 2026-09-28
 

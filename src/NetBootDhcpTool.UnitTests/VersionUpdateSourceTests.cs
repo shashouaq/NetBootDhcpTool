@@ -31,7 +31,9 @@ public sealed class VersionUpdateSourceTests
             if (request.RequestUri.AbsoluteUri == GiteeManifestUrl)
                 return Json(Manifest("1.0.14"));
             if (request.RequestUri.AbsoluteUri == VersionUpdateService.DefaultManifestUrl)
-                return Json(Manifest("1.0.14"));
+                return Json(GithubManifest());
+            if (request.RequestUri.AbsoluteUri.EndsWith(".sig", StringComparison.Ordinal))
+                return new HttpResponseMessage(HttpStatusCode.NotFound);
             if (request.Headers.Range?.Ranges.SingleOrDefault() is not { From: 0, To: 65535 })
                 return new HttpResponseMessage(HttpStatusCode.RequestedRangeNotSatisfiable);
             if (request.RequestUri.Host.Equals("github.com", StringComparison.OrdinalIgnoreCase))
@@ -46,8 +48,8 @@ public sealed class VersionUpdateSourceTests
         Assert.IsTrue(result.Succeeded, result.Error);
         Assert.IsTrue(result.IsNewVersion);
         Assert.AreEqual(2, result.DownloadSpeeds.Count);
-        Assert.AreEqual(GiteeArchiveUrl, result.DownloadUrl);
-        Assert.AreEqual(GiteeArchiveUrl, result.DownloadUrls[0]);
+        Assert.AreEqual("https://gitee.com/joel20230302/NetBootDhcpTool/releases/download/v1.0.14/NetBootDhcpTool-v1.0.14.7z", result.DownloadUrl);
+        Assert.AreEqual(result.DownloadUrl, result.DownloadUrls[0]);
         Assert.IsTrue(result.DownloadSpeeds.All(source => source.BytesPerSecond is > 0));
         Assert.IsTrue(result.DownloadSpeeds.Single(source => source.Url == result.DownloadUrl).BytesPerSecond
             > result.DownloadSpeeds.Single(source => source.Url == GithubArchiveUrl).BytesPerSecond);
@@ -55,8 +57,8 @@ public sealed class VersionUpdateSourceTests
         Assert.IsTrue(requests.Where(request => request.Headers.Range != null).All(request =>
             request.Headers.Range!.Ranges.Single().From == 0 && request.Headers.Range.Ranges.Single().To == 65535));
         Assert.AreEqual(2, requests.Count(request => request.Headers.Range != null));
-        Assert.AreEqual("https://gitee.com/joel20230302/NetBootDhcpTool/releases/tag/v1.0.14", result.ReleasePageUrl,
-            "An equal version keeps the first valid release source.");
+        Assert.AreEqual("https://github.com/shashouaq/NetBootDhcpTool/releases/tag/v1.0.14", result.ReleasePageUrl,
+            "When both sources match, use the formal GitHub release metadata and select download mirrors by speed.");
     }
 
     [TestMethod]
@@ -131,7 +133,9 @@ public sealed class VersionUpdateSourceTests
         Assert.IsTrue(result.Succeeded, result.Error);
         Assert.AreEqual(new Version(1, 0, 18), result.LatestVersion);
         Assert.IsTrue(result.IsNewVersion);
-        CollectionAssert.AreEquivalent(new[] { giteeArchiveUrl, githubArchiveUrl }, result.DownloadUrls.ToArray());
+        CollectionAssert.AreEquivalent(new[] { giteeArchiveUrl }, result.DownloadUrls.ToArray(),
+            "A Gitee-only check has not validated the GitHub source manifest, so it may probe only Gitee.");
+        Assert.AreEqual(1, requests.Count(url => url.EndsWith(".7z", StringComparison.Ordinal)));
         Assert.IsTrue(requests.Contains(giteeManifestUrl), "The Gitee API's canonical latest.json download URL should be fetched directly.");
         Assert.IsFalse(requests.Contains(VersionUpdateService.DefaultManifestUrl), "A Gitee-only check must succeed without the GitHub fallback manifest.");
     }
@@ -192,6 +196,48 @@ public sealed class VersionUpdateSourceTests
         Assert.AreEqual(GithubArchiveUrl, result.DownloadUrl);
         Assert.AreEqual("https://github.com/shashouaq/NetBootDhcpTool/releases/tag/v1.0.14", result.ReleasePageUrl);
         Assert.IsTrue(requests.Contains(VersionUpdateService.DefaultManifestUrl));
+        CollectionAssert.AreEqual(new[] { GithubArchiveUrl }, requests
+            .Where(url => url.EndsWith(".7z", StringComparison.Ordinal))
+            .ToArray(), "The stale Gitee mirror must be excluded from speed probes.");
+    }
+
+    [TestMethod]
+    public async Task SameVersionGiteeWithDifferentArchiveNameAndHashIsNotProbed()
+    {
+        var requests = new ConcurrentQueue<string>();
+        const string staleGiteeManifest = """
+            {
+              "version": "1.0.14",
+              "archiveName": "NetBootDhcpTool-v1.0.14-stale.7z",
+              "archiveSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "downloadUrl": "https://gitee.com/joel20230302/NetBootDhcpTool/releases/download/v1.0.14/NetBootDhcpTool-v1.0.14.7z",
+              "downloadMirrors": ["https://github.com/shashouaq/NetBootDhcpTool/releases/download/v1.0.14/NetBootDhcpTool-v1.0.14.7z"],
+              "releasePageUrl": "https://gitee.com/joel20230302/NetBootDhcpTool/releases/tag/v1.0.14"
+            }
+            """;
+        using var client = new HttpClient(new DelegateHandler((request, _) =>
+        {
+            var url = request.RequestUri!.AbsoluteUri;
+            requests.Enqueue(url);
+            if (url == VersionUpdateService.GiteeLatestReleaseApiUrl)
+                return Task.FromResult(Json("{\"id\":123,\"tag_name\":\"v1.0.14\",\"prerelease\":false}"));
+            if (request.RequestUri.AbsolutePath.EndsWith("/attach_files", StringComparison.Ordinal))
+                return Task.FromResult(Json($"[{{\"name\":\"latest.json\",\"browser_download_url\":\"{GiteeManifestUrl}\"}}]"));
+            if (url == GiteeManifestUrl) return Task.FromResult(Json(staleGiteeManifest));
+            if (url == VersionUpdateService.DefaultManifestUrl) return Task.FromResult(Json(GithubManifest()));
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent([1, 2, 3]) });
+        }));
+        using var service = new VersionUpdateService(client);
+
+        var result = await service.CheckAsync(new Version(1, 0, 13));
+
+        Assert.IsTrue(result.Succeeded, result.Error);
+        Assert.AreEqual("NetBootDhcpTool-v1.0.14.7z", result.ArchiveName);
+        Assert.AreEqual("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", result.ArchiveSha256);
+        CollectionAssert.AreEqual(new[] { GithubArchiveUrl }, result.DownloadUrls.ToArray());
+        CollectionAssert.AreEqual(new[] { GithubArchiveUrl }, requests
+            .Where(url => url.EndsWith(".7z", StringComparison.Ordinal))
+            .ToArray(), "A same-version Gitee manifest with a different filename/hash must not enter speed probes.");
     }
 
     [TestMethod]
@@ -225,18 +271,24 @@ public sealed class VersionUpdateSourceTests
         Assert.AreEqual(3, requests.Count);
     }
 
-    private static string Manifest(string version) => $$"""
-        {
-          "version": "{{version}}",
-          "releasedAt": "2026-09-26T00:00:00Z",
-          "archiveName": "NetBootDhcpTool-v1.0.14.7z",
-          "archiveSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-          "downloadUrl": "{{GiteeArchiveUrl}}",
-          "downloadMirrors": ["{{GithubArchiveUrl}}"],
-          "releasePageUrl": "https://gitee.com/joel20230302/NetBootDhcpTool/releases/tag/v1.0.14",
-          "changes": ["Gitee distribution"]
-        }
-        """;
+    private static string Manifest(string version)
+    {
+        var archiveName = $"NetBootDhcpTool-v{version}.7z";
+        var giteeUrl = $"https://gitee.com/joel20230302/NetBootDhcpTool/releases/download/v{version}/{archiveName}";
+        var githubUrl = $"https://github.com/shashouaq/NetBootDhcpTool/releases/download/v{version}/{archiveName}";
+        return $$"""
+            {
+              "version": "{{version}}",
+              "releasedAt": "2026-09-26T00:00:00Z",
+              "archiveName": "{{archiveName}}",
+              "archiveSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "downloadUrl": "{{giteeUrl}}",
+              "downloadMirrors": ["{{githubUrl}}"],
+              "releasePageUrl": "https://gitee.com/joel20230302/NetBootDhcpTool/releases/tag/v{{version}}",
+              "changes": ["Gitee distribution"]
+            }
+            """;
+    }
 
     private static string GithubManifest() => $$"""
         {
@@ -244,6 +296,7 @@ public sealed class VersionUpdateSourceTests
           "archiveName": "NetBootDhcpTool-v1.0.14.7z",
           "archiveSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
           "downloadUrl": "{{GithubArchiveUrl}}",
+          "downloadMirrors": ["{{GiteeArchiveUrl}}"],
           "releasePageUrl": "https://github.com/shashouaq/NetBootDhcpTool/releases/tag/v1.0.14"
         }
         """;

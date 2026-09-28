@@ -26,6 +26,7 @@ $archive = Join-Path $releaseRoot "NetBootDhcpTool-v$version.7z"
 $fullPackageName = "NetBootDhcpTool-full-v$version.zip"
 $fullPackage = Join-Path $releaseRoot $fullPackageName
 $manifestPath = Join-Path $releaseRoot 'latest.json'
+$releaseNotesPath = Join-Path $root 'docs\RELEASE_NOTES.md'
 $changeLogPath = Join-Path $root 'docs\FEATURE_CHANGELOG.md'
 $sevenZip = 'C:\Program Files\7-Zip\7z.exe'
 
@@ -191,15 +192,20 @@ $archiveHash = Write-Checksum $archive
 
 $releaseNotes = ''
 $changeItems = @()
-if (Test-Path -LiteralPath $changeLogPath) {
+$releaseSection = $null
+if (Test-Path -LiteralPath $releaseNotesPath) {
+    $releaseNotesDocument = Get-Content -LiteralPath $releaseNotesPath -Raw
+    $releaseSection = [regex]::Match($releaseNotesDocument, "(?ms)^##\s+v$([regex]::Escape($version))\b.*?(?=^##\s+|\z)")
+}
+if (-not $releaseSection.Success -and (Test-Path -LiteralPath $changeLogPath)) {
     $changeLog = Get-Content -LiteralPath $changeLogPath -Raw
-    $section = [regex]::Match($changeLog, "(?ms)^##\s+v$([regex]::Escape($version))\b.*?(?=^##\s+|\z)")
-    if (-not $section.Success) { $section = [regex]::Match($changeLog, '(?ms)^##\s+Unreleased\b.*?(?=^##\s+|\z)') }
-    if ($section.Success) {
-        $releaseNotes = $section.Value.Trim()
-        $changeItems = @([regex]::Matches($releaseNotes, '(?m)^-\s+(?:Concrete change|User impact|变更内容|用户影响)[：:]?\s*(.+)$') | ForEach-Object { $_.Groups[1].Value.Trim() })
-        if ($changeItems.Count -eq 0) { $changeItems = @([regex]::Matches($releaseNotes, '(?m)^-\s+(.+)$') | ForEach-Object { $_.Groups[1].Value.Trim() }) }
-    }
+    $releaseSection = [regex]::Match($changeLog, "(?ms)^##\s+v$([regex]::Escape($version))\b.*?(?=^##\s+|\z)")
+    if (-not $releaseSection.Success) { $releaseSection = [regex]::Match($changeLog, '(?ms)^##\s+Unreleased\b.*?(?=^##\s+|\z)') }
+}
+if ($null -ne $releaseSection -and $releaseSection.Success) {
+    $releaseNotes = $releaseSection.Value.Trim()
+    $changeItems = @([regex]::Matches($releaseNotes, '(?m)^-\s+(?:Concrete change|User impact|变更内容|用户影响)[：:]?\s*(.+)$') | ForEach-Object { $_.Groups[1].Value.Trim() })
+    if ($changeItems.Count -eq 0) { $changeItems = @([regex]::Matches($releaseNotes, '(?m)^-\s+(.+)$') | ForEach-Object { $_.Groups[1].Value.Trim() }) }
 }
 $manifestObject = [ordered]@{
     version = $version

@@ -1,0 +1,58 @@
+name: Gitee Mirror
+run-name: Gitee mirror ${{ inputs.release_tag || github.event.workflow_run.display_title }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Stable GitHub Release tag to mirror or resume
+        required: true
+        type: string
+  workflow_run:
+    workflows: [Formal Release]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: netboot-gitee-mirror
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    name: Mirror and verify Gitee independently
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve the formal release tag
+        id: release
+        shell: pwsh
+        env:
+          INPUT_TAG: ${{ inputs.release_tag }}
+          FORMAL_RELEASE_TITLE: ${{ github.event.workflow_run.display_title }}
+        run: |
+          $tag = $env:INPUT_TAG
+          if ([string]::IsNullOrWhiteSpace($tag)) {
+            $match = [regex]::Match($env:FORMAL_RELEASE_TITLE, '(?<![A-Za-z0-9])v\d+\.\d+\.\d+$')
+            if (-not $match.Success) { throw 'Could not read a stable tag from the completed Formal Release title.' }
+            $tag = $match.Value
+          }
+          if ($tag -notmatch '^v\d+\.\d+\.\d+$') { throw 'Gitee Mirror requires a stable v<major>.<minor>.<patch> tag.' }
+          "release_tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Publish or resume the Gitee mirror
+        shell: pwsh
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+        run: |
+          .\scripts\Publish-GiteeMirror.ps1 -Tag $env:RELEASE_TAG

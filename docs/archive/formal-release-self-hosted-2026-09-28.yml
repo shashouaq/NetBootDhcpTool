@@ -1,0 +1,146 @@
+name: Formal Release
+run-name: Formal release ${{ inputs.release_tag }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Stable tag whose exact main commit already passed Windows CI
+        required: true
+        type: string
+      repair_manifest_sha256:
+        description: Optional exact old manifest SHA-256 for a reviewed client-URL-only repair
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: netboot-formal-release
+  cancel-in-progress: false
+
+jobs:
+  verify-ci:
+    name: Verify tag and exact-commit CI
+    runs-on: windows-latest
+    outputs:
+      release_commit: ${{ steps.verify.outputs.release_commit }}
+      publisher_commit: ${{ steps.verify.outputs.publisher_commit }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Require a stable main tag with passing Windows CI
+        id: verify
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          if ($env:GITHUB_REF -cne 'refs/heads/main') { throw 'Dispatch Formal Release from the main branch.' }
+          if ($env:RELEASE_TAG -notmatch '^v\d+\.\d+\.\d+$') { throw 'Release tag must use v<major>.<minor>.<patch>.' }
+          [xml]$project = Get-Content -LiteralPath 'src\NetBootDhcpTool.App\NetBootDhcpTool.App.csproj'
+          if ($env:RELEASE_TAG -cne "v$($project.Project.PropertyGroup.Version)") { throw 'Release tag does not match the checked-in application version.' }
+          git fetch origin main --tags
+          if ($LASTEXITCODE -ne 0) { throw 'Could not fetch main and release tags.' }
+          $releaseCommit = (git rev-parse "refs/tags/$($env:RELEASE_TAG)^{commit}").Trim()
+          if ($LASTEXITCODE -ne 0) { throw "Release tag $($env:RELEASE_TAG) does not exist on GitHub." }
+          $publisherCommit = [string]$env:GITHUB_SHA
+          if ($publisherCommit -notmatch '^[a-fA-F0-9]{40}$') { throw 'Workflow publisher commit is not a full Git SHA.' }
+          $publisherCommit = $publisherCommit.ToLowerInvariant()
+          $mainCommit = (git rev-parse 'refs/remotes/origin/main').Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'Could not resolve origin/main.' }
+          git merge-base --is-ancestor $releaseCommit $mainCommit
+          if ($LASTEXITCODE -ne 0) { throw 'Release tag is not contained in origin/main.' }
+          git merge-base --is-ancestor $publisherCommit $mainCommit
+          if ($LASTEXITCODE -ne 0) { throw 'Workflow publisher commit is not contained in origin/main.' }
+
+          foreach ($requiredTagFile in @('build/publish-release.ps1', 'build/release-pipeline/ReleaseState.psm1', 'build/publish.ps1')) {
+            git cat-file -e "${releaseCommit}:$requiredTagFile"
+            if ($LASTEXITCODE -ne 0) { throw "Release tag $($env:RELEASE_TAG) does not contain required release file $requiredTagFile." }
+            git cat-file -e "${publisherCommit}:$requiredTagFile"
+            if ($LASTEXITCODE -ne 0) { throw "Workflow publisher commit does not contain required release file $requiredTagFile." }
+          }
+
+          Import-Module .\build\release-pipeline\ReleaseState.psm1 -Force
+          foreach ($requiredCommit in @($releaseCommit, $publisherCommit) | Select-Object -Unique) {
+            $endpoint = "repos/$env:GITHUB_REPOSITORY/actions/workflows/windows-ci.yml/runs?head_sha=$requiredCommit&status=success&per_page=100"
+            $runJson = gh api $endpoint
+            if ($LASTEXITCODE -ne 0) { throw "Could not read Windows CI runs for commit $requiredCommit." }
+            $runs = $runJson | ConvertFrom-Json
+            if (-not (Test-SuccessfulMainWindowsCiRun -Runs @($runs.workflow_runs) -Commit $requiredCommit)) {
+              throw "Windows CI has no successful main push run for exact commit $requiredCommit."
+            }
+          }
+
+          "release_commit=$releaseCommit" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "publisher_commit=$publisherCommit" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "Release tag $($env:RELEASE_TAG) and publisher $publisherCommit both have successful exact-commit Windows CI."
+
+  publish:
+    name: Build once and publish both mirrors
+    needs: verify-ci
+    runs-on: [self-hosted, windows, x64, netboot-release]
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.release_tag }}
+          fetch-depth: 0
+
+      - name: Load release tooling from the workflow commit
+        shell: pwsh
+        env:
+          PUBLISHER_COMMIT: ${{ needs.verify-ci.outputs.publisher_commit }}
+        run: |
+          if ($env:PUBLISHER_COMMIT -notmatch '^[a-fA-F0-9]{40}$') { throw 'Workflow publisher commit is not a full Git SHA.' }
+          git fetch origin $env:PUBLISHER_COMMIT --no-tags
+          if ($LASTEXITCODE -ne 0) { throw 'Could not fetch the CI-verified workflow commit for release tooling.' }
+          $releaseToolFiles = @('build/publish-release.ps1', 'build/release-pipeline/ReleaseState.psm1', 'build/release-pipeline/ReleaseTransport.psm1', 'build/release-pipeline/ClientManifestCheck.csproj', 'build/release-pipeline/ClientManifestCheck.cs', 'build/publish.ps1')
+          foreach ($toolPath in $releaseToolFiles) {
+            git cat-file -e "${env:PUBLISHER_COMMIT}:$toolPath"
+            if ($LASTEXITCODE -ne 0) { throw "The workflow commit does not contain release tool $toolPath." }
+            $toolContent = git show "${env:PUBLISHER_COMMIT}:$toolPath"
+            if ($LASTEXITCODE -ne 0) { throw "Could not read release tool $toolPath from the workflow commit." }
+            $destinationPath = Join-Path $env:GITHUB_WORKSPACE $toolPath
+            [System.IO.File]::WriteAllText($destinationPath, ($toolContent -join "`n") + "`n", [System.Text.UTF8Encoding]::new($false))
+          }
+          Write-Host "Loaded release tooling from CI-verified workflow commit $($env:PUBLISHER_COMMIT); application sources remain at the requested release tag."
+
+      - name: Set user-writable .NET SDK install path
+        shell: pwsh
+        run: |
+          $sdkRoot = Join-Path $env:LOCALAPPDATA 'NetBootDhcpTool\dotnet'
+          New-Item -ItemType Directory -Path $sdkRoot -Force | Out-Null
+          "DOTNET_INSTALL_DIR=$sdkRoot" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.401
+
+      - name: Build, publish and verify both mirrors (seven-stage summary)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_COMMIT: ${{ needs.verify-ci.outputs.release_commit }}
+          REPAIR_MANIFEST_SHA256: ${{ inputs.repair_manifest_sha256 }}
+          # The publisher supplies Gitee credentials through GIT_ASKPASS. Ignore
+          # machine-wide credential helpers so this runner never blocks on an
+          # interactive Windows Credential Manager prompt.
+          GIT_CONFIG_COUNT: '1'
+          GIT_CONFIG_KEY_0: credential.helper
+          GIT_CONFIG_VALUE_0: ''
+          GIT_TERMINAL_PROMPT: '0'
+          GCM_INTERACTIVE: never
+        run: |
+          $workspace = [System.IO.Path]::GetFullPath($env:GITHUB_WORKSPACE)
+          $runnerWork = Split-Path -Parent (Split-Path -Parent $workspace)
+          $stateRoot = Join-Path $runnerWork '_release-state\NetBootDhcpTool'
+          .\build\publish-release.ps1 -Tag $env:RELEASE_TAG -SourceCommit $env:RELEASE_COMMIT -StateRoot $stateRoot -RepairManifestSha256 $env:REPAIR_MANIFEST_SHA256

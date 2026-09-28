@@ -74,7 +74,8 @@ public sealed class UpdateDownloadResult
 
 public sealed class VersionUpdateService : IDisposable
 {
-    private sealed record ManifestPayload(string Json, string Signature);
+    private sealed record ManifestPayload(string Json, string Signature, string SourceUrl);
+    private sealed record ManifestCandidate(Uri SourceUri, UpdateCheckResult Result);
 
     public const string DefaultManifestUrl = "https://github.com/shashouaq/NetBootDhcpTool/releases/latest/download/latest.json";
     public const string GiteeLatestReleaseApiUrl = "https://gitee.com/api/v5/repos/joel20230302/NetBootDhcpTool/releases/latest";
@@ -107,7 +108,7 @@ public sealed class VersionUpdateService : IDisposable
     public async Task<UpdateCheckResult> CheckAsync(Version currentVersion, CancellationToken ct = default, IProgress<UpdateSourceSpeed>? speedProgress = null)
     {
         var errors = new List<string>();
-        UpdateCheckResult? candidate = null;
+        var candidates = new List<ManifestCandidate>();
         foreach (var manifestUri in _manifestUris)
         {
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(8));
@@ -120,8 +121,7 @@ public sealed class VersionUpdateService : IDisposable
                 var result = Evaluate(response.Json, response.Signature, currentVersion, _trustedPublicKeyPem);
                 if (result.Succeeded)
                 {
-                    if (candidate?.LatestVersion is null || result.LatestVersion > candidate.LatestVersion)
-                        candidate = result;
+                    candidates.Add(new ManifestCandidate(new Uri(response.SourceUrl, UriKind.Absolute), result));
                     continue;
                 }
                 errors.Add($"{manifestUri.Host}: {result.Error}");
@@ -136,8 +136,16 @@ public sealed class VersionUpdateService : IDisposable
             }
         }
 
-        if (candidate is null)
+        if (candidates.Count == 0)
             return new UpdateCheckResult { CurrentVersion = currentVersion, Succeeded = false, Error = string.Join("; ", errors) };
+        var candidateSource = candidates
+            .Where(item => item.SourceUri.Host.Equals("github.com", StringComparison.OrdinalIgnoreCase))
+            .OrderByDescending(item => item.Result.LatestVersion)
+            .FirstOrDefault()
+            ?? candidates.OrderByDescending(item => item.Result.LatestVersion).First();
+        var candidate = RestrictToMatchingMirrors(candidateSource.Result, candidates);
+        if (candidate.DownloadUrls.Count == 0)
+            return new UpdateCheckResult { CurrentVersion = currentVersion, Succeeded = false, Error = "No mirror has a manifest matching the selected version, filename, and SHA-256." };
         if (!candidate.IsNewVersion) return candidate;
 
         var measured = await MeasureDownloadSourcesAsync(candidate.DownloadUrls, speedProgress, ct);
@@ -149,6 +157,83 @@ public sealed class VersionUpdateService : IDisposable
         var prioritizedUrls = fastest.Length > 0 ? fastest : candidate.DownloadUrls;
         return CopyWithDownloadSources(candidate, prioritizedUrls, measured);
     }
+
+    private static UpdateCheckResult RestrictToMatchingMirrors(UpdateCheckResult selected, IReadOnlyList<ManifestCandidate> candidates)
+    {
+        var matchingSources = candidates
+            .Where(item => SameReleaseIdentity(selected, item.Result))
+            .ToArray();
+        var isCanonicalSourceSet = matchingSources.All(item =>
+            item.SourceUri.Host.Equals("github.com", StringComparison.OrdinalIgnoreCase)
+            || item.SourceUri.Host.Equals("gitee.com", StringComparison.OrdinalIgnoreCase));
+        if (!isCanonicalSourceSet)
+            return selected;
+
+        var archiveUrls = matchingSources
+            .SelectMany(item => item.Result.DownloadUrls.Where(url => IsFromHost(url, item.SourceUri.Host)))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        var packages = new List<UpdatePackageMetadata>();
+        foreach (var selectedPackage in selected.Packages)
+        {
+            var packageUrls = matchingSources
+                .SelectMany(item => item.Result.Packages
+                    .Where(package => SamePackageIdentity(selectedPackage, package))
+                    .SelectMany(package => GetSafePackageUrls(package, item.Result.LatestVersion)
+                        .Where(url => IsFromHost(url, item.SourceUri.Host))))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            if (packageUrls.Length == 0) continue;
+            packages.Add(new UpdatePackageMetadata
+            {
+                Kind = selectedPackage.Kind,
+                FileName = selectedPackage.FileName,
+                Sha256 = selectedPackage.Sha256,
+                Size = selectedPackage.Size,
+                DownloadUrl = packageUrls[0],
+                DownloadMirrors = packageUrls.Skip(1).ToList(),
+                BaseVersion = selectedPackage.BaseVersion,
+                BaseInstallManifestSha256 = selectedPackage.BaseInstallManifestSha256
+            });
+        }
+
+        return new UpdateCheckResult
+        {
+            CurrentVersion = selected.CurrentVersion,
+            LatestVersion = selected.LatestVersion,
+            Succeeded = selected.Succeeded,
+            IsNewVersion = selected.IsNewVersion,
+            DownloadUrl = archiveUrls.FirstOrDefault() ?? "",
+            DownloadUrls = archiveUrls,
+            ReleasePageUrl = selected.ReleasePageUrl,
+            ArchiveName = selected.ArchiveName,
+            ArchiveSha256 = selected.ArchiveSha256,
+            ReleaseNotes = selected.ReleaseNotes,
+            Changes = selected.Changes,
+            SignatureVerified = selected.SignatureVerified,
+            SignedManifestJson = selected.SignedManifestJson,
+            ManifestSignature = selected.ManifestSignature,
+            Packages = packages,
+            Error = selected.Error
+        };
+    }
+
+    private static bool SameReleaseIdentity(UpdateCheckResult left, UpdateCheckResult right) =>
+        left.LatestVersion == right.LatestVersion
+        && left.ArchiveName.Equals(right.ArchiveName, StringComparison.Ordinal)
+        && left.ArchiveSha256.Equals(right.ArchiveSha256, StringComparison.OrdinalIgnoreCase);
+
+    private static bool SamePackageIdentity(UpdatePackageMetadata left, UpdatePackageMetadata right) =>
+        left.Kind.Equals(right.Kind, StringComparison.OrdinalIgnoreCase)
+        && left.FileName.Equals(right.FileName, StringComparison.Ordinal)
+        && left.Sha256.Equals(right.Sha256, StringComparison.OrdinalIgnoreCase)
+        && left.Size == right.Size
+        && string.Equals(left.BaseVersion, right.BaseVersion, StringComparison.Ordinal)
+        && string.Equals(left.BaseInstallManifestSha256, right.BaseInstallManifestSha256, StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsFromHost(string url, string host) =>
+        Uri.TryCreate(url, UriKind.Absolute, out var uri)
+        && uri.Host.Equals(host, StringComparison.OrdinalIgnoreCase);
 
     private async Task<IReadOnlyList<UpdateSourceSpeed>> MeasureDownloadSourcesAsync(IReadOnlyList<string> urls, IProgress<UpdateSourceSpeed>? progress, CancellationToken ct)
     {
@@ -420,7 +505,7 @@ public sealed class VersionUpdateService : IDisposable
         var json = await GetJsonAsync(manifestUri, ct).ConfigureAwait(false);
         var signatureUri = new Uri(manifestUri.AbsoluteUri + ".sig", UriKind.Absolute);
         var signature = await GetOptionalTextAsync(signatureUri, ct).ConfigureAwait(false);
-        return new ManifestPayload(json, signature);
+        return new ManifestPayload(json, signature, manifestUri.AbsoluteUri);
     }
 
     private async Task<ManifestPayload> FetchLatestGiteeManifestAsync(Uri releaseEndpoint, CancellationToken ct)
@@ -476,7 +561,7 @@ public sealed class VersionUpdateService : IDisposable
         var signature = "";
         if (signatureUrl is not null && IsSafeManifestAssetUrl(signatureUrl, releaseVersion, "latest.json.sig"))
             signature = await GetOptionalTextAsync(new Uri(signatureUrl, UriKind.Absolute), ct).ConfigureAwait(false);
-        return new ManifestPayload(manifestJson, signature);
+        return new ManifestPayload(manifestJson, signature, manifestUrl);
     }
 
     private async Task<string> GetJsonAsync(Uri uri, CancellationToken ct)

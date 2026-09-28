@@ -124,116 +124,97 @@ try {
     [System.IO.File]::WriteAllBytes($archivePath, $tamperedArchive)
 
     $formalWorkflow = Get-Content -Raw -LiteralPath (Join-Path $repoRoot '.github\workflows\formal-release.yml')
+    $giteeWorkflow = Get-Content -Raw -LiteralPath (Join-Path $repoRoot '.github\workflows\gitee-mirror.yml')
     $windowsWorkflow = Get-Content -Raw -LiteralPath (Join-Path $repoRoot '.github\workflows\windows-ci.yml')
     if ($formalWorkflow -notmatch '(?m)^  workflow_dispatch:') { throw 'Formal Release must be explicitly dispatched.' }
-    if ($formalWorkflow -match '(?m)^  release:') { throw 'Formal Release must not automatically start after an asset has already been published.' }
-    if ($formalWorkflow -notmatch '(?ms)  verify-ci:.*?runs-on: windows-latest') { throw 'Exact-commit validation must remain on a GitHub-hosted runner.' }
-    if ($formalWorkflow -notmatch '(?ms)  publish:.*?runs-on: \[self-hosted, windows, x64, netboot-release\]') { throw 'Release publication must use the dedicated Windows x64 release runner.' }
-    if ($formalWorkflow -notmatch 'git cat-file -e "\$\{releaseCommit\}:\$requiredTagFile"') { throw 'The CI gate must reject legacy tags that do not contain the publisher used by the release job.' }
-    if ($formalWorkflow -notmatch 'publisher_commit=\$publisherCommit' -or
-        $formalWorkflow -notmatch 'Test-SuccessfulMainWindowsCiRun' -or
-        $formalWorkflow -notmatch '@\(\$releaseCommit, \$publisherCommit\)' -or
-        $formalWorkflow -notmatch 'PUBLISHER_COMMIT: \$\{\{ needs\.verify-ci\.outputs\.publisher_commit \}\}') {
-        throw 'The current publisher commit and the release tag commit must each have a successful exact-main push CI run before publication.'
+    if ($formalWorkflow -match '(?m)^  release:') { throw 'Formal Release must not run after a Release has already been published.' }
+    if ($formalWorkflow -match '(?i)self-hosted|netboot-release|GITEE_TOKEN') { throw 'Formal Release must not depend on the local Runner or Gitee credentials.' }
+    foreach ($job in @('verify-ci', 'build-once', 'publish-github')) {
+        $jobPattern = '(?ms)^  ' + [regex]::Escape($job) + ':\r?\n.*?runs-on: windows-latest'
+        if ($formalWorkflow -notmatch $jobPattern) { throw "Formal Release job $job must use GitHub-hosted Windows." }
     }
-    $workflowLf = $formalWorkflow.Replace("`r`n", "`n")
-    foreach ($workflowText in @($workflowLf, $workflowLf.Replace("`n", "`r`n"))) {
-        $publishTimeout = [regex]::Match($workflowText, '(?m)^    timeout-minutes: (\d+)\r?$')
-        if (-not $publishTimeout.Success -or [int]$publishTimeout.Groups[1].Value -gt 30) {
-            throw 'The self-hosted publish job must fail within 30 minutes if a platform or credential operation hangs.'
-        }
+    if ($formalWorkflow -notmatch 'Test-SuccessfulMainWindowsCiRun' -or
+        -not $formalWorkflow.Contains('publisher_commit=$publisherCommit') -or
+        -not $formalWorkflow.Contains('release_commit=$releaseCommit') -or
+        $formalWorkflow -notmatch 'build/release-pipeline/ReleaseState.psm1') {
+        throw 'The tag and workflow commits must each pass exact-commit Windows CI before release.'
     }
-    $publisherSourceSetup = $formalWorkflow.IndexOf('Load release tooling from the workflow commit', [System.StringComparison]::Ordinal)
-    $publisherInvocation = $formalWorkflow.IndexOf('.\build\publish-release.ps1', [System.StringComparison]::Ordinal)
-    if ($publisherSourceSetup -lt 0 -or $publisherInvocation -lt $publisherSourceSetup -or
-        $formalWorkflow -notmatch 'PUBLISHER_COMMIT: \$\{\{ needs\.verify-ci\.outputs\.publisher_commit \}\}' -or
-        $formalWorkflow -notmatch 'application sources remain at the requested release tag') {
-        throw 'Release coordination must use CI-verified tooling while building and publishing the requested tag source.'
+    if ($formalWorkflow -notmatch 'NETBOOT_UPDATE_SIGNING_PRIVATE_KEY: \$\{\{ secrets\.NETBOOT_UPDATE_SIGNING_PRIVATE_KEY \}\}' -or
+        $formalWorkflow -notmatch 'formal-release-\$\{\{ inputs\.release_tag \}\}' -or
+        $formalWorkflow -notmatch 'actions/upload-artifact@v7' -or
+        $formalWorkflow -notmatch 'actions/download-artifact@v5') {
+        throw 'The build job must sign and persist one package set for the separate GitHub publish job.'
     }
-    foreach ($toolPath in @('build/publish-release.ps1', 'build/release-pipeline/ReleaseState.psm1', 'build/publish.ps1')) {
-        if (-not $formalWorkflow.Contains($toolPath)) {
-            throw "The release job must load $toolPath from its CI-verified workflow commit."
-        }
+    if ($formalWorkflow.IndexOf('actions/upload-artifact@v7', [System.StringComparison]::Ordinal) -gt
+        $formalWorkflow.IndexOf('actions/download-artifact@v5', [System.StringComparison]::Ordinal)) {
+        throw 'GitHub publication must consume the artifact produced by the single build job.'
     }
-    $sdkPathSetup = $formalWorkflow.IndexOf('DOTNET_INSTALL_DIR=$sdkRoot', [System.StringComparison]::Ordinal)
-    $dotnetAction = $formalWorkflow.IndexOf('uses: actions/setup-dotnet@v5', [System.StringComparison]::Ordinal)
-    if ($sdkPathSetup -lt 0 -or $dotnetAction -lt $sdkPathSetup -or
-        $formalWorkflow -notmatch "LOCALAPPDATA 'NetBootDhcpTool\\dotnet'") {
-        throw 'The self-hosted runner must install the pinned SDK into its persistent user-writable directory before setup-dotnet runs.'
+    if ($formalWorkflow -notmatch 'scripts/Prepare-GitHubRelease.ps1' -or
+        $formalWorkflow -notmatch 'scripts/Publish-GitHubRelease.ps1') {
+        throw 'Formal Release must call the new hosted build and GitHub-only publisher scripts.'
     }
-    if ($formalWorkflow -notmatch 'build[\\/]publish-release\.ps1') { throw 'Formal Release must invoke the idempotent local publisher.' }
-    foreach ($credentialSetting in @(
-        "GIT_CONFIG_COUNT: '1'",
-        'GIT_CONFIG_KEY_0: credential.helper',
-        "GIT_CONFIG_VALUE_0: ''",
-        "GIT_TERMINAL_PROMPT: '0'",
-        'GCM_INTERACTIVE: never'
-    )) {
-        if (-not $formalWorkflow.Contains($credentialSetting)) {
-            throw "The release publisher must bypass machine-wide interactive Git credential helpers: missing $credentialSetting."
-        }
+    if ($windowsWorkflow -notmatch '(?m)^    runs-on: windows-latest' -or
+        $windowsWorkflow -notmatch 'build[\\/]tests[\\/]gitee-mirror\.tests\.ps1') {
+        throw 'GitHub-hosted CI must run the isolated Gitee mirror recovery regression.'
     }
-    if ($windowsWorkflow -notmatch '(?m)^    runs-on: windows-latest') { throw 'Day-to-day CI must remain on GitHub-hosted Windows.' }
-    $publisher = Get-Content -Raw -LiteralPath (Join-Path $repoRoot 'build\publish-release.ps1')
-    if ($publisher -notmatch '(?s)function Invoke-GiteeJsonRequest.*?-ContentType ''application/json; charset=utf-8''.*?-Body \$jsonBody' -or
-        $publisher -notmatch 'Invoke-GiteeJsonRequest -Uri .*?/releases" -Method Post') {
-        throw 'Gitee Release create/update calls must send a JSON request body so the API receives its required fields.'
-    }
-    if ($publisher -notmatch 'function Assert-ReleaseAssetFileName' -or
-        $publisher -notmatch 'Join-Path \$finalManifestDirectory ''latest\.json''') {
-        throw 'Every remote asset must be uploaded using the exact filename clients request, including latest.json.'
-    }
-    if ($publisher -notmatch "'--draft'") { throw 'GitHub Release must remain draft until final verification.' }
-    foreach ($operation in @('Create', 'Update', 'Publish')) {
-        if ($publisher -notmatch "New-GiteeReleasePayload -Operation $operation") {
-            throw "Gitee Release $operation must use the checked JSON field contract."
-        }
-    }
-    $archivesReady = $publisher.IndexOf('Ensure-GiteeAsset -LocalPath $bundle.ArchivePath', [System.StringComparison]::Ordinal)
-    $manifestPublished = $publisher.LastIndexOf("Ensure-GiteeAsset -LocalPath `$finalManifestPath", [System.StringComparison]::Ordinal)
-    $releasePromoted = $publisher.IndexOf('$giteeRelease = Publish-GiteeRelease', [System.StringComparison]::Ordinal)
-    if ($archivesReady -lt 0 -or $manifestPublished -lt $archivesReady -or $releasePromoted -lt $manifestPublished) {
-        throw 'Stable Release promotion must follow archive and latest.json remote verification.'
-    }
-    $archiveOperations = @(
-        'Ensure-GitHubAsset -LocalPath $bundle.ArchivePath',
-        'Ensure-GitHubAsset -LocalPath $bundle.ChecksumPath',
-        'Ensure-GiteeAsset -LocalPath $bundle.ChecksumPath',
-        'Ensure-GiteeAsset -LocalPath $bundle.ArchivePath'
-    )
-    foreach ($operation in $archiveOperations) {
-        $position = $publisher.IndexOf($operation, [System.StringComparison]::Ordinal)
-        if ($position -lt 0 -or $position -gt $manifestPublished) {
-            throw "Both remote archive and sidecar verification must precede latest.json publication: $operation"
-        }
-    }
-    $githubManifestUpload = $publisher.LastIndexOf('Ensure-GitHubAsset -LocalPath $finalManifestPath', [System.StringComparison]::Ordinal)
-    $githubManifestReadback = $publisher.IndexOf('$script:verifiedAssets["$mirror/latest.json"]', [System.StringComparison]::Ordinal)
-    $githubPromotion = $publisher.IndexOf('$githubRelease = Publish-GitHubRelease', [System.StringComparison]::Ordinal)
-    $giteePromotion = $publisher.IndexOf('$giteeRelease = Publish-GiteeRelease', [System.StringComparison]::Ordinal)
-    if ($githubManifestUpload -lt $manifestPublished -or
-        $githubManifestReadback -lt $githubManifestUpload -or
-        $githubPromotion -lt $githubManifestReadback -or
-        $giteePromotion -lt $githubPromotion) {
-        throw 'Both latest.json files must be verified before publication, with Gitee promoted last.'
-    }
-    if ($publisher -match '(?m)\$configPath = Join-Path \$stateDirectory' -or
-        $publisher -notmatch '\$curlConfig \| & \$curl --config -') {
-        throw 'The Gitee access token must be streamed to curl and never saved in persistent release state.'
-    }
-    $cacheGuard = $publisher.IndexOf('Assert-ReleaseCachePolicy', [System.StringComparison]::Ordinal)
-    $packageBuild = $publisher.IndexOf('[Package] Building Full/OTA and portable archive', [System.StringComparison]::Ordinal)
-    if ($cacheGuard -lt 0 -or $packageBuild -lt $cacheGuard) {
-        throw 'An existing remote Release without its persistent cache must fail before any rebuild.'
-    }
-    foreach ($requiredSignedUpdateStep in @('PackageAssets', 'latest.json.sig', 'Get-OrCreateFinalSignedManifest', 'RSASignaturePadding]::Pss', 'install-manifest.json')) {
-        if (-not $publisher.Contains($requiredSignedUpdateStep) -and -not (Get-Content -Raw -LiteralPath (Join-Path $repoRoot 'build\release-pipeline\ReleaseState.psm1')).Contains($requiredSignedUpdateStep)) {
-            throw "The formal release pipeline is missing signed update package step '$requiredSignedUpdateStep'."
-        }
-    }
-    if (Test-Path -LiteralPath (Join-Path $repoRoot '.github\workflows\gitee-release-sync.yml')) { throw 'The old GitHub-hosted large-file sync workflow must be removed.' }
-    if (Test-Path -LiteralPath (Join-Path $repoRoot 'build\sync-gitee-release.ps1')) { throw 'The old GitHub-download-to-Gitee publisher must be removed.' }
 
+    $giteeScript = Get-Content -Raw -LiteralPath (Join-Path $repoRoot 'scripts\Publish-GiteeMirror.ps1')
+    $githubScript = Get-Content -Raw -LiteralPath (Join-Path $repoRoot 'scripts\Publish-GitHubRelease.ps1')
+    $prepareScript = Get-Content -Raw -LiteralPath (Join-Path $repoRoot 'scripts\Prepare-GitHubRelease.ps1')
+    $packageBuilder = Get-Content -Raw -LiteralPath (Join-Path $repoRoot 'build\publish.ps1')
+    if ($packageBuilder -notmatch 'docs\\RELEASE_NOTES\.md' -or
+        $packageBuilder -notmatch 'docs\\FEATURE_CHANGELOG\.md' -or
+        $packageBuilder -notmatch 'releaseSection') {
+        throw 'Package metadata must prefer the current bilingual release notes and retain the feature change-log fallback.'
+    }
+    foreach ($requiredMirrorBehavior in @(
+        'api.github.com/repos/$Repository/releases/tags',
+        'browser_download_url',
+        'FormFields',
+        'access_token = $Token',
+        'Sync-GiteeSourceRefs',
+        'merge-base --is-ancestor',
+        'Fast-forward synchronized main and tag',
+        'Get-MirrorSha256',
+        'Assert-MirrorManifestSignature',
+        'Get-GiteeAttachmentsForMirror',
+        'Gitee Release has duplicate attachments named',
+        'Gitee attachment readback size/SHA-256 mismatch',
+        'Final public Gitee download SHA-256 mismatch',
+        'GITEE_MIRROR SUCCESS',
+        'latest.json.sig',
+        'latest.json'
+    )) {
+        if (-not $giteeScript.Contains($requiredMirrorBehavior)) { throw "Independent Gitee mirror is missing required recovery/integrity behavior: $requiredMirrorBehavior." }
+    }
+    if ($giteeScript -match 'actions\.githubusercontent\.com|ssl-no-revoke|NoCheck|RevocationMode|push[^\r\n]*--force') {
+        throw 'Gitee Mirror must use ordinary REST/Release HTTPS and normal certificate validation.'
+    }
+    if ($giteeWorkflow -notmatch 'workflow_dispatch:' -or $giteeWorkflow -notmatch 'workflow_run:' -or
+        $giteeWorkflow -notmatch "conclusion == 'success'" -or $giteeWorkflow -notmatch 'secrets\.GITEE_TOKEN') {
+        throw 'Gitee mirror needs an independent manual retry and a success-only trigger with a separate Gitee token.'
+    }
+    if ($giteeWorkflow -match '(?m)^\s+needs:\s*Formal Release') { throw 'Gitee mirror status must not gate or change GitHub Formal Release status.' }
+    foreach ($requiredGithubBehavior in @('Test-GitHubAssetReadback', 'Ensure-GitHubAsset', 'stable Release promotion returned', 'make_latest = ''true''')) {
+        if (-not $githubScript.Contains($requiredGithubBehavior)) { throw "GitHub publisher is missing immutable asset/readback behavior: $requiredGithubBehavior." }
+    }
+    if ($githubScript -match '--clobber|delete.*asset') { throw 'GitHub asset repair must not overwrite or delete an existing attachment.' }
+    if ($prepareScript -notmatch 'NETBOOT_UPDATE_SIGNING_PRIVATE_KEY' -or
+        $prepareScript -notmatch 'ImportFromPem' -or
+        $prepareScript -notmatch 'RSASignaturePadding]::Pss' -or
+        $prepareScript -notmatch 'does not match the public key trusted by the client') {
+        throw 'The hosted package preparation must sign with the existing client-trusted update key and fail on key mismatch.'
+    }
+    $legacyWorkflow = Join-Path $repoRoot 'docs\archive\formal-release-self-hosted-2026-09-28.yml'
+    if (-not (Test-Path -LiteralPath $legacyWorkflow) -or
+        (Get-Content -Raw -LiteralPath $legacyWorkflow) -notmatch 'runs-on: \[self-hosted, windows, x64, netboot-release\]') {
+        throw 'The prior self-hosted Runner workflow must remain archived as a backup.'
+    }
+    foreach ($legacyScript in @('build/publish-release.ps1', 'build/release-pipeline/ReleaseTransport.psm1', 'build/release-pipeline/ReleaseState.psm1')) {
+        if (-not (Test-Path -LiteralPath (Join-Path $repoRoot $legacyScript))) { throw "Legacy release script backup is missing: $legacyScript." }
+    }
+    if (Test-Path -LiteralPath (Join-Path $repoRoot '.github\workflows\gitee-release-sync.yml')) { throw 'The obsolete Gitee sync workflow must not be restored.' }
+    if (Test-Path -LiteralPath (Join-Path $repoRoot 'build\sync-gitee-release.ps1')) { throw 'The obsolete GitHub-download-to-Gitee publisher must not be restored.' }
     & (Join-Path $PSScriptRoot 'release-resilience.tests.ps1')
 
     Write-Output 'RELEASE_PIPELINE_TESTS_OK'
