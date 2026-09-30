@@ -17,7 +17,7 @@ function Assert-True([bool]$Condition, [string]$Message) {
 }
 
 function New-MirrorFixture {
-    param([string]$Root)
+    param([string]$Root, [string]$Tag = 'v1.0.20')
     $files = [ordered]@{}
     $archiveName = 'NetBootDhcpTool-v1.0.20.7z'
     $fullName = 'NetBootDhcpTool-full-v1.0.20.7z'
@@ -35,8 +35,8 @@ function New-MirrorFixture {
         version = '1.0.20'
         archiveName = $archiveName
         archiveSha256 = $archiveHash
-        downloadUrl = "https://gitee.com/joel20230302/NetBootDhcpTool/releases/download/v1.0.20/$archiveName"
-        downloadMirrors = @("https://github.com/shashouaq/NetBootDhcpTool/releases/download/v1.0.20/$archiveName")
+        downloadUrl = "https://gitee.com/joel20230302/NetBootDhcpTool/releases/download/$Tag/$archiveName"
+        downloadMirrors = @("https://github.com/shashouaq/NetBootDhcpTool/releases/download/$Tag/$archiveName")
         releasePageUrl = 'https://gitee.com/joel20230302/NetBootDhcpTool/releases/tag/v1.0.20'
         releaseNotes = 'Chinese / English release notes'
         packages = @()
@@ -45,8 +45,8 @@ function New-MirrorFixture {
             fileName = $fullName
             sha256 = $fullHash
             size = [long](Get-Item -LiteralPath (Join-Path $Root $fullName)).Length
-            downloadUrl = "https://gitee.com/joel20230302/NetBootDhcpTool/releases/download/v1.0.20/$fullName"
-            downloadMirrors = @("https://github.com/shashouaq/NetBootDhcpTool/releases/download/v1.0.20/$fullName")
+            downloadUrl = "https://gitee.com/joel20230302/NetBootDhcpTool/releases/download/$Tag/$fullName"
+            downloadMirrors = @("https://github.com/shashouaq/NetBootDhcpTool/releases/download/$Tag/$fullName")
             baseVersion = $null
             baseInstallManifestSha256 = $null
         })
@@ -66,20 +66,20 @@ function New-MirrorFixture {
     $sourceMap = @{}
     foreach ($name in $assetNames) {
         $path = Join-Path $Root $name
-        $sourceMap["https://github.com/shashouaq/NetBootDhcpTool/releases/download/v1.0.20/$name"] = $path
+        $sourceMap["https://github.com/shashouaq/NetBootDhcpTool/releases/download/$Tag/$name"] = $path
         $githubAssets += [ordered]@{
             name = $name
             size = [long](Get-Item -LiteralPath $path).Length
             digest = 'sha256:' + (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
-            browser_download_url = "https://github.com/shashouaq/NetBootDhcpTool/releases/download/v1.0.20/$name"
+            browser_download_url = "https://github.com/shashouaq/NetBootDhcpTool/releases/download/$Tag/$name"
         }
     }
     return [pscustomobject]@{
-        Tag = 'v1.0.20'
+        Tag = $Tag
         Version = '1.0.20'
         Assets = $assetNames
         SourceMap = $sourceMap
-        Release = [ordered]@{ id = 123; tag_name = 'v1.0.20'; draft = $false; prerelease = $false; assets = $githubAssets }
+        Release = [ordered]@{ id = 123; tag_name = $Tag; draft = $false; prerelease = ($Tag -like '*-rc.*'); assets = $githubAssets }
         ArchiveName = $archiveName
         ArchiveHash = $archiveHash
     }
@@ -126,16 +126,16 @@ function Invoke-MirrorHttp {
         $destination = Join-Path $testRoot ('gitee-' + $id + '-' + $name)
         Copy-Item -LiteralPath $UploadFile -Destination $destination | Out-Null
         $global:GiteeMirrorMock.GiteeFiles[[string]$id] = $destination
-        $attachment = [ordered]@{ id = $id; name = $name; size = [long](Get-Item -LiteralPath $destination).Length; browser_download_url = "https://gitee.com/joel20230302/NetBootDhcpTool/releases/download/v1.0.20/$name" }
+        $attachment = [ordered]@{ id = $id; name = $name; size = [long](Get-Item -LiteralPath $destination).Length; browser_download_url = "https://gitee.com/joel20230302/NetBootDhcpTool/releases/download/$($global:GiteeMirrorMock.Fixture.Tag)/$name" }
         $global:GiteeMirrorMock.Attachments.Add($attachment)
         $content = ConvertTo-Json -InputObject $attachment -Compress
-    } elseif ($uriObject.Host -eq 'api.github.com' -and $uriObject.AbsolutePath -match '/releases/tags/v1\.0\.20$') {
+    } elseif ($uriObject.Host -eq 'api.github.com' -and $uriObject.AbsolutePath -match '/releases/tags/v1\.0\.20(?:-rc\.1)?$') {
         Assert-True ($Headers.Authorization -ceq 'Bearer test-github-token') 'GitHub Release REST requests must use the supplied read-only token.'
         $content = ConvertTo-Json -InputObject $global:GiteeMirrorMock.Fixture.Release -Depth 8 -Compress
-    } elseif ($uriObject.Host -eq 'api.github.com' -and $uriObject.AbsolutePath -match '/git/ref/tags/v1\.0\.20$') {
+    } elseif ($uriObject.Host -eq 'api.github.com' -and $uriObject.AbsolutePath -match '/git/ref/tags/v1\.0\.20(?:-rc\.1)?$') {
         Assert-True ($Headers.Authorization -ceq 'Bearer test-github-token') 'GitHub tag REST requests must use the supplied read-only token.'
         $content = '{"object":{"type":"commit","sha":"0123456789012345678901234567890123456789"}}'
-    } elseif ($uriObject.Host -eq 'gitee.com' -and $uriObject.AbsolutePath -match '/releases/tags/v1\.0\.20$') {
+    } elseif ($uriObject.Host -eq 'gitee.com' -and $uriObject.AbsolutePath -match '/releases/tags/v1\.0\.20(?:-rc\.1)?$') {
         $global:GiteeMirrorMock.GiteeApiCallCount++
         if ($null -eq $global:GiteeMirrorMock.Release) { $content = 'null' }
         else { $content = ConvertTo-Json -InputObject $global:GiteeMirrorMock.Release -Depth 8 -Compress }
@@ -170,7 +170,7 @@ function Invoke-MirrorHttp {
         $source = $global:GiteeMirrorMock.Fixture.SourceMap[$Uri]
         if ($OutFile) { Copy-Item -LiteralPath $source -Destination $OutFile | Out-Null }
         else { $content = [System.IO.File]::ReadAllText($source) }
-    } elseif ($uriObject.Host -eq 'gitee.com' -and $uriObject.AbsolutePath -match '/releases/download/v1\.0\.20/(?<name>[^/]+)$') {
+    } elseif ($uriObject.Host -eq 'gitee.com' -and $uriObject.AbsolutePath -match '/releases/download/v1\.0\.20(?:-rc\.1)?/(?<name>[^/]+)$') {
         $global:GiteeMirrorMock.EventLog.Add("public:$($Matches.name)")
         $name = $Matches.name
         $attachment = @($global:GiteeMirrorMock.Attachments | Where-Object { $_.name -ceq $name } | Select-Object -First 1)
@@ -307,6 +307,27 @@ try {
     Assert-True $noWriteBeforeReject 'An over-limit formal asset must fail during local preflight.'
     Assert-True ($global:GiteeMirrorMock.GiteeApiCallCount -eq 0 -and $global:GiteeMirrorMock.UploadCount -eq 0) 'Size rejection must happen before any Gitee API call or HTTP POST.'
     $script:GiteeReleaseAssetMaxBytes = $null
+
+    $candidateRoot = Join-Path $testRoot 'candidate-source'
+    New-Item -ItemType Directory -Path $candidateRoot | Out-Null
+    $candidateFixture = New-MirrorFixture $candidateRoot 'v1.0.20-rc.1'
+    Reset-MirrorMock $candidateFixture
+    $script:MirrorIsCandidate = $true
+    $candidate = Publish-GiteeMirror -Tag $candidateFixture.Tag -Token 'test-token' -AssetDirectory $candidateRoot
+    Assert-True ($candidate.AssetCount -eq $candidateFixture.Assets.Count -or $candidate.UploadTimings.Count -eq $candidateFixture.Assets.Count) 'RC assets must pass the same complete public readback.'
+    Assert-True ($global:GiteeMirrorMock.Release.prerelease -and -not $global:GiteeMirrorMock.EventLog.Contains('promote')) 'An RC must never promote Gitee stable.'
+    $candidateUploadCount = $global:GiteeMirrorMock.UploadCount
+    foreach ($generated in @("$($candidateFixture.Tag).zip", "$($candidateFixture.Tag).tar.gz")) {
+        $global:GiteeMirrorMock.Attachments.Add([ordered]@{ id = 999; name = $generated; browser_download_url = "https://gitee.com/joel20230302/NetBootDhcpTool/releases/download/$($candidateFixture.Tag)/$generated" })
+    }
+    $null = Publish-GiteeMirror -Tag $candidateFixture.Tag -Token 'test-token' -AssetDirectory $candidateRoot
+    Assert-True ($global:GiteeMirrorMock.UploadCount -eq $candidateUploadCount) 'Re-running an RC mirror must reuse exact assets and ignore source archives.'
+    $global:GiteeMirrorMock.Release.prerelease = $false
+    $stableReuseRejected = $false
+    try { $null = Publish-GiteeMirror -Tag $candidateFixture.Tag -Token 'test-token' -AssetDirectory $candidateRoot }
+    catch { $stableReuseRejected = $_.Exception.Message -match 'stable Gitee Release' }
+    Assert-True $stableReuseRejected 'A stable Gitee Release cannot be repurposed as an RC.'
+    $script:MirrorIsCandidate = $false
 
     Write-Output 'GITEE_MIRROR_TESTS_OK api_only=1 asset_directory=1 local_hash_hard_fail=1 promote_after_public_hash=1 resume=1 mismatched_sha_hard_fail=1 duplicates_preserved=1 size_preflight=1 reject_before_gitee_write=1'
 } finally {

@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)][ValidatePattern('^v\d+\.\d+\.\d+$')][string]$Tag,
+    [Parameter(Mandatory)][string]$Tag,
     [string]$GitHubRepository = 'shashouaq/NetBootDhcpTool',
     [string]$GiteeOwner = 'joel20230302',
     [string]$GiteeRepository = 'NetBootDhcpTool',
@@ -8,13 +8,17 @@ param(
     [string]$AssetDirectory,
     [ValidateRange(30, 300)][int]$UploadTimeoutSec = 180,
     [string]$TelemetryPath,
-    [switch]$LibraryOnly
+    [switch]$LibraryOnly,
+    [switch]$ReleaseCandidate
 )
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $script:MirrorRoot = Split-Path -Parent $PSScriptRoot
 $script:RepositoryRoot = $script:MirrorRoot
+. (Join-Path $script:MirrorRoot 'build\release-identity.ps1')
+$null = Get-NetBootReleaseIdentity -Tag $Tag -ReleaseCandidate:$ReleaseCandidate
+$script:MirrorIsCandidate = [bool]$ReleaseCandidate
 $script:GiteeAssetWarningThresholdBytes = 95000000L
 $script:GiteeReleaseAssetMaxBytes = $null
 
@@ -196,14 +200,14 @@ function Get-GitHubReleaseForMirror([string]$Tag, [string]$Repository) {
     $response = Invoke-MirrorHttp -Uri $uri -Headers (Get-GitHubMirrorApiHeaders)
     if ($response.StatusCode -ne 200) { throw "GitHub Release lookup returned HTTP $($response.StatusCode) for $Tag. Provide a read-only GitHub API token or retry after the API limit resets." }
     $release = Get-MirrorJson $response.Content 'GitHub Release lookup'
-    if ($release.tag_name -cne $Tag -or [bool]$release.draft -or [bool]$release.prerelease) {
-        throw "GitHub Release $Tag is not a stable, published Release."
+    if ($release.tag_name -cne $Tag -or [bool]$release.draft -or [bool]$release.prerelease -ne $script:MirrorIsCandidate) {
+        throw "GitHub Release $Tag has an unexpected publication/candidate state."
     }
     return $release
 }
 
 function Get-MirrorExpectedAssets([object]$Release, [string]$Tag, [string]$GitHubRepository, [string]$GiteeOwner, [string]$GiteeRepository, [byte[]]$ManifestBytes) {
-    $version = $Tag.Substring(1)
+    $version = (Get-NetBootReleaseIdentity -Tag $Tag -ReleaseCandidate:$script:MirrorIsCandidate).Version
     $manifestAsset = @($Release.assets | Where-Object { $_.name -ceq 'latest-v2.json' })
     $signatureAsset = @($Release.assets | Where-Object { $_.name -ceq 'latest-v2.json.sig' })
     if ($manifestAsset.Count -ne 1 -or $signatureAsset.Count -ne 1) { throw "GitHub Release $Tag must contain one latest-v2.json and one latest-v2.json.sig." }
@@ -523,6 +527,7 @@ function Download-VerifiedGitHubAsset([object]$Asset, [string]$Destination) {
 function New-GiteeReleaseForMirror([string]$Tag, [string]$Owner, [string]$Repository, [string]$Token, [string]$TargetCommit, [object]$Manifest) {
     $existing = Get-GiteeReleaseForMirror $Tag $Owner $Repository $Token
     if ($null -ne $existing) {
+        if ($script:MirrorIsCandidate -and -not [bool]$existing.prerelease) { throw 'An existing stable Gitee Release cannot be reused as an RC.' }
         Write-Host "[Gitee] Reusing existing Release $Tag (ID $($existing.id))."
         return $existing
     }
@@ -566,7 +571,7 @@ function Resolve-MirrorSourceAsset([object]$Asset, [string]$SourceDirectory, [bo
 function Publish-GiteeMirror {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][ValidatePattern('^v\d+\.\d+\.\d+$')][string]$Tag,
+        [Parameter(Mandatory)][string]$Tag,
         [string]$Token = $env:GITEE_TOKEN,
         [string]$AssetDirectory,
         [ValidateRange(30, 300)][int]$UploadTimeoutSec = 180,
@@ -581,7 +586,7 @@ function Publish-GiteeMirror {
         if ($repoPart -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { throw 'Repository must be in owner/repository form.' }
     }
 
-    $version = $Tag.Substring(1)
+    $version = (Get-NetBootReleaseIdentity -Tag $Tag -ReleaseCandidate:$script:MirrorIsCandidate).Version
     $release = Get-GitHubReleaseForMirror $Tag $GitHubRepository
     $temporaryRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('netboot-gitee-mirror-' + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $temporaryRoot -Force | Out-Null
@@ -813,7 +818,7 @@ function Publish-GiteeMirror {
             Write-Host "[Gitee] Final public download verified: file=$name size=$($verification.Size) sha256=$($verification.Sha256) http=$($verification.HttpStatus) attachment_id=$($verification.AttachmentId)."
         }
 
-        if ([bool]$giteeRelease.prerelease) {
+        if (-not $script:MirrorIsCandidate -and [bool]$giteeRelease.prerelease) {
             $publishUri = "https://gitee.com/api/v5/repos/$GiteeOwner/$GiteeRepository/releases/$releaseId"
             $payload = ConvertTo-Json -InputObject @{
                 tag_name = $Tag
@@ -828,12 +833,14 @@ function Publish-GiteeMirror {
         }
 
         $confirmedRelease = Get-GiteeReleaseForMirror $Tag $GiteeOwner $GiteeRepository $Token
-        if ($null -eq $confirmedRelease -or [bool]$confirmedRelease.prerelease) { throw 'Gitee Release is not confirmed stable after asset verification.' }
-        $latestUri = "https://gitee.com/api/v5/repos/$GiteeOwner/$GiteeRepository/releases/latest"
-        $latestResponse = Invoke-MirrorHttp -Uri $latestUri -Headers $headers
-        if ($latestResponse.StatusCode -ne 200) { throw "Gitee latest Release lookup returned HTTP $($latestResponse.StatusCode)." }
-        $latestRelease = Get-MirrorJson $latestResponse.Content 'Gitee latest Release'
-        if ([string]$latestRelease.tag_name -cne $Tag) { throw "Gitee latest Release is $($latestRelease.tag_name), expected $Tag." }
+        if ($null -eq $confirmedRelease -or [bool]$confirmedRelease.prerelease -ne $script:MirrorIsCandidate) { throw 'Gitee Release has an unexpected final candidate/stable state after verification.' }
+        if (-not $script:MirrorIsCandidate) {
+            $latestUri = "https://gitee.com/api/v5/repos/$GiteeOwner/$GiteeRepository/releases/latest"
+            $latestResponse = Invoke-MirrorHttp -Uri $latestUri -Headers $headers
+            if ($latestResponse.StatusCode -ne 200) { throw "Gitee latest Release lookup returned HTTP $($latestResponse.StatusCode)." }
+            $latestRelease = Get-MirrorJson $latestResponse.Content 'Gitee latest Release'
+            if ([string]$latestRelease.tag_name -cne $Tag) { throw "Gitee latest Release is $($latestRelease.tag_name), expected $Tag." }
+        }
 
         foreach ($name in $orderedNames) {
             if (-not $uploadTimings.Contains($name)) {

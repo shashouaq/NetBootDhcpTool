@@ -48,12 +48,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Could not read exact-commit CI.' }
           $runs = $json | ConvertFrom-Json
           if (-not (Test-SuccessfulMainWindowsCiRun -Runs @($runs.workflow_runs) -Commit $env:GITHUB_SHA)) { throw 'Exact main Windows CI must pass before RC.' }
-          $tagError = Join-Path $env:RUNNER_TEMP 'rc-tag-query-error.txt'
-          $existing = gh api "repos/$env:GITHUB_REPOSITORY/git/ref/tags/$env:CANDIDATE_TAG" 2>$tagError
-          if ($LASTEXITCODE -eq 0) {
-            $reference = $existing | ConvertFrom-Json
+          $tagResponse = Invoke-WebRequest -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/git/ref/tags/$env:CANDIDATE_TAG" -Headers @{ Authorization="Bearer $env:GH_TOKEN"; 'User-Agent'='NetBootDhcpTool-RC'; Accept='application/vnd.github+json' } -SkipHttpErrorCheck
+          if ($tagResponse.StatusCode -eq 200) {
+            $reference = $tagResponse.Content | ConvertFrom-Json
             if ($reference.object.type -cne 'commit' -or $reference.object.sha -cne $env:GITHUB_SHA) { throw 'Existing RC tag belongs to another commit; it cannot be moved.' }
-          } elseif (-not (Select-String $tagError -Pattern 'HTTP 404' -Quiet)) { throw 'The RC tag query failed; absence was not confirmed.' }
+          } elseif ($tagResponse.StatusCode -ne 404) { throw "RC tag absence was not confirmed: HTTP $($tagResponse.StatusCode)." }
       - name: Fresh NuGet audit
         shell: pwsh
         run: |

@@ -198,6 +198,10 @@ try {
         $candidateWorkflow -match 'runs-on:.*self-hosted|GITEE_TOKEN') {
         throw 'RC publishing must stay prerelease, use exact source identity and never run a Gitee upload or self-hosted runner.'
     }
+    if ($candidateWorkflow -notmatch 'SkipHttpErrorCheck' -or $candidateWorkflow -notmatch 'StatusCode -ne 404' -or
+        $candidateWorkflow -notmatch 'needs: candidate' -or $candidateWorkflow -notmatch 'actions/download-artifact@v5') {
+        throw 'RC absence must use explicit HTTP status; publication recovery must consume the original signed artifact.'
+    }
     $prepareScript = Get-Content -Raw -LiteralPath (Join-Path $repoRoot 'scripts\Prepare-GitHubRelease.ps1')
     $packageBuilder = Get-Content -Raw -LiteralPath (Join-Path $repoRoot 'build\publish.ps1')
     if ($packageBuilder -notmatch 'docs\\RELEASE_NOTES\.md' -or

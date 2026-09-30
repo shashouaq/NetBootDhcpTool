@@ -1,11 +1,14 @@
 #requires -Version 7.0
 [CmdletBinding()]
 param(
-    [ValidatePattern('^v\d+\.\d+\.\d+$')][string]$Tag = 'v1.0.20',
-    [string]$AssetDirectory = 'D:\Release\v1.0.20'
+    [string]$Tag = 'v1.0.20',
+    [string]$AssetDirectory = 'D:\Release\v1.0.20',
+    [switch]$ReleaseCandidate
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path (Split-Path -Parent $PSScriptRoot) 'build\release-identity.ps1')
+$null = Get-NetBootReleaseIdentity -Tag $Tag -ReleaseCandidate:$ReleaseCandidate
 $runId = [guid]::NewGuid().ToString('N')
 $releaseDirectory = 'D:\Release'
 $statusPath = Join-Path $releaseDirectory "_t19-gitee-mirror-$runId.status.json"
@@ -64,7 +67,7 @@ try {
     $state = 'RUNNING'
     Write-SecureMirrorStatus $statusPath $runId $Tag $state
     Write-Host "GITEE_MIRROR_STATUS=$state run_id=$runId"
-    & $publisherPath -Tag $Tag -AssetDirectory $AssetDirectory -TelemetryPath $telemetryPath
+    & $publisherPath -Tag $Tag -AssetDirectory $AssetDirectory -TelemetryPath $telemetryPath -ReleaseCandidate:$ReleaseCandidate
     $state = 'SUCCESS'
     Write-SecureMirrorStatus $statusPath $runId $Tag $state
     Write-Host "GITEE_MIRROR_STATUS=$state run_id=$runId"
