@@ -15,6 +15,46 @@ public sealed class VersionUpdateSourceTests
     private const string GiteeManifestUrl = "https://gitee.com/joel20230302/NetBootDhcpTool/attach_files/654321";
 
     [TestMethod]
+    public void NewClientsUseAnIsolatedV2ManifestChannel()
+    {
+        var manifestUri = new Uri(VersionUpdateService.DefaultManifestUrl, UriKind.Absolute);
+        Assert.AreEqual(VersionUpdateService.ManifestFileName, Path.GetFileName(manifestUri.AbsolutePath));
+        Assert.AreEqual(VersionUpdateService.ManifestSignatureFileName, Path.GetFileName(manifestUri.AbsolutePath) + ".sig");
+    }
+
+    [TestMethod]
+    public async Task GiteeV2DiscoveryIgnoresTheFrozenLegacyManifestAsset()
+    {
+        const string legacyUrl = "https://gitee.com/joel20230302/NetBootDhcpTool/releases/download/v1.0.21/latest.json";
+        const string v2Url = "https://gitee.com/joel20230302/NetBootDhcpTool/releases/download/v1.0.21/latest-v2.json";
+        var requests = new ConcurrentQueue<string>();
+        using var client = new HttpClient(new DelegateHandler((request, _) =>
+        {
+            var url = request.RequestUri!.AbsoluteUri;
+            requests.Enqueue(url);
+            if (url == VersionUpdateService.GiteeLatestReleaseApiUrl)
+                return Task.FromResult(Json("{\"id\":123,\"tag_name\":\"v1.0.21\",\"prerelease\":false}"));
+            if (request.RequestUri.AbsolutePath.EndsWith("/attach_files", StringComparison.Ordinal))
+                return Task.FromResult(Json($"[{{\"name\":\"latest.json\",\"browser_download_url\":\"{legacyUrl}\"}},{{\"name\":\"latest-v2.json\",\"browser_download_url\":\"{v2Url}\"}}]"));
+            if (url == v2Url)
+                return Task.FromResult(Json("{\"version\":\"1.0.21\",\"archiveName\":\"NetBootDhcpTool-full-v1.0.21.7z\",\"archiveSha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"downloadUrl\":\"https://gitee.com/joel20230302/NetBootDhcpTool/releases/download/v1.0.21/NetBootDhcpTool-full-v1.0.21.7z\",\"releasePageUrl\":\"https://gitee.com/joel20230302/NetBootDhcpTool/releases/tag/v1.0.21\"}"));
+            if (url.EndsWith(".sig", StringComparison.Ordinal))
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
+            if (request.Headers.Range?.Ranges.SingleOrDefault() is { From: 0, To: 65535 })
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(Enumerable.Repeat((byte)7, 65536).ToArray()) });
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
+        }));
+        using var service = new VersionUpdateService(client, manifestUrl: VersionUpdateService.GiteeLatestReleaseApiUrl);
+
+        var result = await service.CheckAsync(new Version(1, 0, 20));
+
+        Assert.IsTrue(result.Succeeded, result.Error);
+        Assert.AreEqual(new Version(1, 0, 21), result.LatestVersion);
+        Assert.IsTrue(requests.Contains(v2Url));
+        Assert.IsFalse(requests.Contains(legacyUrl), "A V2 client must never parse the frozen legacy channel.");
+    }
+
+    [TestMethod]
     public async Task UpdateCheckMeasuresBothMirrorsAndPrefersTheFasterOne()
     {
         var requests = new ConcurrentQueue<HttpRequestMessage>();
@@ -27,7 +67,7 @@ public sealed class VersionUpdateSourceTests
             if (path.EndsWith("/releases/latest", StringComparison.Ordinal))
                 return Json("{\"id\":123,\"tag_name\":\"v1.0.14\",\"prerelease\":false}");
             if (path.EndsWith("/attach_files", StringComparison.Ordinal))
-                return Json($"[{{\"name\":\"latest.json\",\"browser_download_url\":\"{GiteeManifestUrl}\"}}]");
+                return Json($"[{{\"name\":\"latest-v2.json\",\"browser_download_url\":\"{GiteeManifestUrl}\"}}]");
             if (request.RequestUri.AbsoluteUri == GiteeManifestUrl)
                 return Json(Manifest("1.0.14"));
             if (request.RequestUri.AbsoluteUri == VersionUpdateService.DefaultManifestUrl)
@@ -72,7 +112,7 @@ public sealed class VersionUpdateSourceTests
             if (path.EndsWith("/releases/latest", StringComparison.Ordinal))
                 return Task.FromResult(Json("{\"id\":123,\"tag_name\":\"v1.0.13\",\"prerelease\":false}"));
             if (path.EndsWith("/attach_files", StringComparison.Ordinal))
-                return Task.FromResult(Json($"[{{\"name\":\"latest.json\",\"browser_download_url\":\"{GiteeManifestUrl}\"}}]"));
+                return Task.FromResult(Json($"[{{\"name\":\"latest-v2.json\",\"browser_download_url\":\"{GiteeManifestUrl}\"}}]"));
             return Task.FromResult(Json(Manifest("1.0.13")));
         }));
         using var service = new VersionUpdateService(client);
@@ -89,7 +129,7 @@ public sealed class VersionUpdateSourceTests
     [TestMethod]
     public async Task GiteeCanonicalReleaseDownloadUrlsSupportIndependentDiscovery()
     {
-        const string giteeManifestUrl = "https://gitee.com/joel20230302/NetBootDhcpTool/releases/download/v1.0.18/latest.json";
+        const string giteeManifestUrl = "https://gitee.com/joel20230302/NetBootDhcpTool/releases/download/v1.0.18/latest-v2.json";
         const string giteeArchiveUrl = "https://gitee.com/joel20230302/NetBootDhcpTool/releases/download/v1.0.18/NetBootDhcpTool-v1.0.18.7z";
         const string githubArchiveUrl = "https://github.com/shashouaq/NetBootDhcpTool/releases/download/v1.0.18/NetBootDhcpTool-v1.0.18.7z";
         var requests = new ConcurrentQueue<string>();
@@ -119,7 +159,7 @@ public sealed class VersionUpdateSourceTests
             if (uri.AbsoluteUri == VersionUpdateService.GiteeLatestReleaseApiUrl)
                 return Task.FromResult(Json("{\"id\":123,\"tag_name\":\"v1.0.18\",\"prerelease\":false}"));
             if (uri.AbsolutePath.EndsWith("/attach_files", StringComparison.Ordinal))
-                return Task.FromResult(Json($"[{{\"name\":\"latest.json\",\"browser_download_url\":\"{giteeManifestUrl}\"}}]"));
+                return Task.FromResult(Json($"[{{\"name\":\"latest-v2.json\",\"browser_download_url\":\"{giteeManifestUrl}\"}}]"));
             if (uri.AbsoluteUri == giteeManifestUrl) return Task.FromResult(Json(manifest));
             if (uri.AbsoluteUri == VersionUpdateService.DefaultManifestUrl) return Task.FromResult(Json(githubManifest));
             if (request.Headers.Range?.Ranges.SingleOrDefault() is { From: 0, To: 65535 })
@@ -136,7 +176,7 @@ public sealed class VersionUpdateSourceTests
         CollectionAssert.AreEquivalent(new[] { giteeArchiveUrl }, result.DownloadUrls.ToArray(),
             "A Gitee-only check has not validated the GitHub source manifest, so it may probe only Gitee.");
         Assert.AreEqual(1, requests.Count(url => url.EndsWith(".7z", StringComparison.Ordinal)));
-        Assert.IsTrue(requests.Contains(giteeManifestUrl), "The Gitee API's canonical latest.json download URL should be fetched directly.");
+        Assert.IsTrue(requests.Contains(giteeManifestUrl), "The Gitee API's canonical latest-v2.json download URL should be fetched directly.");
         Assert.IsFalse(requests.Contains(VersionUpdateService.DefaultManifestUrl), "A Gitee-only check must succeed without the GitHub fallback manifest.");
     }
 
@@ -181,7 +221,7 @@ public sealed class VersionUpdateSourceTests
             if (url == VersionUpdateService.GiteeLatestReleaseApiUrl)
                 return Task.FromResult(Json("{\"id\":123,\"tag_name\":\"v1.0.13\",\"prerelease\":false}"));
             if (request.RequestUri.AbsolutePath.EndsWith("/attach_files", StringComparison.Ordinal))
-                return Task.FromResult(Json($"[{{\"name\":\"latest.json\",\"browser_download_url\":\"{GiteeManifestUrl}\"}}]"));
+                return Task.FromResult(Json($"[{{\"name\":\"latest-v2.json\",\"browser_download_url\":\"{GiteeManifestUrl}\"}}]"));
             if (url == GiteeManifestUrl) return Task.FromResult(Json(Manifest("1.0.13")));
             if (url == VersionUpdateService.DefaultManifestUrl) return Task.FromResult(Json(GithubManifest()));
             return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent([1, 2, 3]) });
@@ -222,7 +262,7 @@ public sealed class VersionUpdateSourceTests
             if (url == VersionUpdateService.GiteeLatestReleaseApiUrl)
                 return Task.FromResult(Json("{\"id\":123,\"tag_name\":\"v1.0.14\",\"prerelease\":false}"));
             if (request.RequestUri.AbsolutePath.EndsWith("/attach_files", StringComparison.Ordinal))
-                return Task.FromResult(Json($"[{{\"name\":\"latest.json\",\"browser_download_url\":\"{GiteeManifestUrl}\"}}]"));
+                return Task.FromResult(Json($"[{{\"name\":\"latest-v2.json\",\"browser_download_url\":\"{GiteeManifestUrl}\"}}]"));
             if (url == GiteeManifestUrl) return Task.FromResult(Json(staleGiteeManifest));
             if (url == VersionUpdateService.DefaultManifestUrl) return Task.FromResult(Json(GithubManifest()));
             return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent([1, 2, 3]) });

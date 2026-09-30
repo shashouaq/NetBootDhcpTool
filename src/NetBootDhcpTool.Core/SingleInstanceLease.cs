@@ -1,60 +1,47 @@
 using System.Security.Cryptography;
 using System.Text;
+using System.Threading;
 
 namespace NetBootDhcpTool.Core;
 
 /// <summary>Owns the write and recovery responsibility for one normalized data directory.</summary>
 public sealed class SingleInstanceLease : IDisposable
 {
-    private readonly Mutex _mutex;
-    private bool _ownsMutex;
-    private bool _disposed;
+    private readonly Semaphore _semaphore;
+    private int _disposed;
 
-    private SingleInstanceLease(Mutex mutex)
+    private SingleInstanceLease(Semaphore semaphore)
     {
-        _mutex = mutex;
-        _ownsMutex = true;
+        _semaphore = semaphore;
     }
 
     public static SingleInstanceLease? TryAcquire(AppPaths paths)
     {
         ArgumentNullException.ThrowIfNull(paths);
         var digest = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(paths.DataDirectoryIdentity)));
-        var mutex = new Mutex(initiallyOwned: false, name: $"Global\\NetBootDhcpTool-{digest}");
+        // Use a new kernel-object name when moving from the legacy named Mutex.
+        // Windows does not allow a Semaphore to open an existing Mutex by the same name.
+        var semaphore = new Semaphore(initialCount: 1, maximumCount: 1, name: $"Global\\NetBootDhcpTool-LeaseV2-{digest}");
         try
         {
-            try
+            if (!semaphore.WaitOne(TimeSpan.Zero))
             {
-                if (!mutex.WaitOne(TimeSpan.Zero))
-                {
-                    mutex.Dispose();
-                    return null;
-                }
+                semaphore.Dispose();
+                return null;
             }
-            catch (AbandonedMutexException)
-            {
-                // An abnormal exit releases the mutex. Ownership is granted to this waiter.
-            }
-
-            return new SingleInstanceLease(mutex);
+            return new SingleInstanceLease(semaphore);
         }
         catch
         {
-            mutex.Dispose();
+            semaphore.Dispose();
             throw;
         }
     }
 
     public void Dispose()
     {
-        if (_disposed) return;
-        _disposed = true;
-        if (_ownsMutex)
-        {
-            _ownsMutex = false;
-            try { _mutex.ReleaseMutex(); }
-            finally { _mutex.Dispose(); }
-        }
-        else _mutex.Dispose();
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+        try { _semaphore.Release(); }
+        finally { _semaphore.Dispose(); }
     }
 }

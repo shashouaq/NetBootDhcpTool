@@ -5,6 +5,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $root = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
+. (Join-Path $PSScriptRoot 'package-content.ps1')
 $repositoryReleaseRoot = Join-Path $root 'release'
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
     $OutputDirectory = Join-Path $repositoryReleaseRoot ('local-build-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N'))
@@ -23,9 +24,9 @@ if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "Version not found or invalid 
 $tag = "v$version"
 $versionedRelease = Join-Path $releaseRoot "NetBootDhcpTool-v$version"
 $archive = Join-Path $releaseRoot "NetBootDhcpTool-v$version.7z"
-$fullPackageName = "NetBootDhcpTool-full-v$version.zip"
+$fullPackageName = "NetBootDhcpTool-full-v$version.7z"
 $fullPackage = Join-Path $releaseRoot $fullPackageName
-$manifestPath = Join-Path $releaseRoot 'latest.json'
+$manifestPath = Join-Path $releaseRoot 'latest-v2.json'
 $releaseNotesPath = Join-Path $root 'docs\RELEASE_NOTES.md'
 $changeLogPath = Join-Path $root 'docs\FEATURE_CHANGELOG.md'
 $sevenZip = 'C:\Program Files\7-Zip\7z.exe'
@@ -39,20 +40,7 @@ function Remove-OwnedOutput([string]$Path) {
 }
 
 function Get-ProductFiles([string]$Directory) {
-    $base = [System.IO.Path]::GetFullPath($Directory).TrimEnd([System.IO.Path]::DirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar
-    foreach ($file in Get-ChildItem -LiteralPath $Directory -File -Recurse -Force) {
-        $relative = $file.FullName.Substring($base.Length).Replace('\', '/')
-        if ($relative.Equals('install-manifest.json', [System.StringComparison]::OrdinalIgnoreCase) -or
-            $relative.StartsWith('logs/', [System.StringComparison]::OrdinalIgnoreCase) -or
-            $relative.EndsWith('.tmp', [System.StringComparison]::OrdinalIgnoreCase) -or
-            $relative.EndsWith('.bak', [System.StringComparison]::OrdinalIgnoreCase)) { continue }
-        [pscustomobject]@{
-            Path = $relative
-            SourcePath = $file.FullName
-            Sha256 = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-            Size = [long]$file.Length
-        }
-    }
+    return Get-ProductPackageContentManifest -Directory $Directory
 }
 
 function New-PackageZip([string]$Path, [System.Collections.IDictionary]$PackageDocument, [object[]]$Files) {
@@ -105,9 +93,11 @@ try {
 } finally { Remove-OwnedOutput $updaterOutput }
 & $dotnet publish .\src\NetBootDhcpTool.DhcpVerifier\NetBootDhcpTool.DhcpVerifier.csproj -c Release -r win-x64 --self-contained true --no-restore -p:PublishSingleFile=true -p:EnableCompressionInSingleFile=true -p:DebugType=None -p:DebugSymbols=false -o $toolsRelease
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-foreach ($directory in @('config', 'i18n', 'assets', 'docs')) { Copy-Item -LiteralPath (Join-Path $root $directory) -Destination $product -Recurse -Force }
-Copy-Item -LiteralPath (Join-Path $root 'README.md') -Destination $product -Force
-Copy-Item -LiteralPath (Join-Path $root 'PROJECT_MEMORY.md') -Destination $product -Force
+foreach ($publishRoot in @($product, $toolsRelease)) {
+    Get-ChildItem -LiteralPath $publishRoot -File -Recurse -Filter '*.pdb' | Remove-Item -Force
+}
+foreach ($directory in @('config', 'i18n', 'assets')) { Copy-Item -LiteralPath (Join-Path $root $directory) -Destination $product -Recurse -Force }
+Copy-ProductDocumentation -SourceRoot $root -DestinationProduct $product
 [System.IO.File]::WriteAllText((Join-Path $product 'README_RUN.txt'), "Run NetBootDhcpTool.exe to start the application.`r`nYou may move this NetBootDhcpTool folder to any writable path.`r`nNetBootDhcpTool-tools contains command-line diagnostic tools only.", [System.Text.UTF8Encoding]::new($false))
 New-Item -ItemType Directory -Force -Path (Join-Path $product 'logs') | Out-Null
 
@@ -125,60 +115,29 @@ $manifestFile = [pscustomobject]@{ Path='install-manifest.json';SourcePath=$inst
 $fullFiles = @($productFiles) + @($manifestFile)
 $fullPackageEntries = @($fullFiles | ForEach-Object { [ordered]@{path=$_.Path;sha256=$_.Sha256;size=$_.Size} })
 $fullDocument = [ordered]@{schemaVersion=1;productId='NetBootDhcpTool';kind='Full';targetVersion=$version;baseVersion=$null;baseInstallManifestSha256=$null;files=$fullPackageEntries;deletedFiles=@()}
-New-PackageZip -Path $fullPackage -PackageDocument $fullDocument -Files $fullFiles
+$packageWork = Join-Path $releaseRoot '.full7z-package'
+New-Item -ItemType Directory -Path (Join-Path $packageWork 'payload') -Force | Out-Null
+[System.IO.File]::WriteAllText((Join-Path $packageWork 'update-package.json'), (ConvertTo-Json -InputObject $fullDocument -Depth 12), [System.Text.UTF8Encoding]::new($false))
+foreach ($file in $fullFiles) {
+    $destination = Join-Path (Join-Path $packageWork 'payload') ([string]$file.Path -replace '/', [System.IO.Path]::DirectorySeparatorChar)
+    New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
+    Copy-Item -LiteralPath $file.SourcePath -Destination $destination
+}
+Push-Location $packageWork
+try {
+    & $sevenZip a -t7z $fullPackage 'update-package.json' 'payload' -mx=9 -m0=lzma2 -ms=on -mmt=on
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    & $sevenZip t $fullPackage
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+} finally { Pop-Location }
+Remove-OwnedOutput $packageWork
 $fullHash = Write-Checksum $fullPackage
 $fullSize = [long](Get-Item -LiteralPath $fullPackage).Length
 
-$packageMetadata = [System.Collections.Generic.List[object]]::new()
+$sevenZipPackageMetadata = [System.Collections.Generic.List[object]]::new()
 $githubBaseUrl = "https://github.com/$GitHubRepository/releases/download/$tag"
-$packageMetadata.Add([ordered]@{kind='Full';fileName=$fullPackageName;sha256=$fullHash;size=$fullSize;downloadUrl="$githubBaseUrl/$fullPackageName";downloadMirrors=@();baseVersion=$null;baseInstallManifestSha256=$null})
-
-$previous = Get-ChildItem -LiteralPath $BaselineDirectory -File -Filter 'install-manifest.json' -Recurse -ErrorAction SilentlyContinue |
-    ForEach-Object {
-        try { $candidateManifest = Read-InstallManifest $_.FullName } catch { return }
-        if ($candidateManifest.productId -eq 'NetBootDhcpTool' -and $candidateManifest.version -match '^\d+\.\d+\.\d+$') {
-            $candidateVersion = [version]$candidateManifest.version
-            if ($candidateVersion -lt [version]$version -and -not $_.FullName.StartsWith($releaseRoot + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) {
-                [pscustomobject]@{ Version=$candidateVersion;ManifestPath=$_.FullName }
-            }
-        }
-    } | Sort-Object Version -Descending | Select-Object -First 1
-if ($null -ne $previous) {
-    try {
-        $baseManifest = Read-InstallManifest $previous.ManifestPath
-        if ($baseManifest.productId -ne 'NetBootDhcpTool' -or $baseManifest.version -ne $previous.Version.ToString(3)) { throw 'Prior install manifest identity does not match its version.' }
-        $baseManifestHash = (Get-FileHash -LiteralPath $previous.ManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
-        $baseRecords = @{}
-        foreach ($file in $baseManifest.files) { $baseRecords[[string]$file.path] = $file }
-        $targetRecords = @{}
-        foreach ($file in $productFiles) { $targetRecords[$file.Path] = $file }
-        $changed = @($productFiles | Where-Object { -not $baseRecords.ContainsKey($_.Path) -or [string]$baseRecords[$_.Path].sha256 -cne $_.Sha256 })
-        $changed += $manifestFile
-        $deleted = @($baseRecords.Keys | Where-Object { -not $targetRecords.ContainsKey($_) } | Sort-Object)
-        $otaName = "NetBootDhcpTool-ota-v$($previous.Version.ToString(3))-to-v$version.zip"
-        $otaPath = Join-Path $releaseRoot $otaName
-        $otaEntries = @($changed | ForEach-Object {
-            $baseHash = if ($baseRecords.ContainsKey($_.Path)) { [string]$baseRecords[$_.Path].sha256 } else { $null }
-            [ordered]@{path=$_.Path;sha256=$_.Sha256;size=$_.Size;baseSha256=$baseHash}
-        })
-        $otaDocument = [ordered]@{schemaVersion=1;productId='NetBootDhcpTool';kind='Ota';targetVersion=$version;baseVersion=$previous.Version.ToString(3);baseInstallManifestSha256=$baseManifestHash;files=$otaEntries;deletedFiles=$deleted}
-        New-PackageZip -Path $otaPath -PackageDocument $otaDocument -Files $changed
-        $otaSize = [long](Get-Item -LiteralPath $otaPath).Length
-        if ($otaSize -lt $fullSize) {
-            $otaHash = Write-Checksum $otaPath
-            $packageMetadata.Add([ordered]@{kind='Ota';fileName=$otaName;sha256=$otaHash;size=$otaSize;downloadUrl="$githubBaseUrl/$otaName";downloadMirrors=@();baseVersion=$previous.Version.ToString(3);baseInstallManifestSha256=$baseManifestHash})
-            Write-Host "OTA package created: $otaName ($otaSize bytes, base $($previous.Version.ToString(3)))."
-        } else {
-            Remove-Item -LiteralPath $otaPath -Force
-            Remove-Item -LiteralPath "$otaPath.sha256" -Force -ErrorAction SilentlyContinue
-            Write-Host "OTA package is not smaller than Full ($otaSize >= $fullSize); only Full is published."
-        }
-    } catch {
-        throw "Could not create an OTA package from $($previous.Version): $($_.Exception.Message)"
-    }
-} else {
-    Write-Host 'No prior release with a valid install manifest exists; this release is Full-only and establishes the OTA baseline.'
-}
+$sevenZipPackageMetadata.Add([ordered]@{kind='Full';fileName=$fullPackageName;sha256=$fullHash;size=$fullSize;downloadUrl="$githubBaseUrl/$fullPackageName";downloadMirrors=@();baseVersion=$null;baseInstallManifestSha256=$null})
+Write-Host "Full 7z update payload created: $fullPackageName ($fullSize bytes). OTA remains disabled until the full-install migration closes."
 
 Copy-Item -LiteralPath $product -Destination $versionedRelease -Recurse -Force
 Push-Location $releaseRoot
@@ -218,7 +177,8 @@ $manifestObject = [ordered]@{
     minimumSupportedVersion = '1.0.6'
     releaseNotes = $releaseNotes
     changes = $changeItems
-    packages = @($packageMetadata)
+    packages = @()
+    sevenZipPackages = @($sevenZipPackageMetadata)
 }
 [System.IO.File]::WriteAllText($manifestPath, (ConvertTo-Json -InputObject $manifestObject -Depth 12), [System.Text.UTF8Encoding]::new($false))
 Write-Host "Output directory: $releaseRoot"
@@ -226,5 +186,5 @@ Write-Host "Portable folder: $product (move this folder without renaming it)."
 Write-Host "Versioned install inventory: $versionedRelease"
 Write-Host "Tools: $toolsRelease"
 Write-Host "Legacy archive: $archive"
-Write-Host "Full update package: $fullPackage"
+Write-Host "Full 7z update package: $fullPackage"
 Write-Host "Manifest: $manifestPath (formal publishing signs the final dual-source bytes)."

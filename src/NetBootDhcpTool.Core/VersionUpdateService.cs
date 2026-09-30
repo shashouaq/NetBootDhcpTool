@@ -19,6 +19,7 @@ public sealed class UpdateManifest
     public List<string> Changes { get; set; } = [];
     public List<string> DownloadMirrors { get; set; } = [];
     public List<UpdatePackageMetadata> Packages { get; set; } = [];
+    public List<UpdatePackageMetadata> SevenZipPackages { get; set; } = [];
 }
 
 public sealed class UpdateCheckResult
@@ -77,7 +78,9 @@ public sealed class VersionUpdateService : IDisposable
     private sealed record ManifestPayload(string Json, string Signature, string SourceUrl);
     private sealed record ManifestCandidate(Uri SourceUri, UpdateCheckResult Result);
 
-    public const string DefaultManifestUrl = "https://github.com/shashouaq/NetBootDhcpTool/releases/latest/download/latest.json";
+    public const string ManifestFileName = "latest-v2.json";
+    public const string ManifestSignatureFileName = "latest-v2.json.sig";
+    public const string DefaultManifestUrl = "https://github.com/shashouaq/NetBootDhcpTool/releases/latest/download/latest-v2.json";
     public const string GiteeLatestReleaseApiUrl = "https://gitee.com/api/v5/repos/joel20230302/NetBootDhcpTool/releases/latest";
     private const string GiteeRepositoryApiPrefix = "https://gitee.com/api/v5/repos/joel20230302/NetBootDhcpTool";
     private readonly HttpClient _httpClient;
@@ -98,7 +101,7 @@ public sealed class VersionUpdateService : IDisposable
         if (_downloadIdleTimeout <= TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(downloadIdleTimeout));
         ArgumentException.ThrowIfNullOrWhiteSpace(trustedPublicKeyPem);
         _trustedPublicKeyPem = trustedPublicKeyPem;
-        _httpClient = httpClient ?? new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
+        _httpClient = httpClient ?? UpdateTestEnvironment.CreateHttpClient() ?? new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
         _ownsHttpClient = httpClient == null;
         _manifestUris = string.IsNullOrWhiteSpace(manifestUrl)
             ? [new Uri(GiteeLatestReleaseApiUrl, UriKind.Absolute), new Uri(DefaultManifestUrl, UriKind.Absolute)]
@@ -187,6 +190,7 @@ public sealed class VersionUpdateService : IDisposable
             packages.Add(new UpdatePackageMetadata
             {
                 Kind = selectedPackage.Kind,
+                Format = selectedPackage.Format,
                 FileName = selectedPackage.FileName,
                 Sha256 = selectedPackage.Sha256,
                 Size = selectedPackage.Size,
@@ -225,6 +229,7 @@ public sealed class VersionUpdateService : IDisposable
 
     private static bool SamePackageIdentity(UpdatePackageMetadata left, UpdatePackageMetadata right) =>
         left.Kind.Equals(right.Kind, StringComparison.OrdinalIgnoreCase)
+        && left.Format.Equals(right.Format, StringComparison.OrdinalIgnoreCase)
         && left.FileName.Equals(right.FileName, StringComparison.Ordinal)
         && left.Sha256.Equals(right.Sha256, StringComparison.OrdinalIgnoreCase)
         && left.Size == right.Size
@@ -328,7 +333,10 @@ public sealed class VersionUpdateService : IDisposable
             if (!IsSha256(manifest.ArchiveSha256)) throw new InvalidDataException("Update archive checksum is invalid");
 
             var signed = UpdateManifestSignature.Verify(Encoding.UTF8.GetBytes(json), signature, trustedPublicKeyPem);
-            var packages = signed ? ValidatePackages(manifest.Packages, latest) : [];
+            var packages = signed
+                ? ValidatePackages(manifest.Packages, latest, UpdatePackageFormat.Zip)
+                    .Concat(ValidatePackages(manifest.SevenZipPackages, latest, UpdatePackageFormat.SevenZip)).ToList()
+                : [];
 
             return new UpdateCheckResult
             {
@@ -544,12 +552,12 @@ public sealed class VersionUpdateService : IDisposable
                 continue;
             var name = nameElement.GetString();
             var url = urlElement.GetString();
-            if (string.Equals(name, "latest.json", StringComparison.OrdinalIgnoreCase)) manifestUrl = url;
-            else if (string.Equals(name, "latest.json.sig", StringComparison.OrdinalIgnoreCase)) signatureUrl = url;
+            if (string.Equals(name, ManifestFileName, StringComparison.OrdinalIgnoreCase)) manifestUrl = url;
+            else if (string.Equals(name, ManifestSignatureFileName, StringComparison.OrdinalIgnoreCase)) signatureUrl = url;
         }
 
-        if (manifestUrl is null) throw new FileNotFoundException("Gitee latest release does not contain latest.json");
-        if (!IsSafeManifestAssetUrl(manifestUrl, releaseVersion, "latest.json"))
+        if (manifestUrl is null) throw new FileNotFoundException($"Gitee latest release does not contain {ManifestFileName}");
+        if (!IsSafeManifestAssetUrl(manifestUrl, releaseVersion, ManifestFileName))
             throw new InvalidDataException("Gitee latest manifest attachment URL is not approved");
         var manifestJson = await GetJsonAsync(new Uri(manifestUrl, UriKind.Absolute), ct).ConfigureAwait(false);
         using var manifestDocument = JsonDocument.Parse(manifestJson);
@@ -559,7 +567,7 @@ public sealed class VersionUpdateService : IDisposable
             || manifestVersion != releaseVersion)
             throw new InvalidDataException("Gitee latest manifest version does not match its Release tag");
         var signature = "";
-        if (signatureUrl is not null && IsSafeManifestAssetUrl(signatureUrl, releaseVersion, "latest.json.sig"))
+        if (signatureUrl is not null && IsSafeManifestAssetUrl(signatureUrl, releaseVersion, ManifestSignatureFileName))
             signature = await GetOptionalTextAsync(new Uri(signatureUrl, UriKind.Absolute), ct).ConfigureAwait(false);
         return new ManifestPayload(manifestJson, signature, manifestUrl);
     }
@@ -605,7 +613,7 @@ public sealed class VersionUpdateService : IDisposable
         return urls;
     }
 
-    private static IReadOnlyList<UpdatePackageMetadata> ValidatePackages(IReadOnlyList<UpdatePackageMetadata>? packages, Version expectedVersion)
+    private static IReadOnlyList<UpdatePackageMetadata> ValidatePackages(IReadOnlyList<UpdatePackageMetadata>? packages, Version expectedVersion, UpdatePackageFormat format)
     {
         if (packages is null || packages.Count == 0 || packages.Count > 8) return [];
         var valid = new List<UpdatePackageMetadata>();
@@ -616,13 +624,15 @@ public sealed class VersionUpdateService : IDisposable
                 return [];
             if (package.Kind.Equals("Full", StringComparison.OrdinalIgnoreCase))
             {
-                if (hasFull || package.FileName != $"NetBootDhcpTool-full-v{expectedVersion.ToString(3)}.zip") return [];
+                var extension = format == UpdatePackageFormat.SevenZip ? ".7z" : ".zip";
+                if (hasFull || package.FileName != $"NetBootDhcpTool-full-v{expectedVersion.ToString(3)}{extension}") return [];
                 hasFull = true;
             }
             else if (package.Kind.Equals("Ota", StringComparison.OrdinalIgnoreCase))
             {
+                var extension = format == UpdatePackageFormat.SevenZip ? ".7z" : ".zip";
                 if (!TryParseVersion(package.BaseVersion, out var baseVersion) || baseVersion >= expectedVersion
-                    || package.FileName != $"NetBootDhcpTool-ota-v{baseVersion.ToString(3)}-to-v{expectedVersion.ToString(3)}.zip"
+                    || package.FileName != $"NetBootDhcpTool-ota-v{baseVersion.ToString(3)}-to-v{expectedVersion.ToString(3)}{extension}"
                     || !IsSha256(package.BaseInstallManifestSha256)) return [];
             }
             else return [];
@@ -630,7 +640,18 @@ public sealed class VersionUpdateService : IDisposable
             if (GetSafePackageUrls(package, expectedVersion).Count == 0) return [];
             if (valid.Any(existing => existing.Kind.Equals(package.Kind, StringComparison.OrdinalIgnoreCase)
                 && string.Equals(existing.BaseVersion, package.BaseVersion, StringComparison.Ordinal))) return [];
-            valid.Add(package);
+            valid.Add(new UpdatePackageMetadata
+            {
+                Kind = package.Kind,
+                Format = format.ToString(),
+                FileName = package.FileName,
+                Sha256 = package.Sha256,
+                Size = package.Size,
+                DownloadUrl = package.DownloadUrl,
+                DownloadMirrors = package.DownloadMirrors,
+                BaseVersion = package.BaseVersion,
+                BaseInstallManifestSha256 = package.BaseInstallManifestSha256
+            });
         }
         return hasFull ? valid : [];
     }
@@ -729,13 +750,15 @@ public sealed class VersionUpdateService : IDisposable
         if (tail.Length != 2 || !tail[0].StartsWith('v') || !TryParseVersion(tail[0], out var tagVersion)
             || (expectedVersion is not null && tagVersion != expectedVersion)) return false;
         var name = tail[1];
-        if (name is "latest.json" or "latest.json.sig") return true;
+        if (name is "latest.json" or "latest.json.sig" or "latest-v2.json" or "latest-v2.json.sig") return true;
         if (name.Equals($"NetBootDhcpTool-v{tagVersion.ToString(3)}.7z", StringComparison.Ordinal)) return true;
         if (name.Equals($"NetBootDhcpTool-v{tagVersion.ToString(3)}.7z.sha256", StringComparison.Ordinal)) return true;
         if (name.Equals($"NetBootDhcpTool-full-v{tagVersion.ToString(3)}.zip", StringComparison.Ordinal)
-            || name.Equals($"NetBootDhcpTool-full-v{tagVersion.ToString(3)}.zip.sha256", StringComparison.Ordinal)) return true;
+            || name.Equals($"NetBootDhcpTool-full-v{tagVersion.ToString(3)}.zip.sha256", StringComparison.Ordinal)
+            || name.Equals($"NetBootDhcpTool-full-v{tagVersion.ToString(3)}.7z", StringComparison.Ordinal)
+            || name.Equals($"NetBootDhcpTool-full-v{tagVersion.ToString(3)}.7z.sha256", StringComparison.Ordinal)) return true;
         var ota = System.Text.RegularExpressions.Regex.Match(name,
-            @"^NetBootDhcpTool-ota-v(?<base>[0-9]+\.[0-9]+\.[0-9]+)-to-v(?<target>[0-9]+\.[0-9]+\.[0-9]+)\.zip(?:\.sha256)?$",
+            @"^NetBootDhcpTool-ota-v(?<base>[0-9]+\.[0-9]+\.[0-9]+)-to-v(?<target>[0-9]+\.[0-9]+\.[0-9]+)\.(?:zip|7z)(?:\.sha256)?$",
             System.Text.RegularExpressions.RegexOptions.CultureInvariant);
         return ota.Success && ota.Groups["target"].Value.Equals(tagVersion.ToString(3), StringComparison.Ordinal)
             && TryParseVersion(ota.Groups["base"].Value, out var baseVersion) && baseVersion < tagVersion;

@@ -20,6 +20,21 @@ function Assert-Throws {
 $tempRoot = Join-Path $env:TEMP ("netboot-release-tests-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tempRoot -Force | Out-Null
 try {
+    . (Join-Path $repoRoot 'build\release-identity.ps1')
+    Assert-Equal '1.1.0' (Get-NetBootReleaseIdentity -Tag 'v1.1.0-rc.1' -ReleaseCandidate).Version 'RC binary version remains numeric'
+    Assert-Equal $true (Get-NetBootReleaseIdentity -Tag 'v1.1.0-rc.1' -ReleaseCandidate).IsCandidate 'RC mode is explicit'
+    Assert-Throws { Get-NetBootReleaseIdentity -Tag 'v1.1.0' -ReleaseCandidate } 'Candidate mode must reject a stable tag'
+    Assert-Throws { Get-NetBootReleaseIdentity -Tag 'v1.1.0-rc.1' } 'Formal mode must reject RC tags'
+    Assert-Throws { Get-NetBootReleaseIdentity -Tag 'v1.1.0-rc.0' -ReleaseCandidate } 'RC ordinal must be positive'
+    . (Join-Path $repoRoot 'build\legacy-manifest.ps1')
+    $newRelease = Join-Path $tempRoot 'v2-release'
+    New-Item -ItemType Directory -Path $newRelease | Out-Null
+    [IO.File]::WriteAllText((Join-Path $newRelease 'latest-v2.json'), '{"version":"1.1.0"}')
+    Copy-NetBootFrozenLegacyManifest -RepositoryRoot $repoRoot -Destination $newRelease
+    Assert-Equal '10d2b102b615c007e81616b9abe15c939b43f212e9667910822b78975e9a48a7' (Get-ReleaseFileSha256 (Join-Path $newRelease 'latest.json')) 'Publishing V2 must preserve the frozen v1.0.20 bytes'
+    Assert-Equal '1.1.0' ((Get-Content (Join-Path $newRelease 'latest-v2.json') -Raw | ConvertFrom-Json).version) 'Legacy publication must not rewrite the V2 manifest'
+    [IO.File]::WriteAllText((Join-Path $newRelease 'latest.json'), '{"version":"1.1.0"}')
+    Assert-Throws { Copy-NetBootFrozenLegacyManifest -RepositoryRoot $repoRoot -Destination $newRelease } 'A new manifest must never overwrite the legacy channel'
     Assert-Equal '1.2.3' (Get-ReleaseVersionFromTag 'v1.2.3') 'Stable release tag parsing failed'
     Assert-Throws { Get-ReleaseVersionFromTag 'v1.2.3-rc.1' } 'Prerelease tags must not enter the stable release workflow.'
     Assert-Equal 'https://gitee.com/releases/file.7z' (Assert-SafeGiteeDownloadUrl 'https://gitee.com/releases/file.7z') 'Gitee HTTPS download URL validation failed'
@@ -61,7 +76,7 @@ try {
     [System.IO.File]::WriteAllBytes($archivePath, [System.Text.Encoding]::UTF8.GetBytes('release archive bytes'))
     $archiveHash = Get-ReleaseFileSha256 $archivePath
     [System.IO.File]::WriteAllText("$archivePath.sha256", "$archiveHash  $archiveName", [System.Text.Encoding]::ASCII)
-    $fullName = 'NetBootDhcpTool-full-v1.2.3.zip'
+    $fullName = 'NetBootDhcpTool-full-v1.2.3.7z'
     $fullPath = Join-Path $bundleDirectory $fullName
     [System.IO.File]::WriteAllBytes($fullPath, [System.Text.Encoding]::UTF8.GetBytes('full package bytes'))
     $fullHash = Get-ReleaseFileSha256 $fullPath
@@ -76,7 +91,8 @@ try {
         minimumSupportedVersion = '1.0.6'
         releaseNotes = 'Test notes'
         changes = @('Test change')
-        packages = @(@{
+        packages = @()
+        sevenZipPackages = @(@{
             kind = 'Full'
             fileName = $fullName
             sha256 = $fullHash
@@ -85,7 +101,7 @@ try {
             downloadMirrors = @()
         })
     }
-    $baseManifestPath = Join-Path $bundleDirectory 'latest.json'
+    $baseManifestPath = Join-Path $bundleDirectory 'latest-v2.json'
     [System.IO.File]::WriteAllText($baseManifestPath, (ConvertTo-Json -InputObject $baseManifest -Depth 6), [System.Text.UTF8Encoding]::new($false))
 
     $bundle = Get-ReleaseBundle -Directory $bundleDirectory -Tag $tag
@@ -108,15 +124,15 @@ try {
     Assert-Equal 'verified' $reopened.giteeAssets[$archiveName].status 'Gitee attachment status did not survive a cache readback'
     Assert-Throws { Read-ReleaseState -Path $statePath -Tag $tag -SourceCommit ('f' * 40) -ArchiveSha256 $archiveHash } 'A release cache from another source commit must fail closed.'
 
-    $dualManifestPath = Join-Path $bundleDirectory 'final-latest.json'
+    $dualManifestPath = Join-Path $bundleDirectory 'final-latest-v2.json'
     $giteePackageUrl = 'https://gitee.com/joel20230302/NetBootDhcpTool/attach_files/12345/download'
     $dualManifest = New-DualSourceManifest -BaseManifestPath $baseManifestPath -Tag $tag -GitHubRepository 'shashouaq/NetBootDhcpTool' -GiteeReleasePageUrl "https://gitee.com/joel20230302/NetBootDhcpTool/releases/tag/$tag" -GiteeArchiveDownloadUrl 'https://gitee.com/download/archive' -GiteeAssetUrls @{ $fullName=$giteePackageUrl } -OutputPath $dualManifestPath
     Assert-Equal 'https://gitee.com/download/archive' $dualManifest.downloadUrl 'Gitee must be the manifest primary source'
     Assert-Equal @("https://github.com/shashouaq/NetBootDhcpTool/releases/download/$tag/$archiveName") @($dualManifest.downloadMirrors) 'GitHub mirror URL was not preserved'
     Assert-Equal $archiveHash $dualManifest.archiveSha256 'Dual-source manifest changed the archive checksum'
     Assert-Equal "https://gitee.com/joel20230302/NetBootDhcpTool/releases/tag/$tag" $dualManifest.releasePageUrl 'Gitee release page link was not set'
-    Assert-Equal $giteePackageUrl $dualManifest.packages[0].downloadUrl 'Full package Gitee attachment URL was not included in the signed manifest'
-    Assert-Equal @("https://github.com/shashouaq/NetBootDhcpTool/releases/download/$tag/$fullName") @($dualManifest.packages[0].downloadMirrors) 'Full package GitHub mirror was not included in the signed manifest'
+    Assert-Equal $giteePackageUrl $dualManifest.sevenZipPackages[0].downloadUrl 'Full 7z Gitee attachment URL was not included in the signed manifest'
+    Assert-Equal @("https://github.com/shashouaq/NetBootDhcpTool/releases/download/$tag/$fullName") @($dualManifest.sevenZipPackages[0].downloadMirrors) 'Full 7z GitHub mirror was not included in the signed manifest'
 
     $tamperedArchive = [System.IO.File]::ReadAllBytes($archivePath)
     [System.IO.File]::WriteAllBytes($archivePath, [System.Text.Encoding]::UTF8.GetBytes('different archive bytes'))
@@ -159,7 +175,29 @@ try {
     }
 
     $giteeScript = Get-Content -Raw -LiteralPath (Join-Path $repoRoot 'scripts\Publish-GiteeMirror.ps1')
+    $secureMirrorScript = Get-Content -Raw -LiteralPath (Join-Path $repoRoot 'scripts\Invoke-GiteeMirrorSecure.ps1')
+    foreach ($requiredSecureBehavior in @(
+        'Read-Host',
+        '-AsSecureString',
+        'SecureStringToBSTR',
+        '$env:GITEE_TOKEN = $tokenText',
+        'Remove-Item Env:GITEE_TOKEN',
+        'ZeroFreeBSTR',
+        '& $publisherPath -Tag $Tag -AssetDirectory $AssetDirectory -TelemetryPath $telemetryPath'
+    )) {
+        if (-not $secureMirrorScript.Contains($requiredSecureBehavior)) { throw "Secure Gitee launcher is missing required credential handling: $requiredSecureBehavior." }
+    }
+    if ($secureMirrorScript -match '(?i)(?:param\s*\([^)]*\$Token|-[\w]+Token\s+\$tokenText|Write-(?:Host|Output|AllText)[^\r\n]*\$tokenText)') {
+        throw 'Secure Gitee launcher must not accept or print a token parameter.'
+    }
     $githubScript = Get-Content -Raw -LiteralPath (Join-Path $repoRoot 'scripts\Publish-GitHubRelease.ps1')
+    $candidateWorkflow = Get-Content -Raw -LiteralPath (Join-Path $repoRoot '.github\workflows\release-candidate.yml')
+    if (-not $githubScript.Contains('if (-not $ReleaseCandidate -and [bool]$release.prerelease)') -or
+        -not $githubScript.Contains("make_latest = 'false'") -or
+        $candidateWorkflow -notmatch 'Publish-GitHubRelease\.ps1.*-ReleaseCandidate -SourceCommit' -or
+        $candidateWorkflow -match 'runs-on:.*self-hosted|GITEE_TOKEN') {
+        throw 'RC publishing must stay prerelease, use exact source identity and never run a Gitee upload or self-hosted runner.'
+    }
     $prepareScript = Get-Content -Raw -LiteralPath (Join-Path $repoRoot 'scripts\Prepare-GitHubRelease.ps1')
     $packageBuilder = Get-Content -Raw -LiteralPath (Join-Path $repoRoot 'build\publish.ps1')
     if ($packageBuilder -notmatch 'docs\\RELEASE_NOTES\.md' -or
@@ -172,28 +210,34 @@ try {
         'browser_download_url',
         'FormFields',
         'access_token = $Token',
-        'Sync-GiteeSourceRefs',
-        'merge-base --is-ancestor',
-        'Fast-forward synchronized main and tag',
+        'AssetDirectory',
+        'Get-GitHubAssetSha256',
+        'Assert-GitHubAssetFile',
+        'Download-VerifiedGitHubAsset',
         'Get-MirrorSha256',
         'Assert-MirrorManifestSignature',
         'Get-GiteeAttachmentsForMirror',
+        'Get-GiteeAttachmentById',
+        'AssetDirectory must contain exactly the formal GitHub Release assets',
+        'Write-GiteeMirrorTelemetry',
         'Gitee Release has duplicate attachments named',
-        'Gitee attachment readback size/SHA-256 mismatch',
-        'Final public Gitee download SHA-256 mismatch',
+        'size/SHA-256 mismatch for',
         'GITEE_MIRROR SUCCESS',
+        'avg_bytes_per_sec=',
+        'latest-v2.json.sig',
+        'latest-v2.json',
         'latest.json.sig',
         'latest.json'
     )) {
         if (-not $giteeScript.Contains($requiredMirrorBehavior)) { throw "Independent Gitee mirror is missing required recovery/integrity behavior: $requiredMirrorBehavior." }
     }
-    if ($giteeScript -match 'actions\.githubusercontent\.com|ssl-no-revoke|NoCheck|RevocationMode|push[^\r\n]*--force') {
+    if ($giteeScript -match 'actions\.githubusercontent\.com|results-receiver\.actions\.githubusercontent\.com|ssl-no-revoke|NoCheck|RevocationMode|GITHUB_STEP_SUMMARY|git (push|fetch)|git\.exe') {
         throw 'Gitee Mirror must use ordinary REST/Release HTTPS and normal certificate validation.'
     }
-    if ($giteeWorkflow -notmatch 'workflow_dispatch:' -or $giteeWorkflow -notmatch 'workflow_run:' -or
-        $giteeWorkflow -notmatch "conclusion == 'success'" -or $giteeWorkflow -notmatch 'secrets\.GITEE_TOKEN' -or
-        $giteeWorkflow -notmatch 'GITHUB_TOKEN: \$\{\{ github\.token \}\}') {
-        throw 'Gitee mirror needs an independent manual retry, success-only trigger, separate Gitee token and read-only GitHub API token.'
+    if ($giteeWorkflow -notmatch 'workflow_dispatch:' -or
+        $giteeWorkflow -notmatch 'gitee-mirror\.tests\.ps1' -or
+        $giteeWorkflow -match 'workflow_run:|secrets\.GITEE_TOKEN|GITHUB_TOKEN:|Publish-GiteeMirror\.ps1\s+-Tag') {
+        throw 'Gitee mirror workflow must remain a manual mock-test diagnostic and must not upload official assets.'
     }
     if ($giteeWorkflow -match '(?m)^\s+needs:\s*Formal Release') { throw 'Gitee mirror status must not gate or change GitHub Formal Release status.' }
     foreach ($requiredGithubBehavior in @('Test-GitHubAssetReadback', 'Ensure-GitHubAsset', 'stable Release promotion returned', 'make_latest = ''true''')) {
@@ -205,6 +249,11 @@ try {
         $prepareScript -notmatch 'RSASignaturePadding]::Pss' -or
         $prepareScript -notmatch 'does not match the public key trusted by the client') {
         throw 'The hosted package preparation must sign with the existing client-trusted update key and fail on key mismatch.'
+    }
+    if ($prepareScript -notmatch 'package-setup\.ps1' -or
+        -not $packageBuilder.Contains('NetBootDhcpTool-full-v') -or
+        -not $packageBuilder.Contains('sevenZipPackages')) {
+        throw 'The formal package path must prepare a paired Setup.exe and signed Full 7z V2 package.'
     }
     $legacyWorkflow = Join-Path $repoRoot 'docs\archive\formal-release-self-hosted-2026-09-28.yml'
     if (-not (Test-Path -LiteralPath $legacyWorkflow) -or

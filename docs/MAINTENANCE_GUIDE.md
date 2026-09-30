@@ -16,14 +16,16 @@ The 2026-09-23 audit baseline and unperformed real-network checks are recorded i
 - Gitee distribution repository: `https://gitee.com/joel20230302/NetBootDhcpTool`
 - Default branch: `main`
 - Release tag format: `v<version>`
-- Current application version: `1.0.20`
+- Current application version: `1.1.0`
 - Target framework: .NET 10; the repository pins SDK `10.0.401` in `global.json` with `latestFeature` roll-forward.
 - Resolve the SDK through `build/resolve-dotnet.ps1`; it honors the repository pin and bootstraps that SDK when needed. The first run may need network access.
-- GitHub fallback manifest URL:
+- Legacy GitHub manifest URL (frozen for ZIP-only clients):
 
 ```text
 https://github.com/shashouaq/NetBootDhcpTool/releases/latest/download/latest.json
 ```
+
+New V2 clients use `latest-v2.json` and its detached signature. Keep the legacy manifest frozen; old clients migrate once through the paired full Setup and Full 7z assets before using V2 automatic updates.
 
 ## Non-Negotiable Maintenance Rules
 
@@ -37,7 +39,7 @@ https://github.com/shashouaq/NetBootDhcpTool/releases/latest/download/latest.jso
 - For application changes that are not being published, finish validation by opening the current source `Release` build for preview; documentation-only changes do not need an application preview. Do not push or publish unless the user explicitly asks.
 - Before an application preview, check whether `NetBootDhcpTool` is already running. `build/run-app-admin.ps1` manages only a process whose resolved `.exe`/`dotnet` entry point is one of this repository's source Release or packaged app outputs. It requests normal close and waits up to 240 seconds for the app's serialized cleanup; refusal, unreadable ownership, or timeout leaves the process running and does not start another GUI. It prefers the current source Release output and falls back to `release/NetBootDhcpTool` only when the source executable is absent. It never uses `Stop-Process -Force` for the app.
 - Only when the user explicitly says to publish/release may source, packages, tags, or releases be pushed to either host. After publishing, verify the remote commit/release/assets and report the exact URLs or commit; never claim publication from a local command alone.
-- Follow [RELEASE_PROCESS](RELEASE_PROCESS.md) for every formal release. GitHub-hosted Windows runners gate CI, build the signed bundle once, publish GitHub Release and verify every public asset. Gitee mirroring runs as an independent workflow through `scripts/Publish-GiteeMirror.ps1`; retry that workflow by tag without rebuilding or changing the successful GitHub formal-release state. Keep the former self-hosted workflow, scripts, runner configuration and release cache until a real v1.0.20 end-to-end publication has been verified and the migration is reviewed.
+- Follow [RELEASE_PROCESS](RELEASE_PROCESS.md) for every formal release. GitHub-hosted Windows runners gate CI, build and publish the signed assets once, then verify every public asset. Gitee mirroring runs independently through `scripts/Publish-GiteeMirror.ps1`; retry it by tag without rebuilding or changing the successful GitHub formal-release state. Keep the former self-hosted workflow, scripts, runner configuration and release cache as backups while the new formal release chain is under review; they are not a publication prerequisite.
 - Every application run must create a new UTF-8 session log whose filename contains the start timestamp; user actions and slow-operation start/completion, elapsed time, and errors must be traceable in that run's log.
 - Prioritize Chinese/English bilingual support for every future user-visible change, including UI labels, buttons, dialogs, status messages, logs, help text, and maintenance documentation. Reuse the language resources where practical; do not add Chinese-only or English-only text without documenting the reason.
 - Every user-facing application button must have a separate compact round `?` help button beside it. Keep the indicator small and visible by default; hovering the action or indicator shows a contextual Chinese/English explanation, and clicking the indicator opens the same explanation in a dialog without executing the neighboring action. Run-time-created buttons must use `HelpButtonService.Attach`.
@@ -173,13 +175,13 @@ Update the version in `src/NetBootDhcpTool.App/NetBootDhcpTool.App.csproj`, revi
 
 ## Upgrade Detection Contract
 
-In-app upgrade detection currently tries the Gitee latest Release API and its `latest.json` attachment first, then falls back to this GitHub manifest URL:
+The legacy v1.0.20 update path uses the Gitee latest Release API and frozen `latest.json` attachment, then its GitHub fallback URL. New V2 clients use `latest-v2.json` on both sources:
 
 ```text
 https://github.com/shashouaq/NetBootDhcpTool/releases/latest/download/latest.json
 ```
 
-The signed manifest retains the legacy `.7z` fields and adds a Full package plus an optional OTA package. The OTA applies only when both the installed version and the SHA-256 of the installed inventory exactly match its declared base; otherwise the client selects Full. A detached RSA-PSS/SHA-256 signature authenticates the final manifest bytes before package metadata is used. Old unsigned manifests remain manual-download-only.
+The V2 signed manifest keeps legacy fields unchanged and adds a separate `sevenZipPackages` list. Full 7z is the automatic-update payload; any optional OTA package must use the same 7z extractor, locked stream, canonical path checks and transaction/rollback path. The detached RSA-PSS/SHA-256 signature authenticates the exact manifest bytes. ZIP support remains for historical compatibility and test/tools; it does not mean the v1.0.20 updater can safely apply V2 packages.
 
 For a signed package, the app:
 

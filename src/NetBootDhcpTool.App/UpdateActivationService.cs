@@ -71,7 +71,8 @@ internal sealed class UpdateActivationService
             install.ManifestSha256,
             Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(downloaded.SignedManifestJson)),
             downloaded.ManifestSignature,
-            requestId);
+            requestId,
+            downloaded.Package.Format);
         var processRequest = new UpdateProcessRequest(
             applyRequest,
             Environment.ProcessId,

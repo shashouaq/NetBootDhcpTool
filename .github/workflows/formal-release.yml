@@ -99,6 +99,20 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw 'Could not install 7-Zip on the GitHub-hosted runner.' }
           }
 
+      - name: Install pinned NSIS 3.12 compiler
+        shell: pwsh
+        run: |
+          winget install --id NSIS.NSIS --exact --version 3.12 --source winget --silent --accept-source-agreements --accept-package-agreements --disable-interactivity
+          if ($LASTEXITCODE -ne 0) { throw 'Could not install pinned NSIS 3.12.' }
+          $makensis = @(
+            (Join-Path ${env:ProgramFiles(x86)} 'NSIS\makensis.exe'),
+            (Join-Path $env:ProgramFiles 'NSIS\makensis.exe')
+          ) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+          if (-not $makensis) { throw 'NSIS was installed but makensis.exe was not found.' }
+          $versionOutput = (& $makensis /VERSION | Out-String).Trim()
+          if ($versionOutput -notmatch '^v?3\.12(?:\.|$)') { throw "Expected NSIS 3.12; got $versionOutput." }
+          "MAKENSIS_PATH=$makensis" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       - name: Build and sign the immutable package set
         shell: pwsh
         env:

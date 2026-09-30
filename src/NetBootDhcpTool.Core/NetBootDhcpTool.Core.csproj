@@ -8,4 +8,7 @@
     <InternalsVisibleTo Include="NetBootDhcpTool.App" />
     <InternalsVisibleTo Include="NetBootDhcpTool.UnitTests" />
   </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="SharpCompress" Version="0.50.4" />
+  </ItemGroup>
 </Project>

@@ -1,0 +1,35 @@
+{
+  "version": "1.0.20",
+  "releasedAt": "2026-09-28T03:03:54Z",
+  "archiveName": "NetBootDhcpTool-v1.0.20.7z",
+  "archiveSha256": "4566940798fcfccc0c2926a7c947ae1ba87fedc39da58e65c1e0e0b663ce47d5",
+  "downloadUrl": "https://gitee.com/joel20230302/NetBootDhcpTool/releases/download/v1.0.20/NetBootDhcpTool-v1.0.20.7z",
+  "downloadMirrors": [
+    "https://github.com/shashouaq/NetBootDhcpTool/releases/download/v1.0.20/NetBootDhcpTool-v1.0.20.7z"
+  ],
+  "releasePageUrl": "https://gitee.com/joel20230302/NetBootDhcpTool/releases/tag/v1.0.20",
+  "minimumSupportedVersion": "1.0.6",
+  "releaseNotes": "## v1.0.20\r\n\r\n### zh-CN\r\n\r\nNetBoot DHCP Tool v1.0.20 将正式发布与 Gitee 镜像同步拆开，提升发布可靠性。\r\n\r\n- 正式包在 GitHub-hosted Windows Runner 上只构建一次，GitHub 发布和完整性校验独立完成。\r\n- Gitee 镜像可在 GitHub 正式发布成功后单独重试和续传，不会让镜像故障回滚 GitHub 发布状态。\r\n- 更新检查只测速和下载签名信息与当前正式版本一致的镜像；过期或文件名、SHA-256 不匹配的镜像会自动排除。\r\n\r\n### en-US\r\n\r\nNetBoot DHCP Tool v1.0.20 separates formal publication from Gitee mirror synchronization for more reliable releases.\r\n\r\n- The formal package is built once on a GitHub-hosted Windows runner, followed by independent GitHub publication and full integrity verification.\r\n- Gitee mirroring can be retried or resumed after GitHub publication succeeds; mirror failures do not change the GitHub release state.\r\n- Update checks probe and download only mirrors whose signed metadata matches the current formal version; stale sources or filename/SHA-256 mismatches are excluded.",
+  "changes": [
+    "正式包在 GitHub-hosted Windows Runner 上只构建一次，GitHub 发布和完整性校验独立完成。",
+    "Gitee 镜像可在 GitHub 正式发布成功后单独重试和续传，不会让镜像故障回滚 GitHub 发布状态。",
+    "更新检查只测速和下载签名信息与当前正式版本一致的镜像；过期或文件名、SHA-256 不匹配的镜像会自动排除。",
+    "The formal package is built once on a GitHub-hosted Windows runner, followed by independent GitHub publication and full integrity verification.",
+    "Gitee mirroring can be retried or resumed after GitHub publication succeeds; mirror failures do not change the GitHub release state.",
+    "Update checks probe and download only mirrors whose signed metadata matches the current formal version; stale sources or filename/SHA-256 mismatches are excluded."
+  ],
+  "packages": [
+    {
+      "kind": "Full",
+      "fileName": "NetBootDhcpTool-full-v1.0.20.zip",
+      "sha256": "f925e90a321c9a946f7d18a65d3ec3283f8099df55e81d0fa5f141cc33d90cde",
+      "size": 106449589,
+      "downloadUrl": "https://gitee.com/joel20230302/NetBootDhcpTool/releases/download/v1.0.20/NetBootDhcpTool-full-v1.0.20.zip",
+      "downloadMirrors": [
+        "https://github.com/shashouaq/NetBootDhcpTool/releases/download/v1.0.20/NetBootDhcpTool-full-v1.0.20.zip"
+      ],
+      "baseVersion": null,
+      "baseInstallManifestSha256": null
+    }
+  ]
+}

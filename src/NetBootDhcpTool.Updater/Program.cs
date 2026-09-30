@@ -1,17 +1,27 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text.Json;
-using System.Windows.Forms;
+using Microsoft.Win32;
 using NetBootDhcpTool.Core;
 
 namespace NetBootDhcpTool.Updater;
 
 internal static class Program
 {
+    private static IDisposable? _transactionLease;
     private static int Main(string[] args)
     {
-        if (args.Length != 2 || !args[0].Equals("--apply", StringComparison.Ordinal)) return 2;
+        if (OperatingSystem.IsWindows()) _ = SetErrorMode(0x8003); // Suppress OS error dialogs; the transaction protocol reports the failure.
+        try { return RunMain(args); }
+        finally { _transactionLease?.Dispose(); }
+    }
+
+    private static int RunMain(string[] args)
+    {
+        if (args.Length != 2 || args[0] is not ("--apply" or "--recover")) return (int)InstallExitCode.PreflightFailure;
         UpdateProcessRequest? request = null;
+        var requestValidated = false;
         try
         {
             var requestPath = Path.GetFullPath(args[1]);
@@ -22,54 +32,68 @@ internal static class Program
             if (!request.RequestFilePath.Equals(requestPath, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidDataException("更新请求路径与其内容不一致。 / Update request path does not match its content.");
             ValidateRequest(request);
-            using (GetExpectedParent(request.ParentProcessId, Path.GetFullPath(request.Apply.InstallRoot))) { }
+            requestValidated = true;
+            _transactionLease = UpdateTransactionLease.Acquire(request.UserDataDirectory);
+            if (args[0] == "--recover")
+            {
+                using var recoveryLease = WaitForDataLeaseAsync(request.UserDataDirectory, request.Apply.InstallRoot).GetAwaiter().GetResult();
+                UpdatePackageApplier.RecoverInterruptedAsync(request.Apply.InstallRoot).GetAwaiter().GetResult();
+                recoveryLease.Dispose();
+                StartPreviousVersionAsync(request.Apply.InstallRoot).GetAwaiter().GetResult();
+                WriteFinal(request, InstallExitCode.RolledBack, "rolled-back", "Interrupted transaction recovered; previous installation restored.");
+                return (int)InstallExitCode.RolledBack;
+            }
+            using (request.IsFullInstall
+                ? GetExpectedSetupParent(request.ParentProcessId)
+                : GetExpectedParent(request.ParentProcessId, Path.GetFullPath(request.Apply.InstallRoot))) { }
             new UpdatePackageApplier().ApplyAsync(request.Apply, validateOnly: true).GetAwaiter().GetResult();
             WriteAccepted(request);
         }
         catch (Exception ex)
         {
-            if (request is not null)
+            var code = UpdateResultProtocol.Classify(ex);
+            if (requestValidated && request is not null)
             {
                 TryLog(request.UpdateLogPath, "FAILED", ex.ToString());
-                TryWriteStatus(request, "failed", ex.Message);
+                WriteFinal(request, code, code == InstallExitCode.RollbackFailed ? "rollback-failed" : "failed", ex.Message);
             }
-            ShowFailureMessage();
-            return 1;
+            if (request?.Silent != true) ShowFailureMessage(ex.Message);
+            return (int)code;
         }
 
-        var exitCode = 0;
-        using var window = new UpdateProgressWindow();
-        window.Shown += async (_, _) =>
+        try
         {
-            try
-            {
-                await RunTransactionAsync(request!, window.ShowStatus).ConfigureAwait(true);
-                window.ShowStatus("completed", "新版已启动并通过校验 / New version started and passed its health check");
-                await Task.Delay(900).ConfigureAwait(true);
-            }
-            catch (Exception ex)
-            {
-                TryLog(request!.UpdateLogPath, "FAILED", ex.ToString());
-                TryWriteStatus(request, "failed", ex.Message);
-                window.ShowFailure(ex.Message);
-                ShowFailureMessage();
-                exitCode = 1;
-            }
-            finally { window.Close(); }
-        };
-        Application.Run(window);
-        return exitCode;
+            RunTransactionAsync(request!).GetAwaiter().GetResult();
+            return (int)InstallExitCode.Success;
+        }
+        catch (Exception ex)
+        {
+            TryLog(request!.UpdateLogPath, "FAILED", ex.ToString());
+            var journal = UpdatePackageApplier.GetJournalState(request.Apply.InstallRoot, request.Apply.RequestId);
+            var code = ex is UpdateOperationException operation ? operation.Code
+                : journal == "rolled-back" ? InstallExitCode.RolledBack
+                : journal == "rollback-incomplete" || ex is AggregateException ? InstallExitCode.RollbackFailed
+                : UpdateResultProtocol.Classify(ex);
+            WriteFinal(request, code, code is InstallExitCode.RolledBack or InstallExitCode.HealthCheckRolledBack ? "rolled-back"
+                : code == InstallExitCode.RollbackFailed ? "rollback-failed" : "failed", ex.Message);
+            if (!request.Silent) ShowFailureMessage(ex.Message);
+            return (int)code;
+        }
     }
 
-    private static async Task RunTransactionAsync(UpdateProcessRequest request, Action<string, string>? showStatus = null)
+    private static async Task RunTransactionAsync(UpdateProcessRequest request)
     {
         var apply = request.Apply;
         var root = Path.GetFullPath(apply.InstallRoot);
-        var status = new UpdateStatus(request.Apply.RequestId, apply.CurrentVersion, apply.TargetVersion, "waiting-for-exit", "正在等待主程序正常退出 / Waiting for the application to close normally", DateTimeOffset.UtcNow);
-        WriteStatus(request, status, showStatus);
+        var status = new UpdateTransactionStatus(request.Apply.RequestId, apply.CurrentVersion, apply.TargetVersion, "waiting-for-exit", "正在等待主程序正常退出 / Waiting for the application to close normally", DateTimeOffset.UtcNow);
+        WriteStatus(request, status);
         TryLog(request.UpdateLogPath, "WAITING_FOR_EXIT", $"pid={request.ParentProcessId} root={root}");
 
-        var parent = GetExpectedParent(request.ParentProcessId, root);
+        if (request.WaitForParentExit)
+        {
+        var parent = request.IsFullInstall
+            ? GetExpectedSetupParent(request.ParentProcessId)
+            : GetExpectedParent(request.ParentProcessId, root);
         using (var timeout = new CancellationTokenSource(TimeSpan.FromMinutes(4)))
         {
             try { await parent.WaitForExitAsync(timeout.Token).ConfigureAwait(false); }
@@ -79,15 +103,18 @@ internal static class Program
             }
             finally { parent.Dispose(); }
         }
+        }
 
         Process? launched = null;
+        UpdateApplyResult? appliedResult = null;
         var preserveInstallationForRecovery = false;
         var previousRestartAttempted = false;
         try
         {
             using var lease = await WaitForDataLeaseAsync(request.UserDataDirectory, root).ConfigureAwait(false);
+            await UpdatePackageApplier.RecoverInterruptedAsync(root).ConfigureAwait(false);
             status = status with { Phase = "applying", Message = "正在验证并替换程序文件 / Verifying and replacing program files", UpdatedAt = DateTimeOffset.UtcNow };
-            WriteStatus(request, status, showStatus);
+            WriteStatus(request, status);
             TryLog(request.UpdateLogPath, "APPLYING", "Validating signed package and applying file transaction.");
             UpdateApplyResult result;
             try { result = await new UpdatePackageApplier().ApplyAsync(apply).ConfigureAwait(false); }
@@ -96,16 +123,17 @@ internal static class Program
                 if (applyFailure is AggregateException) preserveInstallationForRecovery = true;
                 throw;
             }
+            appliedResult = result;
             status = status with { Phase = "starting", Message = "正在启动并验证新版本 / Starting and validating the new version", UpdatedAt = DateTimeOffset.UtcNow };
-            WriteStatus(request, status, showStatus);
+            WriteStatus(request, status);
             TryLog(request.UpdateLogPath, "FILES_VERIFIED", $"backup={result.BackupDirectory}");
 
             try { await UpdatePackageApplier.VerifyInstalledFilesAsync(root, apply.TargetVersion).ConfigureAwait(false); }
-            catch
+            catch (Exception verificationFailure)
             {
                 previousRestartAttempted = true;
                 await RollbackAndRestartPreviousAsync(result.BackupDirectory, root, apply.RequestId).ConfigureAwait(false);
-                throw;
+                throw new UpdateOperationException(InstallExitCode.HealthCheckRolledBack, "Installed inventory verification failed; previous installation restored.", verificationFailure);
             }
             lease.Dispose();
             var executable = Path.Combine(root, "NetBootDhcpTool.exe");
@@ -114,14 +142,17 @@ internal static class Program
             {
                 previousRestartAttempted = true;
                 await RollbackAndRestartPreviousAsync(result.BackupDirectory, root, apply.RequestId).ConfigureAwait(false);
-                throw new InvalidOperationException("新版无法启动，已恢复旧版本并尝试重新启动。 / The new version could not start; the old version was restored and a restart was attempted.", startFailure);
+                throw new UpdateOperationException(InstallExitCode.HealthCheckRolledBack, "新版无法启动，已恢复旧版本并尝试重新启动。 / The new version could not start; the old version was restored and a restart was attempted.", startFailure);
             }
 
             var health = await WaitForHealthAsync(request, launched).ConfigureAwait(false);
+            UpdateTestEnvironment.Checkpoint("health-check", root);
             if (health)
             {
+                await UpdatePackageApplier.VerifyInstalledFilesAsync(root, apply.TargetVersion).ConfigureAwait(false);
                 UpdatePackageApplier.MarkHealthy(result.BackupDirectory, apply.RequestId);
-                WriteStatus(request, status with { Phase = "completed", Message = "新版已启动并通过校验 / New version started and passed its health check", UpdatedAt = DateTimeOffset.UtcNow }, showStatus);
+                RememberInstallLocation(root, request.UpdateLogPath);
+                WriteFinal(request, InstallExitCode.Success, "completed", "新版已启动并通过校验 / New version started and passed its health check");
                 TryLog(request.UpdateLogPath, "HEALTHY", $"version={apply.TargetVersion}");
                 TryDelete(request.RequestFilePath);
                 TryDelete(request.AcceptedFilePath);
@@ -132,25 +163,60 @@ internal static class Program
 
             if (launched is { HasExited: false })
             {
-                preserveInstallationForRecovery = true;
-                WriteStatus(request, status with { Phase = "awaiting-startup", Message = "新版进程仍在运行但未完成健康确认；保留新文件与回滚备份，不强制结束进程。 / The new process is still running without a health confirmation; files and rollback backup are preserved, and the process will not be terminated.", UpdatedAt = DateTimeOffset.UtcNow }, showStatus);
-                throw new TimeoutException("新版未在 90 秒内回报启动健康状态；更新器保留现场供恢复。 / The new version did not report healthy startup within 90 seconds; the transaction was preserved for recovery.");
+                // This exact process was started by this transaction; stop it before restoring its files.
+                launched.CloseMainWindow();
+                using var stopTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                try { await launched.WaitForExitAsync(stopTimeout.Token); }
+                catch (OperationCanceledException)
+                {
+                    launched.Kill();
+                    using var killTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                    await launched.WaitForExitAsync(killTimeout.Token);
+                }
             }
 
             previousRestartAttempted = true;
             await RollbackAndRestartPreviousAsync(result.BackupDirectory, root, apply.RequestId).ConfigureAwait(false);
-            WriteStatus(request, status with { Phase = "rolled-back", Message = "新版启动校验失败，已恢复旧版本 / New version health check failed; the previous version was restored", UpdatedAt = DateTimeOffset.UtcNow }, showStatus);
+            WriteStatus(request, status with { Phase = "rolled-back", Message = "新版启动校验失败，已恢复旧版本 / New version health check failed; the previous version was restored", UpdatedAt = DateTimeOffset.UtcNow });
             TryLog(request.UpdateLogPath, "ROLLED_BACK", "New version exited before health confirmation; restored the previous installation.");
-            throw new InvalidOperationException("新版未能通过启动校验，已恢复旧版本并尝试重新启动。 / The new version failed its startup check; the old version was restored and a restart was attempted.");
+            throw new UpdateOperationException(InstallExitCode.HealthCheckRolledBack, "新版未能通过启动校验，已恢复旧版本并尝试重新启动。 / The new version failed its startup check; the old version was restored and a restart was attempted.");
         }
         catch (Exception transactionFailure)
         {
+            if (appliedResult is not null && !preserveInstallationForRecovery && !previousRestartAttempted)
+            {
+                if (launched is { HasExited: false })
+                {
+                    launched.Kill();
+                    using var killTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                    await launched.WaitForExitAsync(killTimeout.Token);
+                }
+                previousRestartAttempted = true;
+                await RollbackAndRestartPreviousAsync(appliedResult.BackupDirectory, root, apply.RequestId);
+                throw new UpdateOperationException(InstallExitCode.HealthCheckRolledBack, "Post-replacement validation failed; previous installation restored.", transactionFailure);
+            }
             if (!preserveInstallationForRecovery && !previousRestartAttempted && (launched is null || launched.HasExited))
             {
                 try { await StartPreviousVersionAsync(root).ConfigureAwait(false); }
                 catch (Exception restartFailure) { throw new AggregateException("The previous application could not be restarted after the update failed.", transactionFailure, restartFailure); }
             }
             throw;
+        }
+    }
+
+    private static void RememberInstallLocation(string root, string logPath)
+    {
+        if (UpdateTestEnvironment.IsActive) return;
+        try
+        {
+            using var key = Registry.CurrentUser.CreateSubKey(@"Software\NetBootDhcpTool", writable: true);
+            key?.SetValue("InstallPath", Path.GetFullPath(root), RegistryValueKind.String);
+            key?.Flush();
+            TryLog(logPath, "INSTALL_LOCATION_REGISTERED", $"path={Path.GetFullPath(root)}");
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException)
+        {
+            TryLog(logPath, "WARN_INSTALL_LOCATION_REGISTRATION", ex.Message);
         }
     }
 
@@ -168,10 +234,14 @@ internal static class Program
     private static void ValidateRequest(UpdateProcessRequest request)
     {
         var apply = request.Apply;
+        UpdateTestEnvironment.RequirePath(apply.InstallRoot);
+        UpdateTestEnvironment.RequirePath(request.UserDataDirectory);
         var expectedDefaultData = Path.GetFullPath(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "NetBootDhcpTool"));
         var dataRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(request.UserDataDirectory));
         var injected = Environment.GetEnvironmentVariable("NETBOOT_DATA_DIRECTORY");
+        var testData = UpdateTestEnvironment.Root is { } testRoot ? Path.Combine(testRoot, "user-data") : "";
         if (!dataRoot.Equals(expectedDefaultData, StringComparison.OrdinalIgnoreCase)
+            && !dataRoot.Equals(testData, StringComparison.OrdinalIgnoreCase)
             && (string.IsNullOrWhiteSpace(injected) || !dataRoot.Equals(Path.TrimEndingDirectorySeparator(Path.GetFullPath(injected)), StringComparison.OrdinalIgnoreCase)))
             throw new InvalidDataException("更新数据目录不在应用数据目录中。 / Update data directory is not approved.");
         var updates = Path.Combine(dataRoot, "updates");
@@ -183,8 +253,12 @@ internal static class Program
             || apply.RequestId.Length > 80 || apply.RequestId.Any(ch => !char.IsAsciiLetterOrDigit(ch) && ch != '-'))
             throw new InvalidDataException("更新请求标识无效。 / Update request identifiers are invalid.");
         var root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(apply.InstallRoot));
-        if (root.Equals(dataRoot, StringComparison.OrdinalIgnoreCase) || !Directory.Exists(root))
+        if (root.Equals(dataRoot, StringComparison.OrdinalIgnoreCase)
+            || (!Directory.Exists(root) && !request.IsFullInstall)
+            || request.IsFullInstall != apply.IsFullInstall)
             throw new InvalidDataException("应用安装目录无效。 / Application installation directory is invalid.");
+        if (!request.IsFullInstall && !request.WaitForParentExit)
+            throw new InvalidDataException("Automatic updates must wait for the application to exit.");
         var expectedLog = Path.Combine(updates, "update.log");
         if (!Path.GetFullPath(request.UpdateLogPath).Equals(expectedLog, StringComparison.OrdinalIgnoreCase))
             throw new InvalidDataException("更新日志路径无效。 / Update log path is invalid.");
@@ -200,6 +274,24 @@ internal static class Program
             var actualExe = Path.GetFullPath(process.MainModule?.FileName ?? "");
             if (!actualExe.Equals(expectedExe, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException("等待退出的进程不是目标安装目录中的 NetBoot DHCP Tool。 / The process is not the application from the target installation directory.");
+            return process;
+        }
+        catch
+        {
+            process?.Dispose();
+            throw;
+        }
+    }
+
+    private static Process GetExpectedSetupParent(int processId)
+    {
+        Process? process = null;
+        try
+        {
+            process = Process.GetProcessById(processId);
+            var actualExe = Path.GetFileName(process.MainModule?.FileName ?? "");
+            if (!actualExe.Equals("NetBootDhcpTool.SetupHelper.exe", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("完整安装事务不是由产品安装助手发起。 / The full-install transaction was not started by the product setup helper.");
             return process;
         }
         catch
@@ -227,6 +319,12 @@ internal static class Program
     private static Process? StartTarget(string executable, string root, UpdateProcessRequest request)
     {
         if (!File.Exists(executable)) throw new FileNotFoundException("Target application executable is missing.", executable);
+        using (var header = File.OpenRead(executable))
+        {
+            if (header.Length < 64 || header.ReadByte() != 'M' || header.ReadByte() != 'Z')
+                throw new InvalidDataException("The target application is not a Windows executable.");
+        }
+        TryLog(request.UpdateLogPath, "LAUNCH_START", $"root={root} target={request.Apply.TargetVersion}");
         var start = new ProcessStartInfo(executable)
         {
             WorkingDirectory = root,
@@ -239,13 +337,17 @@ internal static class Program
         start.ArgumentList.Add(request.HealthToken);
         start.ArgumentList.Add("--update-target-version");
         start.ArgumentList.Add(request.Apply.TargetVersion);
-        return Process.Start(start);
+        var process = Process.Start(start);
+        TryLog(request.UpdateLogPath, "LAUNCH_STARTED", $"pid={process?.Id}");
+        return process;
     }
 
     private static async Task<bool> WaitForHealthAsync(UpdateProcessRequest request, Process? launched)
     {
         var deadline = Stopwatch.StartNew();
-        while (deadline.Elapsed < TimeSpan.FromSeconds(90))
+        var healthTimeout = UpdateTestEnvironment.IsActive && Environment.GetEnvironmentVariable("NETBOOT_TEST_HEALTH_TIMEOUT") == "short"
+            ? TimeSpan.FromSeconds(3) : TimeSpan.FromSeconds(90);
+        while (deadline.Elapsed < healthTimeout)
         {
             if (File.Exists(request.HealthFilePath))
             {
@@ -281,29 +383,30 @@ internal static class Program
 
     private static void TryWriteStatus(UpdateProcessRequest request, string phase, string message)
     {
-        try { WriteStatus(request, new UpdateStatus(request.Apply.RequestId, request.Apply.CurrentVersion, request.Apply.TargetVersion, phase, message, DateTimeOffset.UtcNow)); }
+        try { WriteStatus(request, new UpdateTransactionStatus(request.Apply.RequestId, request.Apply.CurrentVersion, request.Apply.TargetVersion, phase, message, DateTimeOffset.UtcNow)); }
         catch { }
     }
 
-    private static void WriteStatus(UpdateProcessRequest request, UpdateStatus status, Action<string, string>? showStatus = null)
+    private static void WriteStatus(UpdateProcessRequest request, UpdateTransactionStatus status)
     {
-        var path = Path.Combine(Path.GetDirectoryName(request.UpdateLogPath)!, "update-status.json");
-        WriteAtomically(path, JsonSerializer.Serialize(status, JsonStore.Options));
-        showStatus?.Invoke(status.Phase, status.Message);
+        UpdateResultProtocol.Write(request, status);
     }
 
-    private static void ShowFailureMessage()
+    private static void WriteFinal(UpdateProcessRequest request, InstallExitCode code, string phase, string message)
+        => WriteStatus(request, new UpdateTransactionStatus(request.Apply.RequestId, request.Apply.CurrentVersion,
+            request.Apply.TargetVersion, phase, message, DateTimeOffset.UtcNow, code));
+
+    private static void ShowFailureMessage(string details)
     {
-        try
-        {
-            MessageBox.Show(
-                "更新未能完成，现有安装已保留或已恢复。请查看更新日志。\nThe update could not be completed. The existing installation was preserved or restored. See the update log.",
-                "NetBoot DHCP Tool Update",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Error);
-        }
+        try { _ = MessageBoxW(IntPtr.Zero, $"更新未能完成，现有安装已保留或已恢复。请查看更新日志。\nThe update could not be completed. The existing installation was preserved or restored. See the update log.\n\n{details}", "NetBoot DHCP Tool Update", 0x00000010); }
         catch { }
     }
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "MessageBoxW", SetLastError = true)]
+    private static extern int MessageBoxW(IntPtr window, string text, string caption, uint type);
+
+    [DllImport("kernel32.dll")]
+    private static extern uint SetErrorMode(uint mode);
 
     private static void TryLog(string path, string phase, string details)
     {
@@ -339,65 +442,4 @@ internal static class Program
         try { if (File.Exists(path)) File.Delete(path); } catch { }
     }
 
-    private sealed record UpdateStatus(string RequestId, string CurrentVersion, string TargetVersion, string Phase, string Message, DateTimeOffset UpdatedAt);
-
-    private sealed class UpdateProgressWindow : Form
-    {
-        private readonly Label _message;
-        private readonly ProgressBar _progress;
-
-        public UpdateProgressWindow()
-        {
-            Text = "NetBoot DHCP Tool Update / 程序升级";
-            Width = 540;
-            Height = 175;
-            StartPosition = FormStartPosition.CenterScreen;
-            FormBorderStyle = FormBorderStyle.FixedDialog;
-            ControlBox = false;
-            MaximizeBox = false;
-            MinimizeBox = false;
-            ShowInTaskbar = true;
-            TopMost = true;
-
-            _message = new Label
-            {
-                Left = 22,
-                Top = 20,
-                Width = 480,
-                Height = 70,
-                Text = "正在等待主程序正常关闭 / Waiting for the application to close normally",
-                TextAlign = System.Drawing.ContentAlignment.MiddleLeft
-            };
-            _progress = new ProgressBar
-            {
-                Left = 22,
-                Top = 102,
-                Width = 480,
-                Height = 22,
-                Style = ProgressBarStyle.Marquee,
-                MarqueeAnimationSpeed = 24
-            };
-            Controls.Add(_message);
-            Controls.Add(_progress);
-        }
-
-        public void ShowStatus(string phase, string message)
-        {
-            if (InvokeRequired)
-            {
-                try { BeginInvoke(new Action(() => ShowStatus(phase, message))); } catch (InvalidOperationException) { }
-                return;
-            }
-            _message.Text = $"{phase}\n{message}";
-            _progress.Style = phase is "completed" or "rolled-back" ? ProgressBarStyle.Blocks : ProgressBarStyle.Marquee;
-            if (_progress.Style == ProgressBarStyle.Blocks) _progress.Value = 100;
-        }
-
-        public void ShowFailure(string message)
-        {
-            ShowStatus("failed", message);
-            _progress.Style = ProgressBarStyle.Blocks;
-            _progress.Value = 0;
-        }
-    }
 }

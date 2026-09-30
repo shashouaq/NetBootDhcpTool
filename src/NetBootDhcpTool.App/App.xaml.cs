@@ -112,6 +112,9 @@ public partial class App : Application
                 }
                 catch (Exception ex) { logger.Error("Could not write update startup health confirmation", ex); }
             }
+            if (_updateStartupHealth is null && UpdateTestEnvironment.IsActive
+                && Environment.GetEnvironmentVariable("NETBOOT_TEST_AUTOMATIC_UPDATE") == "1")
+                _ = mainWindow.RunAutomaticUpdateForIntegrationAsync();
         };
         MainWindow = mainWindow;
         mainWindow.Show();

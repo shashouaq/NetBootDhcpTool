@@ -102,7 +102,7 @@ function Get-ReleaseBundle {
     $archiveName = Get-ReleaseArchiveName $Tag
     $archivePath = Join-Path $Directory $archiveName
     $checksumPath = "$archivePath.sha256"
-    $manifestPath = Join-Path $Directory 'latest.json'
+    $manifestPath = Join-Path $Directory 'latest-v2.json'
 
     foreach ($path in @($archivePath, $checksumPath, $manifestPath)) {
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
@@ -122,28 +122,35 @@ function Get-ReleaseBundle {
     try {
         $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json -AsHashtable -ErrorAction Stop
     } catch {
-        throw "Release latest.json is invalid for $Tag."
+        throw "Release latest-v2.json is invalid for $Tag."
     }
     if ($manifest.version -ne $version -or
         $manifest.archiveName -ne $archiveName -or
         ([string]$manifest.archiveSha256).ToLowerInvariant() -ne $archiveHash) {
-        throw "Release latest.json does not match the local archive for $Tag."
+        throw "Release latest-v2.json does not match the local archive for $Tag."
     }
 
     $packageAssets = [System.Collections.Generic.List[object]]::new()
     $fullCount = 0
-    foreach ($package in @($manifest.packages)) {
+    $allPackages = @(
+        @($manifest.packages) | ForEach-Object { [pscustomobject]@{ Package=$_; Format='Zip' } }
+        @($manifest.sevenZipPackages) | ForEach-Object { [pscustomobject]@{ Package=$_; Format='SevenZip' } }
+    )
+    foreach ($entry in $allPackages) {
+        $package = $entry.Package
         if ([string]$package.sha256 -notmatch '^[a-fA-F0-9]{64}$' -or [long]$package.size -le 0) {
             throw 'Release package metadata has an invalid size or SHA-256.'
         }
         if ($package.kind -ceq 'Full') {
-            $fullCount++
-            $expectedName = "NetBootDhcpTool-full-v$version.zip"
+            if ($entry.Format -ceq 'SevenZip') { $fullCount++ }
+            $extension = if ($entry.Format -ceq 'SevenZip') { '7z' } else { 'zip' }
+            $expectedName = "NetBootDhcpTool-full-v$version.$extension"
         } elseif ($package.kind -ceq 'Ota') {
             if ([string]$package.baseVersion -notmatch '^\d+\.\d+\.\d+$' -or [version]$package.baseVersion -ge [version]$version) {
                 throw 'Release OTA metadata has an invalid base version.'
             }
-            $expectedName = "NetBootDhcpTool-ota-v$($package.baseVersion)-to-v$version.zip"
+            $extension = if ($entry.Format -ceq 'SevenZip') { '7z' } else { 'zip' }
+            $expectedName = "NetBootDhcpTool-ota-v$($package.baseVersion)-to-v$version.$extension"
         } else { throw 'Release package kind must be Full or Ota.' }
         if ([string]$package.fileName -cne $expectedName) { throw "Unexpected update package filename: $($package.fileName)." }
         $packagePath = Join-Path $Directory $expectedName
@@ -160,7 +167,7 @@ function Get-ReleaseBundle {
         }
         $packageAssets.Add([ordered]@{ Kind=[string]$package.kind;Name=$expectedName;Path=$packagePath;ChecksumPath=$packageSidecar;Sha256=$actualHash;Size=[long]$package.size;Metadata=$package })
     }
-    if ($fullCount -ne 1) { throw 'Every release bundle must contain exactly one Full update package.' }
+    if ($fullCount -ne 1) { throw 'Every V2 release bundle must contain exactly one Full 7z update package.' }
     $packageNames = @($packageAssets | ForEach-Object Name)
     if ($packageNames | Group-Object | Where-Object Count -gt 1) { throw 'Release bundle contains duplicate update package names.' }
 
@@ -305,16 +312,13 @@ function New-DualSourceManifest {
     $manifest.downloadUrl = $GiteeArchiveDownloadUrl
     $manifest.downloadMirrors = @($githubArchiveUrl)
     $manifest.releasePageUrl = $GiteeReleasePageUrl
-    foreach ($package in @($manifest.packages)) {
+    foreach ($package in @($manifest.packages) + @($manifest.sevenZipPackages)) {
         $githubPackageUrl = "https://github.com/$GitHubRepository/releases/download/$Tag/$($package.fileName)"
-        if ($GiteeAssetUrls.Contains([string]$package.fileName) -and -not [string]::IsNullOrWhiteSpace([string]$GiteeAssetUrls[[string]$package.fileName])) {
-            $package.downloadUrl = [string]$GiteeAssetUrls[[string]$package.fileName]
-        } else {
-            $package.downloadUrl = [string]$GiteeAssetUrls[[string]$package.fileName]
-        }
-        if ([string]::IsNullOrWhiteSpace([string]$package.downloadUrl)) {
+        if (-not $GiteeAssetUrls.Contains([string]$package.fileName) -or
+            [string]::IsNullOrWhiteSpace([string]$GiteeAssetUrls[[string]$package.fileName])) {
             throw "Gitee attachment URL is missing for update package $($package.fileName)."
         }
+        $package.downloadUrl = [string]$GiteeAssetUrls[[string]$package.fileName]
         $package.downloadMirrors = @($githubPackageUrl)
     }
     $json = ConvertTo-Json -InputObject $manifest -Depth 12

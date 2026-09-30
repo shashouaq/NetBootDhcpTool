@@ -284,26 +284,36 @@ public partial class MainWindow : Window
 
     protected override async void OnClosing(System.ComponentModel.CancelEventArgs e)
     {
+        _logger.Info($"Window close requested: settingsDirty={_settingsDirty}, activeNetworkWorkflow={_activeNetworkWorkflow is not null}, standaloneOperation={_standaloneOperationCompletion is not null}, operationCancellation={_operationCts is not null}, closingCleanupStarted={_closingCleanupStarted}");
         if (_closeAfterCleanup)
         {
+            _logger.Info("Window close accepted after cleanup completed");
             base.OnClosing(e);
             return;
         }
         if (_closingCleanupStarted)
         {
+            _logger.Info("Window close deferred because cleanup is already running");
             e.Cancel = true;
             return;
         }
 
-        if (_settingsDirty && !_unsavedSettingsExitConfirmed && !AppDialog.Show(this,
-            IsChineseUi() ? "未保存设置" : "Unsaved Settings",
-            IsChineseUi()
-                ? "设置页存在尚未保存的更改。关闭后这些更改会丢失，仍要退出吗？"
-                : "The Settings page has unsaved changes. They will be lost when the application closes. Exit anyway?",
-            confirm: true))
+        if (_settingsDirty && !_unsavedSettingsExitConfirmed)
         {
-            e.Cancel = true;
-            return;
+            _logger.Info("Window close is waiting for confirmation because settings are unsaved");
+            var confirmed = AppDialog.Show(this,
+                IsChineseUi() ? "未保存设置" : "Unsaved Settings",
+                IsChineseUi()
+                    ? "设置页存在尚未保存的更改。关闭后这些更改会丢失，仍要退出吗？"
+                    : "The Settings page has unsaved changes. They will be lost when the application closes. Exit anyway?",
+                confirm: true);
+            _logger.Info($"Unsaved-settings close confirmation returned: confirmed={confirmed}");
+            if (!confirmed)
+            {
+                _logger.Info("Window close canceled by the user at unsaved-settings confirmation");
+                e.Cancel = true;
+                return;
+            }
         }
         if (_settingsDirty) _unsavedSettingsExitConfirmed = true;
 
@@ -358,9 +368,13 @@ public partial class MainWindow : Window
         _feedbackTimer.Stop();
         _updateController.StateChanged -= UpdateController_StateChanged;
         IsEnabled = false;
+        _logger.Info("Window close cleanup step started: update-controller-dispose");
         await _updateController.DisposeAsync();
+        _logger.Info("Window close cleanup step completed: update-controller-dispose");
         SetBusy(true, IsChineseUi() ? "正在保存恢复信息并停止 DHCP..." : "Saving recovery state and stopping DHCP...");
+        _logger.Info("Window close cleanup step started: work-environment-cleanup");
         await CleanupWorkEnvironmentAsync();
+        _logger.Info("Window close cleanup step completed: work-environment-cleanup");
         SetBusy(false);
         _scanProgressTimer.Stop();
         _scanHistoryFlushTimer.Stop();
@@ -5608,6 +5622,36 @@ public partial class MainWindow : Window
 
     internal Task<UpdateDownloadResult> StartUpdateDownloadForUiTest(UpdateCheckResult result, string destinationPath) =>
         _updateController.DownloadAsync(result, destinationPath);
+
+    internal async Task RunAutomaticUpdateForIntegrationAsync()
+    {
+        if (!UpdateTestEnvironment.IsActive || UpdateTestEnvironment.Root is null)
+            throw new InvalidOperationException("Automatic lifecycle tests require a marked isolated root.");
+        var report = Path.Combine(_paths.DataDirectory, "integration-auto-update.json");
+        UpdateTestEnvironment.RequirePath(report);
+        try
+        {
+            var result = await _updateController.CheckAsync()
+                ?? throw new InvalidDataException("The integration update check was cancelled.");
+            if (!result.Succeeded || !result.IsNewVersion || !result.SignatureVerified || result.SelectedPackage is null)
+                throw new InvalidDataException("No verified automatic package was discovered: " + result.Error);
+            var destination = Path.Combine(_paths.DataDirectory, "updates", "staging", result.SelectedPackage.FileName);
+            var downloaded = await _updateController.DownloadAsync(result, destination);
+            var install = _updateController.InstallContext ?? throw new InvalidDataException("The installed context is missing.");
+            await new UpdateActivationService().ActivateAsync(_paths, install, downloaded);
+            UpdateResultProtocol.WriteDurably(report, System.Text.Json.JsonSerializer.Serialize(new {
+                Phase = "accepted", Version = result.LatestVersion!.ToString(3), downloaded.Package!.FileName,
+                downloaded.Package.Format, downloaded.Sha256, downloaded.DownloadUrl, Speeds = result.DownloadSpeeds
+            }, JsonStore.Options));
+            Close();
+        }
+        catch (Exception ex)
+        {
+            _logger.Error("Isolated automatic update lifecycle failed", ex);
+            UpdateResultProtocol.WriteDurably(report, System.Text.Json.JsonSerializer.Serialize(new { Phase = "failed", Error = ex.ToString() }, JsonStore.Options));
+            Close();
+        }
+    }
 
     private async void RestartUpgrade_Click(object sender, RoutedEventArgs e)
     {

@@ -7,11 +7,14 @@ public sealed class AppPaths
     public AppPaths(string baseDirectory)
     {
         BaseDirectory = Path.GetFullPath(baseDirectory);
+        UpdateTestEnvironment.RequirePath(BaseDirectory);
         var testDataDirectory = Environment.GetEnvironmentVariable("NETBOOT_DATA_DIRECTORY");
         var dataDirectory = string.IsNullOrWhiteSpace(testDataDirectory)
-            ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "NetBootDhcpTool")
+            ? UpdateTestEnvironment.Root is { } testRoot ? Path.Combine(testRoot, "user-data")
+                : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "NetBootDhcpTool")
             : testDataDirectory;
         DataDirectory = NormalizeDirectoryPath(dataDirectory);
+        UpdateTestEnvironment.RequirePath(DataDirectory);
         DataDirectoryIdentity = DataDirectory.ToUpperInvariant();
         ConfigDirectory = Path.Combine(DataDirectory, "config");
         I18nDirectory = Path.Combine(baseDirectory, "i18n");
@@ -60,6 +63,14 @@ public sealed class AppPaths
         Directory.CreateDirectory(LogsDirectory);
         Directory.CreateDirectory(AssetsDirectory);
         Directory.CreateDirectory(DocsDirectory);
+        MigrateLegacyData();
+    }
+
+    public void EnsureUserDataForMigration()
+    {
+        Directory.CreateDirectory(DataDirectory);
+        Directory.CreateDirectory(ConfigDirectory);
+        Directory.CreateDirectory(LogsDirectory);
         MigrateLegacyData();
     }
 

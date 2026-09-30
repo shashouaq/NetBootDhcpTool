@@ -1,5 +1,25 @@
 ﻿# Release Notes
 
+## v1.1.0
+
+### zh-CN
+
+本版本升级了更新机制。来自旧版本的用户需要执行一次完整安装；用户配置和数据会保留。安装完成后，后续版本将恢复应用内自动更新。
+
+- 新更新清单使用独立的 `latest-v2.json` 通道，避免旧版更新器误选 7z 包。
+- 完整安装程序与 Full 7z 共用同一份签名 payload；安装会校验签名、包大小、SHA-256 和文件清单后再替换程序文件。
+- 新更新器通过 Full 7z 执行应用内更新；失败时恢复之前受管文件。
+- GitHub 与 Gitee 的 Full 7z 使用相同文件名、大小和 SHA-256；两个源均通过签名清单选择。
+
+### en-US
+
+This release updates the application update system. Users coming from an older version must run the full installer once; user settings and data are preserved. After installation, in-app automatic updates resume for subsequent releases.
+
+- The new updater uses a separate `latest-v2.json` channel so legacy updaters cannot select a 7z package.
+- The full installer and Full 7z share the same signed payload. The installer verifies the signature, package size, SHA-256, and file inventory before replacing application files.
+- The new updater applies in-app updates from Full 7z packages and restores the previous managed files if an update fails.
+- GitHub and Gitee serve the same Full 7z filename, size, and SHA-256; signed metadata selects between the two sources.
+
 ## v1.0.20
 
 ### zh-CN

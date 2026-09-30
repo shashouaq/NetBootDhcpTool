@@ -1,0 +1,117 @@
+name: Release Candidate
+run-name: RC ${{ inputs.candidate_tag }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_tag:
+        description: Explicit v<version>-rc.<number> tag, never a stable tag
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: netboot-release-candidate
+  cancel-in-progress: false
+
+jobs:
+  candidate:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 10.0.401
+      - name: Require exact main CI and an RC identity
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+        run: |
+          if ($env:GITHUB_REF -cne 'refs/heads/main') { throw 'Build RC from a reviewed main commit.' }
+          . .\build\release-identity.ps1
+          $identity = Get-NetBootReleaseIdentity -Tag $env:CANDIDATE_TAG -ReleaseCandidate
+          [xml]$project = Get-Content 'src\NetBootDhcpTool.App\NetBootDhcpTool.App.csproj'
+          if ($identity.Version -cne [string]$project.Project.PropertyGroup.Version) { throw 'RC tag and App version differ.' }
+          Import-Module .\build\release-pipeline\ReleaseState.psm1 -Force
+          $json = gh api "repos/$env:GITHUB_REPOSITORY/actions/workflows/windows-ci.yml/runs?head_sha=$env:GITHUB_SHA&status=success&per_page=100"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not read exact-commit CI.' }
+          $runs = $json | ConvertFrom-Json
+          if (-not (Test-SuccessfulMainWindowsCiRun -Runs @($runs.workflow_runs) -Commit $env:GITHUB_SHA)) { throw 'Exact main Windows CI must pass before RC.' }
+          $tagError = Join-Path $env:RUNNER_TEMP 'rc-tag-query-error.txt'
+          $existing = gh api "repos/$env:GITHUB_REPOSITORY/git/ref/tags/$env:CANDIDATE_TAG" 2>$tagError
+          if ($LASTEXITCODE -eq 0) {
+            $reference = $existing | ConvertFrom-Json
+            if ($reference.object.type -cne 'commit' -or $reference.object.sha -cne $env:GITHUB_SHA) { throw 'Existing RC tag belongs to another commit; it cannot be moved.' }
+          } elseif (-not (Select-String $tagError -Pattern 'HTTP 404' -Quiet)) { throw 'The RC tag query failed; absence was not confirmed.' }
+      - name: Fresh NuGet audit
+        shell: pwsh
+        run: |
+          $audit = Join-Path $env:RUNNER_TEMP 'rc-audit'
+          New-Item -ItemType Directory -Path $audit | Out-Null
+          [DateTimeOffset]::UtcNow.ToString('O') | Set-Content "$audit\timestamp.txt"
+          dotnet --info *> "$audit\sdk.txt"
+          dotnet restore .\NetBootDhcpTool.sln --force-evaluate --source https://api.nuget.org/v3/index.json -p:NuGetAudit=true -p:NuGetAuditMode=all -p:NuGetAuditLevel=low *> "$audit\restore.log"
+          if ($LASTEXITCODE -ne 0 -or (Select-String "$audit\restore.log" -Pattern 'NU190[0-5]' -Quiet)) { throw 'Fresh vulnerability audit failed or its feed was unavailable.' }
+          dotnet list .\NetBootDhcpTool.sln package --include-transitive --format json > "$audit\package-graph.json"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not record the package graph.' }
+          dotnet list .\NetBootDhcpTool.sln package --vulnerable --include-transitive --source https://api.nuget.org/v3/index.json --format json > "$audit\vulnerabilities.json"
+          if ($LASTEXITCODE -ne 0) { throw 'Vulnerability query failed.' }
+          $result = Get-Content "$audit\vulnerabilities.json" -Raw | ConvertFrom-Json
+          if ($result.errors) { throw 'The RC vulnerability query reported errors.' }
+          if (@($result.projects).Count -lt @(Get-ChildItem src -Recurse -Filter '*.csproj').Count) { throw 'The vulnerability report did not cover all source projects.' }
+          foreach ($framework in $result.projects.frameworks) {
+            if (@($framework.topLevelPackages | Where-Object { $_ }).Count -gt 0 -or @($framework.transitivePackages | Where-Object { $_ }).Count -gt 0) { throw 'The RC vulnerability query reported vulnerable packages.' }
+          }
+      - name: Install pinned build tools
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'C:\Program Files\7-Zip\7z.exe')) {
+            choco install 7zip -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw '7-Zip build tool installation failed.' }
+          }
+          choco install nsis --version=3.12 -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned NSIS installation failed.' }
+          $makensis = @((Join-Path ${env:ProgramFiles(x86)} 'NSIS\makensis.exe'), (Join-Path $env:ProgramFiles 'NSIS\makensis.exe')) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $makensis -or ((& $makensis /VERSION | Out-String).Trim() -notmatch '^v?3\.12(?:\.|$)')) { throw 'NSIS 3.12 was not found.' }
+          "MAKENSIS_PATH=$makensis" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Build and sign the candidate once
+        shell: pwsh
+        env:
+          NETBOOT_UPDATE_SIGNING_PRIVATE_KEY: ${{ secrets.NETBOOT_UPDATE_SIGNING_PRIVATE_KEY }}
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+        run: |
+          $buildLog = Join-Path $env:RUNNER_TEMP 'rc-audit\candidate-build.log'
+          .\scripts\Prepare-GitHubRelease.ps1 -Tag $env:CANDIDATE_TAG -ReleaseCandidate -OutputDirectory (Join-Path $env:RUNNER_TEMP 'rc-assets') -GitHubRepository $env:GITHUB_REPOSITORY *> $buildLog
+          if (Select-String $buildLog -Pattern 'NU190[0-5]' -Quiet) { throw 'The build reported a vulnerability or an unavailable audit feed; the RC is paused.' }
+      - uses: actions/upload-artifact@v7
+        with:
+          name: candidate-${{ inputs.candidate_tag }}
+          path: ${{ runner.temp }}\rc-assets\*
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: candidate-audit-${{ inputs.candidate_tag }}
+          path: ${{ runner.temp }}\rc-audit\*
+          if-no-files-found: warn
+          retention-days: 90
+      - name: Publish and read back the GitHub RC
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+        run: |
+          .\scripts\Publish-GitHubRelease.ps1 -Tag $env:CANDIDATE_TAG -ReleaseCandidate -SourceCommit $env:GITHUB_SHA -AssetDirectory (Join-Path $env:RUNNER_TEMP 'rc-assets') -GitHubRepository $env:GITHUB_REPOSITORY

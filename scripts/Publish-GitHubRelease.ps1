@@ -1,37 +1,50 @@
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)][ValidatePattern('^v\d+\.\d+\.\d+$')][string]$Tag,
+    [Parameter(Mandatory)][string]$Tag,
     [Parameter(Mandatory)][string]$AssetDirectory,
-    [string]$GitHubRepository = 'shashouaq/NetBootDhcpTool'
+    [string]$GitHubRepository = 'shashouaq/NetBootDhcpTool',
+    [switch]$ReleaseCandidate,
+    [string]$SourceCommit
 )
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+. (Join-Path (Split-Path -Parent $PSScriptRoot) 'build\release-identity.ps1')
+$identity = Get-NetBootReleaseIdentity -Tag $Tag -ReleaseCandidate:$ReleaseCandidate
+if ($ReleaseCandidate -and $SourceCommit -notmatch '^[a-fA-F0-9]{40}$') { throw 'An RC must be bound to an exact source commit.' }
 if ([string]::IsNullOrWhiteSpace($env:GH_TOKEN)) { throw 'GH_TOKEN is required for GitHub Release publication.' }
 if ($GitHubRepository -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { throw 'GitHubRepository must use owner/repository form.' }
 $assetRoot = [System.IO.Path]::GetFullPath($AssetDirectory)
 if (-not (Test-Path -LiteralPath $assetRoot -PathType Container)) { throw "Release artifact directory does not exist: $assetRoot" }
-$version = $Tag.Substring(1)
-$manifestPath = Join-Path $assetRoot 'latest.json'
-$signaturePath = Join-Path $assetRoot 'latest.json.sig'
+$version = $identity.Version
+$manifestPath = Join-Path $assetRoot 'latest-v2.json'
+$signaturePath = Join-Path $assetRoot 'latest-v2.json.sig'
 if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf) -or -not (Test-Path -LiteralPath $signaturePath -PathType Leaf)) {
-    throw 'Build artifact must contain latest.json and latest.json.sig.'
+    throw 'Build artifact must contain latest-v2.json and latest-v2.json.sig.'
 }
 $manifestBytes = [System.IO.File]::ReadAllBytes($manifestPath)
 $manifest = [System.IO.File]::ReadAllText($manifestPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json -AsHashtable -ErrorAction Stop
 if ([string]$manifest.version -cne $version -or [string]$manifest.archiveName -cne "NetBootDhcpTool-v$version.7z" -or
     [string]$manifest.archiveSha256 -notmatch '^[a-fA-F0-9]{64}$') {
-    throw 'Build artifact latest.json does not match the requested tag.'
+    throw 'Build artifact latest-v2.json does not match the requested tag.'
 }
-$packages = @($manifest.packages)
-if ($packages.Count -lt 1 -or $packages.Count -gt 8 -or @($packages | Where-Object { $_.kind -ceq 'Full' }).Count -ne 1) {
-    throw 'Build artifact latest.json must contain exactly one Full package and no more than eight packages.'
+$allPackages = @(
+    @($manifest.packages) | ForEach-Object { [pscustomobject]@{ Package=$_; Format='Zip' } }
+    @($manifest.sevenZipPackages) | ForEach-Object { [pscustomobject]@{ Package=$_; Format='SevenZip' } }
+)
+$packages = @($allPackages | ForEach-Object { $_.Package })
+$sevenZipFull = @($allPackages | Where-Object { $_.Format -ceq 'SevenZip' -and $_.Package.kind -ceq 'Full' })
+if ($sevenZipFull.Count -ne 1 -or $allPackages.Count -gt 16) {
+    throw 'Build artifact latest-v2.json must contain exactly one Full 7z package and no more than sixteen update packages.'
 }
-foreach ($package in $packages) {
+foreach ($entry in $allPackages) {
+    $package = $entry.Package
     if ([string]$package.kind -ceq 'Full') {
-        if ([string]$package.fileName -cne "NetBootDhcpTool-full-v$version.zip") { throw 'Full package filename does not match the requested tag.' }
+        $extension = if ($entry.Format -ceq 'SevenZip') { '7z' } else { 'zip' }
+        if ([string]$package.fileName -cne "NetBootDhcpTool-full-v$version.$extension") { throw 'Full package filename does not match the requested tag.' }
     } elseif ([string]$package.kind -ceq 'Ota') {
-        if ([string]$package.fileName -notmatch "^NetBootDhcpTool-ota-v\d+\.\d+\.\d+-to-v$([regex]::Escape($version))\.zip$" -or
+        $extension = if ($entry.Format -ceq 'SevenZip') { '7z' } else { 'zip' }
+        if ([string]$package.fileName -notmatch "^NetBootDhcpTool-ota-v\d+\.\d+\.\d+-to-v$([regex]::Escape($version))\.$extension$" -or
             [string]$package.baseVersion -notmatch '^\d+\.\d+\.\d+$' -or [version]$package.baseVersion -ge [version]$version) {
             throw 'OTA package filename or base version does not match the requested tag.'
         }
@@ -49,22 +62,26 @@ try {
     $rsa.ImportFromPem($publicMatch.Groups['pem'].Value)
     $signature = [Convert]::FromBase64String($signatureText.Trim())
     if (-not $rsa.VerifyData($manifestBytes, $signature, [System.Security.Cryptography.HashAlgorithmName]::SHA256, [System.Security.Cryptography.RSASignaturePadding]::Pss)) {
-        throw 'Build artifact latest.json signature is invalid.'
+        throw 'Build artifact latest-v2.json signature is invalid.'
     }
 } finally { $rsa.Dispose() }
 
 $assetNames = [System.Collections.Generic.List[string]]::new()
 $assetNames.Add([string]$manifest.archiveName)
 $assetNames.Add(([string]$manifest.archiveName + '.sha256'))
-foreach ($package in @($manifest.packages)) {
+foreach ($entry in $allPackages) {
+    $package = $entry.Package
     if ([string]$package.sha256 -notmatch '^[a-fA-F0-9]{64}$' -or [long]$package.size -le 0) {
         throw 'Build artifact package metadata is invalid.'
     }
     $assetNames.Add([string]$package.fileName)
     $assetNames.Add(([string]$package.fileName + '.sha256'))
 }
+$assetNames.Add('latest-v2.json.sig')
+$assetNames.Add('latest-v2.json')
 $assetNames.Add('latest.json.sig')
 $assetNames.Add('latest.json')
+$assetNames.Add("NetBootDhcpTool-Setup-v$version.exe")
 if ($assetNames.Count -ne @($assetNames | Select-Object -Unique).Count) { throw 'Build artifact contains duplicate expected asset names.' }
 $localAssets = [ordered]@{}
 $actualAssetNames = @(Get-ChildItem -LiteralPath $assetRoot -File | ForEach-Object { $_.Name })
@@ -77,6 +94,19 @@ foreach ($name in $assetNames) {
     $localAssets[$name] = [pscustomobject]@{ Path = $path; Size = [long](Get-Item -LiteralPath $path).Length; Sha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() }
 }
 if ($localAssets[$manifest.archiveName].Sha256 -cne ([string]$manifest.archiveSha256).ToLowerInvariant()) { throw 'Portable archive SHA-256 does not match latest.json.' }
+$setupName = "NetBootDhcpTool-Setup-v$version.exe"
+foreach ($assetEntry in $localAssets.GetEnumerator()) {
+    if ([long]$assetEntry.Value.Size -gt 95000000L) {
+        Write-Warning "Individual release asset $($assetEntry.Key) is $($assetEntry.Value.Size) bytes, above the 95,000,000-byte Gitee risk threshold. No authoritative Release-asset hard limit is configured."
+    }
+}
+$legacyDirectory = Join-Path (Split-Path -Parent $PSScriptRoot) 'build\legacy\v1.0.20'
+foreach ($legacyName in @('latest.json', 'latest.json.sig')) {
+    $expectedLegacy = Join-Path $legacyDirectory $legacyName
+    if (-not (Test-Path -LiteralPath $expectedLegacy -PathType Leaf) -or (Get-FileHash -LiteralPath $expectedLegacy -Algorithm SHA256).Hash -cne (Get-FileHash -LiteralPath $localAssets[$legacyName].Path -Algorithm SHA256).Hash) {
+        throw "Legacy update-channel asset was changed from its byte-preserved v1.0.20 copy: $legacyName."
+    }
+}
 
 function Assert-ReleaseSidecar([string]$Name, [string]$ExpectedHash) {
     $sidecarName = "$Name.sha256"
@@ -190,6 +220,7 @@ function Ensure-GitHubAsset([object]$Release, [string]$Name) {
 }
 
 $release = Get-GitHubRelease
+if ($ReleaseCandidate -and $null -ne $release -and -not [bool]$release.prerelease) { throw 'An existing stable Release cannot be reused as an RC.' }
 if ($null -eq $release) {
     $payload = [ordered]@{
         tag_name = $Tag
@@ -199,6 +230,7 @@ if ($null -eq $release) {
         prerelease = $true
         make_latest = 'false'
     }
+    if ($ReleaseCandidate) { $payload.target_commitish = $SourceCommit }
     $create = Invoke-GitHubApi -Uri "https://api.github.com/repos/$GitHubRepository/releases" -Method Post -Body (ConvertTo-Json -InputObject $payload -Depth 8 -Compress)
     if ($create.StatusCode -notin @(200, 201)) {
         $release = Get-GitHubRelease
@@ -223,22 +255,23 @@ foreach ($name in $assetNames) {
     if ($null -eq $asset) { throw "GitHub Release final inventory is missing $name." }
 }
 
-if ([bool]$release.prerelease) {
+if (-not $ReleaseCandidate -and [bool]$release.prerelease) {
     $stable = Invoke-GitHubApi -Uri "https://api.github.com/repos/$GitHubRepository/releases/$($release.id)" -Method Patch -Body (ConvertTo-Json -InputObject @{ prerelease = $false; draft = $false; make_latest = 'true' } -Compress)
     if ($stable.StatusCode -notin @(200, 201)) { throw "GitHub stable Release promotion returned HTTP $($stable.StatusCode)." }
 }
 $release = Get-GitHubRelease
-if ($null -eq $release -or [bool]$release.draft -or [bool]$release.prerelease) { throw "GitHub Release $Tag is not stable after promotion." }
+if ($null -eq $release -or [bool]$release.draft -or [bool]$release.prerelease -ne [bool]$ReleaseCandidate) { throw "GitHub Release $Tag has an unexpected final release state." }
 
-$fullPackage = @($manifest.packages | Where-Object { $_.kind -ceq 'Full' })[0]
+$fullPackage = $sevenZipFull[0].Package
 $summary = @(
-    "## GitHub Formal Release SUCCESS",
+    $(if ($ReleaseCandidate) { '## GitHub Release Candidate SUCCESS' } else { '## GitHub Formal Release SUCCESS' }),
     '',
     "- Tag: $Tag",
-    "- Stable Release: https://github.com/$GitHubRepository/releases/tag/$Tag",
+    "- Release: https://github.com/$GitHubRepository/releases/tag/$Tag (prerelease=$([bool]$ReleaseCandidate))",
     "- Assets: $($assetNames.Count)",
     "- Portable archive SHA-256: $($localAssets[$manifest.archiveName].Sha256)",
-    "- Full package SHA-256: $($localAssets[[string]$fullPackage.fileName].Sha256)",
+    "- Full 7z update package: $($fullPackage.fileName) ($($localAssets[[string]$fullPackage.fileName].Size) bytes)",
+    "- Setup.exe: $setupName ($($localAssets[$setupName].Size) bytes)",
     '- Every asset was downloaded from the GitHub Release API/URL and matched its local SHA-256 before promotion.'
 ) -join [System.Environment]::NewLine
 Write-Host $summary

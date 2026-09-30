@@ -216,7 +216,9 @@ public sealed class UpdateController : IAsyncDisposable
                 }
                 catch (UpdateBaseInventoryMismatchException) when (downloaded.Package!.Kind.Equals("Ota", StringComparison.OrdinalIgnoreCase))
                 {
-                    var fullPackage = result.Packages.FirstOrDefault(item => item.Kind.Equals("Full", StringComparison.OrdinalIgnoreCase))
+                    var fullPackage = result.Packages.FirstOrDefault(item => item.Kind.Equals("Full", StringComparison.OrdinalIgnoreCase)
+                            && item.Format.Equals(downloaded.Package!.Format, StringComparison.OrdinalIgnoreCase))
+                        ?? result.Packages.FirstOrDefault(item => item.Kind.Equals("Full", StringComparison.OrdinalIgnoreCase))
                         ?? throw new InvalidDataException("The installed files do not match the OTA base, and no Full package is available.");
                     var fullDestination = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(destinationPath))!, fullPackage.FileName);
                     Mutate(state => state with { PackageVerificationInProgress = false, DownloadProgress = null });
@@ -268,7 +270,8 @@ public sealed class UpdateController : IAsyncDisposable
             install.ManifestSha256,
             Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(downloaded.SignedManifestJson)),
             downloaded.ManifestSignature,
-            Guid.NewGuid().ToString("N"));
+            Guid.NewGuid().ToString("N"),
+            downloaded.Package!.Format);
         await applier.ApplyAsync(preflight, cancellationToken, validateOnly: true).ConfigureAwait(false);
     }
 

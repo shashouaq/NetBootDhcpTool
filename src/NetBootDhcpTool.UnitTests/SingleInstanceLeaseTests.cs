@@ -37,6 +37,55 @@ public sealed class SingleInstanceLeaseTests
     }
 
     [TestMethod]
+    public async Task LeaseMayBeReleasedOnAnotherThreadAfterAsyncWork()
+    {
+        var dataDirectory = Path.Combine(Path.GetTempPath(), "netboot-instance-thread-" + Guid.NewGuid().ToString("N"));
+        var previous = Environment.GetEnvironmentVariable("NETBOOT_DATA_DIRECTORY");
+
+        try
+        {
+            Environment.SetEnvironmentVariable("NETBOOT_DATA_DIRECTORY", dataDirectory);
+            var paths = new AppPaths(AppContext.BaseDirectory);
+            var owner = SingleInstanceLease.TryAcquire(paths);
+            Assert.IsNotNull(owner);
+            Assert.IsNull(SingleInstanceLease.TryAcquire(paths), "A second owner must not enter while the lease is held.");
+
+            await Task.Run(owner.Dispose);
+
+            using var successor = SingleInstanceLease.TryAcquire(paths);
+            Assert.IsNotNull(successor, "A different thread must be able to release the cross-process lease after an await.");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("NETBOOT_DATA_DIRECTORY", previous);
+        }
+    }
+
+    [TestMethod]
+    public void NewSemaphoreLeaseDoesNotCollideWithLegacyMutexDuringBridge()
+    {
+        var dataDirectory = Path.Combine(Path.GetTempPath(), "netboot-instance-bridge-" + Guid.NewGuid().ToString("N"));
+        var previous = Environment.GetEnvironmentVariable("NETBOOT_DATA_DIRECTORY");
+
+        try
+        {
+            Environment.SetEnvironmentVariable("NETBOOT_DATA_DIRECTORY", dataDirectory);
+            var paths = new AppPaths(AppContext.BaseDirectory);
+            var digest = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(paths.DataDirectoryIdentity)));
+            using var legacyMutex = new Mutex(initiallyOwned: false, name: $"Global\\NetBootDhcpTool-{digest}");
+            Assert.IsTrue(legacyMutex.WaitOne(TimeSpan.Zero));
+
+            using var lease = SingleInstanceLease.TryAcquire(paths);
+            Assert.IsNotNull(lease, "The Bridge lease must use a distinct kernel-object name from the legacy Mutex.");
+            Assert.IsNull(SingleInstanceLease.TryAcquire(paths), "New App and updater processes must still coordinate on one lease.");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("NETBOOT_DATA_DIRECTORY", previous);
+        }
+    }
+
+    [TestMethod]
     public async Task SeparateProcessesPreventCompetingWritesAndAllowTakeoverAfterExit()
     {
         var root = Path.Combine(Path.GetTempPath(), "netboot-instance-process-" + Guid.NewGuid().ToString("N"));
@@ -130,6 +179,8 @@ public sealed class SingleInstanceLeaseTests
         foreach (var file in Directory.EnumerateFiles(AppContext.BaseDirectory, "NetBootDhcpTool.InstanceProbe.*"))
             File.Copy(file, Path.Combine(destinationDirectory, Path.GetFileName(file)));
         File.Copy(Path.Combine(AppContext.BaseDirectory, "NetBootDhcpTool.Core.dll"), Path.Combine(destinationDirectory, "NetBootDhcpTool.Core.dll"));
+        var sharpCompress = Path.Combine(AppContext.BaseDirectory, "SharpCompress.dll");
+        if (File.Exists(sharpCompress)) File.Copy(sharpCompress, Path.Combine(destinationDirectory, "SharpCompress.dll"));
     }
 
     private static string HashDirectory(string directory)
