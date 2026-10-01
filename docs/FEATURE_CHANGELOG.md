@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- 2026-10-01 T19 formal finalization: audited RC exact commit `7cf3e5f4d9bd41c8b9cf776761b8191f6d069a9c` against takeover HEAD `f60be00cd224ef8b748981e71657123c15ac4a93`; product source, installer and packaging/signing implementation are unchanged. Post-RC differences are credential/publishing tools, CI regressions and documentation. Bilingual v1.1.0 notes now explicitly describe one Setup installation from v1.0.20 or earlier, retained settings/network/favorites/histories, subsequent automatic Full 7z updates and automatic source failover. Final stable publication and public acceptance are pending; the existing RC remains prerelease. Detailed audit: [T19](tasks/T19.md).
+- Final local gates: pinned SDK 10.0.401, Release build 0 warnings/errors, MSTest 234 passed/0 failed/1 configured skip (235 total), console smoke, package-content, release-pipeline/resilience, Gitee mirror/credential, process-safety, ClientManifestCheck build, maintenance and diff checks passed. Fresh official NuGet audit covered all 11 source projects and transitive dependencies without reported vulnerable packages or feed/query failure. Public legacy manifest/signature hashes match the frozen v1.0.20 baseline before publication. Production packaging and public stable acceptance remain pending.
+
 ## v1.1.0 / 2026-10-01 candidate
 
 - Date: 2026-10-01
