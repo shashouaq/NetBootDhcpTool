@@ -4,6 +4,16 @@ This project uses a single repeatable release path for local packaging, GitHub p
 
 For day-to-day maintenance, required change-log practice, GitHub synchronization, and upgrade work, start with `docs\MAINTENANCE_GUIDE.md`.
 
+## Current accepted formal release — v1.1.0 / 2026-10-01
+
+Formal tag `v1.1.0` is immutable at `eee134989cb5a5d1bc787bdca84c838a3e7f82f5`, after exact Windows CI `36801421119` and Formal Release `36801690987`. [GitHub v1.1.0](https://github.com/shashouaq/NetBootDhcpTool/releases/tag/v1.1.0) (400579440) and [Gitee v1.1.0](https://gitee.com/joel20230302/NetBootDhcpTool/releases/tag/v1.1.0) (1177896) are stable. T19 is DONE / ACCEPTED: both hosts' nine files were independently downloaded publicly, verified against signed metadata/sidecars and compared byte for byte; both single-source full installs and both failover-payload installs reached HEALTHY with Setup exit 0 and preserved settings/network/user data.
+
+Setup is 33,395,136 bytes, SHA-256 `6428a7e86ef18918f5ff8e176205c14c9890d29a0ce3dc1ab4ddb8f683a7dd66`; Full 7z is 58,271,600 bytes, SHA-256 `82bebcb8ab6b3dbf32b6f28e8e2120a1dbc8631fc0710b6f5cd27f9ecc7fbf06`. Legacy latest.json remained `10d2b102b615c007e81616b9abe15c939b43f212e9667910822b78975e9a48a7` before/after GitHub and Gitee. Latest-v2 and its production signature passed. Older users run Setup once; subsequent releases use in-app Full 7z updates. Both RCs remain prereleases. Keep legacy parsers/ZIP/rollback compatibility and historical releases intact; any retirement is a separate review.
+
+The existing current-user DPAPI credential was reused automatically and cleared in finally. Local GitHub API HTTPS reads experienced EOF before upload; this run used a tag-restricted, bounded read-only Python transport outside the repository, retaining the original mirror publisher's metadata/signature/digest/idempotency and all Gitee uploads/readbacks. This is an operational observation for a later tooling review, not a change to released product bytes. Extra cold-start strict dual-source diagnostics remain visible as failed evidence; required failover discovery/download and installation passed separately. Setup currently identifies 1.1.0 by filename, displayed version and embedded signed manifest; RC and stable have no PE version resource, which can be evaluated separately without rewriting these assets.
+
+Evidence: `D:\Release\_t19_formal_finalization_20261001\formal-acceptance-summary.json`, gate/audit/workflow/public-download logs, mirror status/telemetry and isolated typed transaction reports. Source/payload comparison and detailed acceptance are in [T19](tasks/T19.md). Post-publication documentation closure does not move the formal tag or rebuild its assets.
+
 ## Version Source
 
 - The application version is defined in `src/NetBootDhcpTool.App/NetBootDhcpTool.App.csproj`.
@@ -57,7 +67,7 @@ The publish script writes to a new `release\local-build-<timestamp>-<id>` folder
 
 `build/clean.ps1` retains the two newest `local-build-*` directories alongside the two newest versioned releases.
 
-When `-GitHubRepository` is supplied, the local `latest.json` includes GitHub URLs for the versioned archive and Full/optional OTA packages. It is a build manifest, not a formally signed client manifest; the release publisher adds approved Gitee URLs and signs the final exact bytes. If the repository is not known yet, omit the parameter and rerun local packaging before any separately authorized release.
+When `-GitHubRepository` is supplied, the local `latest-v2.json` includes GitHub URLs for the versioned archive and Full/optional OTA packages. It is an unsigned build manifest; the release publisher adds approved Gitee URLs and signs the final exact bytes. Legacy `latest.json` / signature come only from the hash-guarded frozen v1.0.20 originals. If the repository is not known yet, omit the parameter and rerun local packaging before any separately authorized release.
 
 Expected outputs under the selected new build directory:
 
@@ -65,9 +75,11 @@ Expected outputs under the selected new build directory:
 - `NetBootDhcpTool-tools`
 - `NetBootDhcpTool-v<version>` (versioned inventory copy for release recovery)
 - `NetBootDhcpTool-v<version>.7z` and `.sha256` (archive root contains only `NetBootDhcpTool/`)
-- `NetBootDhcpTool-full-v<version>.zip` and `.sha256`
+- `NetBootDhcpTool-full-v<version>.7z` and `.sha256`
 - `NetBootDhcpTool-ota-v<base>-to-v<version>.zip` and `.sha256` only when a valid prior install manifest exists and the OTA is smaller than Full
-- `latest.json`
+- `latest-v2.json` (unsigned local build metadata)
+
+The authorized hosted preparation step signs latest-v2, packages the paired `NetBootDhcpTool-Setup-v<version>.exe`, and adds frozen legacy latest.json/signature. v1.1.0's formal set has exactly nine assets; local packaging alone is not a publishable production-signed bundle.
 
 The publish script tests the `.7z` archive and writes package SHA-256 sidecars plus the V2 manifest. The first build without a prior managed install manifest is Full-only. The legacy `latest.json` and signature remain frozen at v1.0.20. Before a formally authorized publication, verify that each package matches its sidecar and signed V2 manifest; the release workflow also verifies the final signed dual-source manifest and public bytes:
 
