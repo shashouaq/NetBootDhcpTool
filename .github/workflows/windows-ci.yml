@@ -36,6 +36,9 @@ jobs:
       - name: Test independent Gitee mirror recovery
         shell: pwsh
         run: .\build\tests\gitee-mirror.tests.ps1
+      - name: Test current-user Gitee credential storage
+        shell: pwsh
+        run: .\build\tests\gitee-credential.tests.ps1
       - name: Test formal package content allowlist
         shell: pwsh
         run: .\build\tests\package-content.tests.ps1

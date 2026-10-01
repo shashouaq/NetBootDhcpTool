@@ -69,16 +69,17 @@ Expected outputs under the selected new build directory:
 - `NetBootDhcpTool-ota-v<base>-to-v<version>.zip` and `.sha256` only when a valid prior install manifest exists and the OTA is smaller than Full
 - `latest.json`
 
-The publish script tests the `.7z` archive and writes package SHA-256 sidecars plus `latest.json`. The first build without a prior managed install manifest is Full-only. Before a formally authorized publication, verify that each package matches its sidecar and manifest; the release workflow also verifies the final signed dual-source manifest and public bytes:
+The publish script tests the `.7z` archive and writes package SHA-256 sidecars plus the V2 manifest. The first build without a prior managed install manifest is Full-only. The legacy `latest.json` and signature remain frozen at v1.0.20. Before a formally authorized publication, verify that each package matches its sidecar and signed V2 manifest; the release workflow also verifies the final signed dual-source manifest and public bytes:
 
 ```powershell
 $version = "<version>"
 $buildDirectory = "<new local-build output directory>"
-$archive = Join-Path $buildDirectory "NetBootDhcpTool-v$version.7z"
+$archive = Join-Path $buildDirectory "NetBootDhcpTool-full-v$version.7z"
 $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
 $sidecarHash = (Get-Content -Raw "$archive.sha256").Trim().Split(' ')[0].ToLowerInvariant()
-$manifest = Get-Content -Raw (Join-Path $buildDirectory 'latest.json') | ConvertFrom-Json
-if ($sidecarHash -ne $hash -or $manifest.version -ne $version -or $manifest.archiveSha256 -ne $hash) {
+$manifest = Get-Content -Raw (Join-Path $buildDirectory 'latest-v2.json') | ConvertFrom-Json
+$package = @($manifest.sevenZipPackages | Where-Object { $_.kind -eq 'Full' -and $_.fileName -ceq [IO.Path]::GetFileName($archive) })
+if ($sidecarHash -ne $hash -or $manifest.version -ne $version -or $package.Count -ne 1 -or $package[0].sha256 -ne $hash -or $package[0].size -ne (Get-Item -LiteralPath $archive).Length) {
     throw "Local release assets are inconsistent for v$version"
 }
 ```
@@ -91,7 +92,7 @@ The candidate Setup is a small NSIS bootstrapper around a self-contained SetupHe
 
 Before installation, Setup verifies the V2 signature, Full 7z filename, size, SHA-256, archive manifest, and payload inventory. It migrates legacy settings/favorites/logs into `%LOCALAPPDATA%\NetBootDhcpTool` without overwriting existing user files; installation and update transactions must never delete or overwrite that data root. The Updater then performs one shared ZIP/7z transaction: locked package stream verification, canonical path validation, payload verification, staging, backup, replacement, startup health confirmation, and rollback. The Updater remains the final security authority. Full 7z is the required automatic-update payload; OTA 7z remains optional and must fall back to Full 7z where supported.
 
-NSIS waits for SetupHelper to validate the manifest/package and for the Updater to accept the transaction, then exits so the Updater can wait for its parent to close and replace files. Therefore Setup.exe exit code 0 means successful validation and transaction handoff; final installation success is the Updater `HEALTHY` status, not the Setup exit code. In a real locked-file test, Setup exited 0 after handoff, the Updater recorded `FAILED` and `rolled-back`, and all 54 v1.0.20 files plus the install-manifest hash matched the baseline. The old application restarted as designed.
+The NSIS wrapper waits for SetupHelper, which waits for the exact request's terminal typed status and the Updater process exit code. Setup.exe exit 0 means final `HEALTHY`; 21 means rollback completed, 22 means rollback failed, and 23 means health-check failure followed by rollback. Other shared protocol codes distinguish preflight, download, verification, disk capacity, permissions, cancellation, unexpected updater termination and timeout. The total wait is bounded at 15 minutes; it does not kill a transaction in the middle of replacement. The earlier handoff-only exit 0 behavior was replaced before RC acceptance. The current real locked-file test returns 21, and public RC installation tests return 0 only after HEALTHY.
 
 Gitee's exact Release-attachment size cap is not confirmed. The public Gitee repository quota article describes repository files, not Release attachments. Setup, Full 7z, and every other Release asset are checked individually: the local mirror publisher warns above 95,000,000 bytes and has a centralized `GiteeReleaseAssetMaxBytes` hard limit that remains unset until an authoritative Release-specific limit is established. Its configured-limit test proves rejection before any Gitee request or upload POST. Independently downloadable asset sizes are never summed for this platform preflight; the first-migration sum is only recorded as a user download/bandwidth metric.
 
@@ -105,7 +106,26 @@ GitHub-hosted Windows runners are the only required Actions infrastructure for f
 
 The formal entry point is .github/workflows/formal-release.yml on main. Its verify-ci job confirms the tag resolves to a commit on main and that the exact tagged commit has a successful Windows CI run. The build-once job checks out that immutable tag, builds and tests one signed release bundle, computes package SHA-256 values, and uploads one artifact for 90 days. The publish-github job consumes that artifact, creates or reuses the GitHub Release, downloads and verifies every asset, then promotes that release to stable. Only this workflow receives the protected NETBOOT_UPDATE_SIGNING_PRIVATE_KEY secret; it does not receive GITEE_TOKEN. No local Windows Actions Runner is required.
 
-GitHub formal-release status is independent from Gitee mirror status. A successful GitHub publication remains successful if Gitee is unavailable. Gitee publication is a local operation, independent of GitHub Actions and any GitHub Runner. For interactive local use, run `scripts/Invoke-GiteeMirrorSecure.ps1 -Tag v<version> -AssetDirectory <path>` in PowerShell 7. It reads the token with a hidden `Read-Host -AsSecureString` prompt, places it only in the current process environment for the publisher, and removes it in `finally`; it does not accept a token argument or persist the credential. The optional `-AssetDirectory <path>` mode uses already-downloaded formal release files; it never builds or signs packages.
+GitHub formal-release status is independent from Gitee mirror status. A successful GitHub publication remains successful if Gitee is unavailable. Gitee publication is a local operation, independent of GitHub Actions and any GitHub Runner. Run `scripts/Invoke-GiteeMirrorSecure.ps1 -Tag v<version> -AssetDirectory <path>` in PowerShell 7. It uses the unified current-user DPAPI interface described below. Only first configuration prompts for an existing dedicated token; later PowerShell processes reuse the encrypted credential. The publisher receives a process-only `GITEE_TOKEN`, removed in `finally` on success or failure. Neither entry point accepts a plaintext token argument. The optional publisher `-AssetDirectory <path>` mode uses already-downloaded release files; it never builds or signs packages.
+
+### Local Gitee credential management
+
+The current Windows user's dedicated publishing token is encrypted by `ConvertFrom-SecureString` with Windows DPAPI and stored outside Git at `%LOCALAPPDATA%\NetBootDhcpTool\Secrets\gitee-token.dpapi`. The directory and file have a private current-user SID ACL. No symmetric key, plaintext `.env`, permanent User/Machine environment variable or credential in an application package is used. Another Windows account cannot normally decrypt this current-user DPAPI record.
+
+```powershell
+. .\scripts\Get-GiteeCredential.ps1 -LoadOnly
+Set-GiteeCredential          # first hidden input; reuse an existing valid token
+Test-GiteeCredential         # account, repository and Release read-only API checks
+Remove-GiteeCredential       # deletes local ciphertext only; never revokes Gitee tokens
+# Explicitly replace only an expired/revoked/rejected/compromised credential:
+Set-GiteeCredential -Replace
+```
+
+The same commands are available through `Get-GiteeCredential.ps1 -Action Set|Test|Remove`. `Get-GiteeCredential` returns a SecureString, never plaintext. Existing unreadable ciphertext fails explicitly; it is not overwritten automatically. An unavailable API/feed retains the stored credential. Token write permissions are enforced by Gitee during publishing; read-only validation does not claim to prove all write permissions. Keep one valid project publishing token, and decide personally whether to revoke redundant account tokens after this reuse flow is verified. No script creates or revokes a PAT.
+
+The mirror and optional source-preparation launcher use this same interface. `-SynchronizeSource` prepares the GitHub release's exact commit/tag on Gitee only when missing, checks fast-forward ancestry and never force-pushes. Git credentials are passed through scoped process configuration, not argv or a stored Git credential helper; traces are disabled and temporary configuration is cleared. The API-only asset publisher itself does not depend on Git synchronization. Setup and installed clients download public assets without a Gitee token.
+
+`Protect-GiteeDiagnostic` redacts literal/URI-encoded tokens and Authorization/access_token values; diagnostic writers reject unredacted credentials. `Test-GiteeCredentialExposure` scans selected repository/log/status/telemetry files and readable process command lines without printing the credential. Windows CI runs a fake-credential regression with actual current-user DPAPI, private ACL, fresh-process reuse, failure cleanup, redaction, invalid replacement retention and local-only removal.
 
 The mirror script uses the ordinary GitHub Release REST API and Release download endpoints. It validates every local/downloaded asset against the GitHub Release asset size and SHA-256, verifies the signed manifest and checksum sidecars, then queries Gitee. By default, verified GitHub assets are retained in `artifacts/gitee-mirror-assets/<tag>` so a later run can use `-AssetDirectory` to resume without downloading them again. Explicit local assets must match the requested tag, manifest version, filenames, GitHub REST digests, sidecars and trusted signature before any Gitee request or write.
 

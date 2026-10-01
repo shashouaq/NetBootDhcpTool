@@ -15,7 +15,9 @@
 
 - GitHub [v1.1.0-rc.1](https://github.com/shashouaq/NetBootDhcpTool/releases/tag/v1.1.0-rc.1), Release 400443155, was built once from `7cf3e5f4d9bd41c8b9cf776761b8191f6d069a9c` after exact-commit Windows CI and a fresh official NuGet audit. It remains a prerelease; no formal v1.1.0 was published.
 - Public download readback verified all nine original RC assets against fresh REST filename/size/SHA-256 metadata. Production manifest signature, package identity, 7z sidecars and frozen v1.0.20 legacy hashes passed. Setup is 33,394,902 B; Full 7z is 58,270,126 B. Test-key assets were not uploaded.
-- 本地 RC 门禁与 GitHub 公共资产读回完成；Gitee 安全凭据、RC 源码同步、公共镜像读回及真实公网双向 failover/安装仍待执行。T19 继续进行中，既有 v1.0.20 与 Gitee Release 1171280 不变。
+- 本机统一凭据入口以当前用户 DPAPI 保存到仓库外 Secrets，之后自动跨进程复用，进程环境变量在 finally 删除。没有创建/撤销账户 Token；23 项凭据/私有 ACL/异常清理/日志脱敏回归通过，真实账户/仓库/Release 只读 Test 返回 HTTP 200。永久记忆只记机制与密文位置，不保存令牌。
+- Gitee RC [v1.1.0-rc.1](https://gitee.com/joel20230302/NetBootDhcpTool/releases/tag/v1.1.0-rc.1)，Release 1177826，9 项原始附件 HTTP 201 上传并逐项即时、最终公共下载 filename/size/SHA 校验通过，最终镜像 SUCCESS。Setup 上传 6.792 秒、Full 7z 9.932 秒、便携 7z 11.128 秒，没有 curl 28/35/55。Gitee 源代码仅 fast-forward 到匹配的 RC 源提交，不重写正式历史。
+- 真实公网客户端测速/双向 failover 下载 3/3 通过；使用两个故障切换公网下载包执行真实原始 Setup，官方 v1.0.20→生产签名 RC 安装 2/2 HEALTHY、最终 exit 0，20 个受管文件 size/SHA 全部一致，稳定用户设置/网络方案/收藏/历史/自定义状态保留。测试仅覆盖显式 RC URL，未改变稳定 latest；失败源在测试 handler 中禁止访问，其他源响应均来自真实公共 HTTPS。完整证据见 T19。T19 继续进行中，RC 保持 prerelease；正式 stable 发布和发布后验收尚未执行，v1.0.20 与 Gitee Release 1171280 不变。
 
 ### 2026-10-01 reliability closure / 可靠性收口
 

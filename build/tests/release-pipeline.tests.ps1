@@ -176,19 +176,31 @@ try {
 
     $giteeScript = Get-Content -Raw -LiteralPath (Join-Path $repoRoot 'scripts\Publish-GiteeMirror.ps1')
     $secureMirrorScript = Get-Content -Raw -LiteralPath (Join-Path $repoRoot 'scripts\Invoke-GiteeMirrorSecure.ps1')
+    $credentialScript = Get-Content -Raw -LiteralPath (Join-Path $repoRoot 'scripts\Get-GiteeCredential.ps1')
     foreach ($requiredSecureBehavior in @(
-        'Read-Host',
-        '-AsSecureString',
-        'SecureStringToBSTR',
-        '$env:GITEE_TOKEN = $tokenText',
+        'Get-GiteeCredential.ps1',
+        'Get-GiteeCredential -CredentialPath',
+        'Test-GiteeCredential -Credential',
+        'Invoke-WithGiteeCredential -CredentialPath',
         'Remove-Item Env:GITEE_TOKEN',
-        'ZeroFreeBSTR',
-        '& $publisherPath -Tag $Tag -AssetDirectory $AssetDirectory -TelemetryPath $telemetryPath'
+        '& $publisherPath -Tag $Tag -AssetDirectory $AssetDirectory -TelemetryPath $telemetryPath -CredentialPath $CredentialPath'
     )) {
         if (-not $secureMirrorScript.Contains($requiredSecureBehavior)) { throw "Secure Gitee launcher is missing required credential handling: $requiredSecureBehavior." }
     }
     if ($secureMirrorScript -match '(?i)(?:param\s*\([^)]*\$Token|-[\w]+Token\s+\$tokenText|Write-(?:Host|Output|AllText)[^\r\n]*\$tokenText)') {
         throw 'Secure Gitee launcher must not accept or print a token parameter.'
+    }
+    foreach ($requiredCredentialBehavior in @('function Set-GiteeCredential','function Get-GiteeCredential','function Test-GiteeCredential',
+        'function Remove-GiteeCredential','Read-Host','-AsSecureString','ConvertFrom-SecureString','ConvertTo-SecureString',
+        'gitee-token.dpapi','SecureStringToBSTR','ZeroFreeBSTR','finally','Remove-Item Env:GITEE_TOKEN',
+        'Protect-GiteeDiagnostic','Assert-GiteeCredentialFreeText','Test-GiteeCredentialExposure')) {
+        if(-not $credentialScript.Contains($requiredCredentialBehavior)){throw "Unified Gitee credential interface is missing: $requiredCredentialBehavior"}
+    }
+    if($credentialScript -match 'ConvertFrom-SecureString[^\r\n]+-(?:Key|SecureKey)\b' -or
+        $credentialScript -match 'SetEnvironmentVariable[^\r\n]+(?:User|Machine)' -or
+        $secureMirrorScript -match 'Read-Host.*Token' -or -not $giteeScript.Contains('Invoke-WithGiteeCredential -CredentialPath $CredentialPath -Operation') -or
+        $windowsWorkflow -notmatch 'gitee-credential\.tests\.ps1') {
+        throw 'Gitee publication must use current-user DPAPI, process-only credentials and the credential regression.'
     }
     $githubScript = Get-Content -Raw -LiteralPath (Join-Path $repoRoot 'scripts\Publish-GitHubRelease.ps1')
     $candidateWorkflow = Get-Content -Raw -LiteralPath (Join-Path $repoRoot '.github\workflows\release-candidate.yml')

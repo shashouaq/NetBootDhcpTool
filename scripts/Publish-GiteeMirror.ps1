@@ -4,10 +4,10 @@ param(
     [string]$GitHubRepository = 'shashouaq/NetBootDhcpTool',
     [string]$GiteeOwner = 'joel20230302',
     [string]$GiteeRepository = 'NetBootDhcpTool',
-    [string]$Token = $env:GITEE_TOKEN,
     [string]$AssetDirectory,
     [ValidateRange(30, 300)][int]$UploadTimeoutSec = 180,
     [string]$TelemetryPath,
+    [string]$CredentialPath,
     [switch]$LibraryOnly,
     [switch]$ReleaseCandidate
 )
@@ -16,6 +16,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $script:MirrorRoot = Split-Path -Parent $PSScriptRoot
 $script:RepositoryRoot = $script:MirrorRoot
+. (Join-Path $PSScriptRoot 'Get-GiteeCredential.ps1') -LoadOnly
 . (Join-Path $script:MirrorRoot 'build\release-identity.ps1')
 $null = Get-NetBootReleaseIdentity -Tag $Tag -ReleaseCandidate:$ReleaseCandidate
 $script:MirrorIsCandidate = [bool]$ReleaseCandidate
@@ -73,7 +74,7 @@ function Invoke-MirrorHttp {
         $curlConfig = 'form = "access_token={0}"' -f $escapedToken
         try {
             $uploadTimer = [System.Diagnostics.Stopwatch]::StartNew()
-            $curlOutput = $curlConfig | & $curl --config - --silent --show-error --http1.1 --header 'Expect:' --connect-timeout 20 --max-time $TimeoutSec --fail-with-body --request POST --form "file=@$UploadFile;filename=$([System.IO.Path]::GetFileName($UploadFile))" --dump-header $headersPath --output $responsePath --write-out 'http=%{http_code} seconds=%{time_total} uploaded=%{size_upload} speed=%{speed_upload}' $Uri 2>&1
+            $curlOutput = $curlConfig | & $curl --disable --config - --silent --show-error --http1.1 --header 'Expect:' --connect-timeout 20 --max-time $TimeoutSec --fail-with-body --request POST --form "file=@$UploadFile;filename=$([System.IO.Path]::GetFileName($UploadFile))" --dump-header $headersPath --output $responsePath --write-out 'http=%{http_code} seconds=%{time_total} uploaded=%{size_upload} speed=%{speed_upload}' $Uri 2>&1
             $uploadTimer.Stop()
             $exitCode = $LASTEXITCODE
             $stats = ($curlOutput | Out-String).Trim()
@@ -144,7 +145,7 @@ function Invoke-MirrorHttp {
         $failure = $_.Exception
         while ($null -ne $failure.InnerException) { $failure = $failure.InnerException }
         $detail = "$($failure.GetType().Name): $($failure.Message)"
-        $detail = $detail -replace '(?i)(access_token=)[^&\s]+', '$1[redacted]'
+        $detail = Protect-GiteeDiagnostic $detail
         throw "HTTPS request to $(([uri]$Uri).Host) failed ($Method) after $([math]::Round($requestTimer.Elapsed.TotalSeconds, 3)) seconds: $detail"
     } finally {
         if ($null -ne $httpResponse) { $httpResponse.Dispose() }
@@ -492,6 +493,7 @@ function Write-GiteeMirrorTelemetry([string]$Path, [string]$Tag, [long]$ReleaseI
     }
     try {
         $json = ConvertTo-Json -InputObject $report -Depth 8
+        Assert-GiteeCredentialFreeText $json
         [System.IO.File]::WriteAllText($tempPath, $json, [System.Text.UTF8Encoding]::new($false))
         Move-Item -LiteralPath $tempPath -Destination $fullPath -Force
     } finally {
@@ -778,7 +780,7 @@ function Publish-GiteeMirror {
                 $endedAt = [DateTimeOffset]::UtcNow
                 if ($null -eq $uploadEndedAt) { $uploadEndedAt = $endedAt }
                 $elapsed = [math]::Round($uploadTimer.Elapsed.TotalSeconds, 3)
-                $networkError = ([string]$_.Exception.Message).Replace([string]$Token, '[redacted]')
+                $networkError = Protect-GiteeDiagnostic ([string]$_.Exception.Message) @($Token)
                 $averageBytesPerSecond = if ($elapsed -gt 0) { [math]::Round([double]$local.Size / $elapsed, 2) } else { 0.0 }
                 $curlExit = if ($null -ne $upload) { $upload.ExitCode } else { $null }
                 $curlUploaded = if ($null -ne $upload) { $upload.UploadedBytes } else { $null }
@@ -878,13 +880,11 @@ function Publish-GiteeMirror {
 
 if (-not $LibraryOnly) {
     try {
-            $null = Publish-GiteeMirror -Tag $Tag -Token $Token -AssetDirectory $AssetDirectory -UploadTimeoutSec $UploadTimeoutSec -TelemetryPath $TelemetryPath -GitHubRepository $GitHubRepository -GiteeOwner $GiteeOwner -GiteeRepository $GiteeRepository
-    } catch {
-        $message = [string]$_.Exception.Message
-        foreach ($secret in @($Token, $env:GITEE_TOKEN)) {
-            if (-not [string]::IsNullOrEmpty([string]$secret)) { $message = $message.Replace([string]$secret, '[redacted]') }
+        Invoke-WithGiteeCredential -CredentialPath $CredentialPath -Operation {
+            $null = Publish-GiteeMirror -Tag $Tag -AssetDirectory $AssetDirectory -UploadTimeoutSec $UploadTimeoutSec -TelemetryPath $TelemetryPath -GitHubRepository $GitHubRepository -GiteeOwner $GiteeOwner -GiteeRepository $GiteeRepository
         }
-        $message = $message -replace '(?i)(access_token=)[^&\s]+', '$1[redacted]'
+    } catch {
+        $message = Protect-GiteeDiagnostic ([string]$_.Exception.Message)
         $message = $message -replace '[\r\n]+', ' '
         Write-Host "GITEE_MIRROR FAILED tag=$Tag reason=$message" -ForegroundColor Red
         throw $message
