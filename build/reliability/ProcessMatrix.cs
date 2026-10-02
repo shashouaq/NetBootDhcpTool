@@ -266,7 +266,8 @@ sealed partial class ProcessMatrix(string suiteRoot)
     }
     async Task<string> BuildNsisAsync(string root,(string Path,string Manifest,string Signature) package)
     {
-        var args=new [] {"-DPRODUCT_VERSION=1.1.0","-DSETUP_HELPER="+helper,"-DMANIFEST="+Path.Combine(root,"manifest.json"),"-DSIGNATURE="+Path.Combine(root,"manifest.sig"),"-DFULL_PACKAGE_NAME="+Path.GetFileName(package.Path),"-DOUTPUT_DIRECTORY="+root,"-DUSER_CANCELLED_EXIT_CODE="+(int)InstallExitCode.Cancelled,Path.Combine(suiteRoot,"source","installer","NetBootDhcpTool.Setup.nsi")};
+        var versionSource = System.Xml.Linq.XDocument.Load(Path.Combine(suiteRoot,"source","build","Version.props")).Root!.Element("PropertyGroup")!;
+        var args=new [] {"-DPRODUCT_VERSION=1.1.0", "-DPE_VERSION=1.1.0.0", "-DPRODUCT_NAME="+versionSource.Element("NetBootProductName")!.Value, "-DCOMPANY_NAME="+versionSource.Element("NetBootCompanyName")!.Value, "-DPRODUCT_COPYRIGHT="+versionSource.Element("NetBootCopyright")!.Value,"-DSETUP_HELPER="+helper,"-DMANIFEST="+Path.Combine(root,"manifest.json"),"-DSIGNATURE="+Path.Combine(root,"manifest.sig"),"-DFULL_PACKAGE_NAME="+Path.GetFileName(package.Path),"-DOUTPUT_DIRECTORY="+root,"-DUSER_CANCELLED_EXIT_CODE="+(int)InstallExitCode.Cancelled,Path.Combine(suiteRoot,"source","installer","NetBootDhcpTool.Setup.nsi")};
         using var compiler=Start(nsis,args,new Dictionary<string,string>());
         await compiler.WaitForExitAsync();
         if(compiler.ExitCode!=0) throw new Exception("NSIS test fixture compilation failed.");

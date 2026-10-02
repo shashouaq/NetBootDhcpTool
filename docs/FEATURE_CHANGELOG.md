@@ -1,6 +1,15 @@
-# Feature Change Log
+﻿# Feature Change Log
 
 ## Unreleased
+
+## v1.1.1 / 2026-10-02
+
+- Date: 2026-10-02
+- Type: Maintenance / T30 — PE version consistency and release HTTP resilience
+- Affected files/modules: `build/Version.props`, root MSBuild props/targets, App/Updater/SetupHelper metadata, NSIS and package preparation, `ReleaseTransport.psm1`/pinned HTTPX fallback, hosted/RC/mirror/credential/archived publisher callers, release and PE fault tests, UI smoke harness and maintenance/task documentation.
+- Concrete change: follow-up review disables POST/PATCH/DELETE automatic redirects, preventing a 307/308 response from repeating a write; Python fallback rejects redirect userinfo before a second request. Shared fresh official NuGet auditing now gates Windows CI, RC and formal signing; feed/query/coverage failures stop publication. One checked-in version/identity source stamps Windows four-component resources and string product versions; real PE + archive/manifest version mismatch stops bundle preparation. Release reads now use bounded classified retries, TLS-verified read-only fallback and verified partial promotion; uncertain writes are reconciled against remote identity/bytes without blind retransmission. T29 duplicate acceptance is closed under accepted T19; no update architecture is reopened.
+- Verification: 2026-10-02 source-1.1.1 regression and temporary-key nine-asset preparation passed: Release 0 warnings/errors; MSTest 234 passed/1 configured skip; console/UI and existing script suites, HTTP 28+1+3, Python 5, fresh-audit decision fixtures 8, actual PE/version and workflow syntax checks. Local official NuGet TLS/NU1900 prevents declaring a fresh vulnerability audit passed; formal CI/audit remains a publication prerequisite. Detailed current evidence: `D:\Release\_v111_readiness_20261002`. Earlier 2026-10-01 evidence: complete Release build 0 warnings/errors; MSTest 234 passed/1 configured performance skip/0 failures, console OK, non-admin UI_SMOKE_OK; existing package/release/mirror/credential/process/maintenance checks passed, HTTP fault cases 22 + GitHub unknown-upload reconciliation + 3 archived read-contract cases, Python TLS cases 4, actual NSIS stable/RC PE and mismatch checks. Isolated temporary-key Test N+1 1.1.1 nine assets passed build/signature/version gates, mirror simulation rerun uploaded zero files, actual Setup and App→Updater transactions reached HEALTHY/exit 0 with file/user-data/network verification. Evidence and retained failed attempts: `D:\Release\_post_v110_maintenance_20261001`; see [T30](tasks/T30.md).
+- User impact: builds show consistent Windows Properties versions and component descriptions; release tooling handles transient EOF/HTTP failures with bounded diagnostics. The user authorized the complete v1.1.1 release workflow on 2026-10-02; exact source CI, fresh official audit, production signing and public acceptance are required before recording publication success. The 2026-10-01 evidence remains a dated source-1.1.0 snapshot. Production trust, immutable v1.1.0 assets and existing DPAPI credentials are preserved.
 
 ## v1.1.0 / 2026-10-01
 

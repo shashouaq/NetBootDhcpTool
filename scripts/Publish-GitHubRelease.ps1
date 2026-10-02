@@ -9,6 +9,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+Import-Module (Join-Path (Split-Path -Parent $PSScriptRoot) 'build/release-pipeline/ReleaseTransport.psm1') -Force
 . (Join-Path (Split-Path -Parent $PSScriptRoot) 'build\release-identity.ps1')
 $identity = Get-NetBootReleaseIdentity -Tag $Tag -ReleaseCandidate:$ReleaseCandidate
 if ($ReleaseCandidate -and $SourceCommit -notmatch '^[a-fA-F0-9]{40}$') { throw 'An RC must be bound to an exact source commit.' }
@@ -139,18 +140,7 @@ function Invoke-GitHubApi {
         [string]$ContentType = 'application/json; charset=utf-8',
         [string]$Accept = 'application/vnd.github+json'
     )
-    $parameters = @{ Uri = $Uri; Method = $Method; Headers = (Get-GitHubHeaders $Accept); SkipHttpErrorCheck = $true; MaximumRedirection = 10; TimeoutSec = 180; ErrorAction = 'Stop' }
-    if ($Body) { $parameters.Body = $Body; $parameters.ContentType = $ContentType }
-    if ($OutFile) { $parameters.OutFile = $OutFile; $parameters.PassThru = $true }
-    if ($InFile) { $parameters.InFile = $InFile; $parameters.ContentType = $ContentType }
-    try {
-        $response = Invoke-WebRequest @parameters
-        $content = if ($OutFile) { '' } else { [string]$response.Content }
-        return [pscustomobject]@{ StatusCode = [int]$response.StatusCode; Content = $content }
-    } catch {
-        $hostName = ([uri]$Uri).Host
-        throw "GitHub HTTPS $Method failed at $hostName ($($_.Exception.GetType().Name))."
-    }
+    return Invoke-ReleaseHttp -Uri $Uri -Method $Method -Headers (Get-GitHubHeaders $Accept) -Body $Body -OutFile $OutFile -InFile $InFile -ContentType $ContentType -TimeoutSec 180 -Stage github-api
 }
 
 function Convert-GitHubJson([string]$Content, [string]$Context) {
@@ -184,7 +174,7 @@ function Test-GitHubAssetReadback([object]$Asset, [string]$Name) {
     if ([long]$Asset.size -ne $local.Size) { throw "GitHub already has a different-sized $Name; refusing to overwrite it." }
     $path = Join-Path ([System.IO.Path]::GetTempPath()) ('netboot-gh-readback-' + [guid]::NewGuid().ToString('N') + '-' + $Name)
     try {
-        $response = Invoke-GitHubApi -Uri ([string]$Asset.browser_download_url) -OutFile $path -Accept 'application/octet-stream'
+        $response = Invoke-ReleaseDownload -Uri ([string]$Asset.browser_download_url) -Destination $path -AssetName $Name -ExpectedSize $local.Size -ExpectedSha256 $local.Sha256 -Stage github-readback
         if ($response.StatusCode -ne 200 -or -not (Test-Path -LiteralPath $path -PathType Leaf) -or
             (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $local.Sha256) {
             throw "GitHub asset full download SHA-256 mismatch for $Name; existing bytes are preserved."
@@ -208,7 +198,8 @@ function Ensure-GitHubAsset([object]$Release, [string]$Name) {
         return $Release
     }
     $uploadUri = "https://uploads.github.com/repos/$GitHubRepository/releases/$($Release.id)/assets?name=$([uri]::EscapeDataString($Name))"
-    $upload = Invoke-GitHubApi -Uri $uploadUri -Method Post -InFile $localAssets[$Name].Path -ContentType 'application/octet-stream'
+    try { $upload = Invoke-GitHubApi -Uri $uploadUri -Method Post -InFile $localAssets[$Name].Path -ContentType 'application/octet-stream' }
+    catch { if ($_.Exception.Message -match 'category=(certificate|permanent-transport)') { throw }; $upload = [pscustomobject]@{StatusCode=0;Content=''} } # Reconcile, never repeat an uncertain POST.
     $Release = Get-GitHubRelease
     $asset = if ($null -eq $Release) { $null } else { Get-AssetByName $Release $Name }
     if ($null -eq $asset) {
@@ -231,7 +222,8 @@ if ($null -eq $release) {
         make_latest = 'false'
     }
     if ($ReleaseCandidate) { $payload.target_commitish = $SourceCommit }
-    $create = Invoke-GitHubApi -Uri "https://api.github.com/repos/$GitHubRepository/releases" -Method Post -Body (ConvertTo-Json -InputObject $payload -Depth 8 -Compress)
+    try { $create = Invoke-GitHubApi -Uri "https://api.github.com/repos/$GitHubRepository/releases" -Method Post -Body (ConvertTo-Json -InputObject $payload -Depth 8 -Compress) }
+    catch { if ($_.Exception.Message -match 'category=(certificate|permanent-transport)') { throw }; $create = [pscustomobject]@{StatusCode=0;Content=''} } # Read back the exact tag before any later write.
     if ($create.StatusCode -notin @(200, 201)) {
         $release = Get-GitHubRelease
         if ($null -eq $release) { throw "GitHub prerelease creation returned HTTP $($create.StatusCode); no Release for $Tag was confirmed." }

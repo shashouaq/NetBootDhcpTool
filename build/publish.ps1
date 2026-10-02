@@ -18,8 +18,8 @@ $product = Join-Path $releaseRoot 'NetBootDhcpTool'
 $toolsRelease = Join-Path $releaseRoot 'NetBootDhcpTool-tools'
 $projectFile = Join-Path $root 'src\NetBootDhcpTool.App\NetBootDhcpTool.App.csproj'
 $updaterProject = Join-Path $root 'src\NetBootDhcpTool.Updater\NetBootDhcpTool.Updater.csproj'
-[xml]$projectXml = Get-Content -LiteralPath $projectFile
-$version = [string]$projectXml.Project.PropertyGroup.Version
+. (Join-Path $PSScriptRoot 'release-identity.ps1')
+$version = (Get-NetBootVersionMetadata -RepositoryRoot $root).Version
 if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "Version not found or invalid in $projectFile" }
 $tag = "v$version"
 $versionedRelease = Join-Path $releaseRoot "NetBootDhcpTool-v$version"

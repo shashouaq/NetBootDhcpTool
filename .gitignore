@@ -9,3 +9,5 @@ artifacts/release-repair/
 .vs/
 *.user
 *.suo
+__pycache__/
+*.pyc

@@ -1,4 +1,4 @@
-name: Formal Release
+﻿name: Formal Release
 run-name: Formal release ${{ inputs.release_tag }}
 
 on:
@@ -30,6 +30,11 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Install pinned release HTTP fallback
+        shell: pwsh
+        run: |
+          python -m pip install -r .\build\release-pipeline\requirements.txt --disable-pip-version-check
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned release HTTP fallback installation failed.' }
       - name: Require a stable main tag with passing Windows CI
         id: verify
         shell: pwsh
@@ -39,8 +44,9 @@ jobs:
         run: |
           if ($env:GITHUB_REF -cne 'refs/heads/main') { throw 'Dispatch Formal Release from the main branch.' }
           if ($env:RELEASE_TAG -notmatch '^v\d+\.\d+\.\d+$') { throw 'Release tag must use v<major>.<minor>.<patch>.' }
-          [xml]$project = Get-Content -LiteralPath 'src\NetBootDhcpTool.App\NetBootDhcpTool.App.csproj'
-          if ($env:RELEASE_TAG -cne "v$($project.Project.PropertyGroup.Version)") { throw 'Release tag does not match the checked-in application version.' }
+          . .\build\release-identity.ps1
+          $version = (Get-NetBootVersionMetadata).Version
+          if ($env:RELEASE_TAG -cne "v$version") { throw 'Release tag does not match the checked-in application version.' }
           git fetch origin main --tags
           if ($LASTEXITCODE -ne 0) { throw 'Could not fetch main and release tags.' }
           $releaseCommit = (git rev-parse "refs/tags/$($env:RELEASE_TAG)^{commit}").Trim()
@@ -61,8 +67,10 @@ jobs:
           Import-Module .\build\release-pipeline\ReleaseState.psm1 -Force
           foreach ($requiredCommit in @($releaseCommit, $publisherCommit) | Select-Object -Unique) {
             $endpoint = "repos/$env:GITHUB_REPOSITORY/actions/workflows/windows-ci.yml/runs?head_sha=$requiredCommit&status=success&per_page=100"
-            $runJson = gh api $endpoint
-            if ($LASTEXITCODE -ne 0) { throw "Could not read Windows CI runs for commit $requiredCommit." }
+            Import-Module .\build\release-pipeline\ReleaseTransport.psm1
+            $response = Invoke-ReleaseHttp -Uri "https://api.github.com/$endpoint" -Headers @{Authorization="Bearer $env:GH_TOKEN";'User-Agent'='NetBootDhcpTool-CI'} -Stage exact-ci
+            if ($response.StatusCode -ne 200) { throw "Could not read Windows CI runs for commit $requiredCommit." }
+            $runJson = $response.Content
             $runs = $runJson | ConvertFrom-Json
             if (-not (Test-SuccessfulMainWindowsCiRun -Runs @($runs.workflow_runs) -Commit $requiredCommit)) {
               throw "Windows CI has no successful main push run for exact commit $requiredCommit."
@@ -90,6 +98,10 @@ jobs:
       - uses: actions/setup-dotnet@v6
         with:
           dotnet-version: 10.0.401
+
+      - name: Fresh official dependency audit before signing
+        shell: pwsh
+        run: .\build\release-pipeline\Invoke-FreshNuGetAudit.ps1 -EvidenceDirectory (Join-Path $env:RUNNER_TEMP 'formal-audit')
 
       - name: Ensure 7-Zip is available
         shell: pwsh
@@ -150,6 +162,11 @@ jobs:
           name: formal-release-${{ inputs.release_tag }}
           path: ${{ runner.temp }}\formal-release-assets
 
+      - name: Install pinned release HTTP fallback
+        shell: pwsh
+        run: |
+          python -m pip install -r .\build\release-pipeline\requirements.txt --disable-pip-version-check
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned release HTTP fallback installation failed.' }
       - name: Publish only the verified build artifact
         shell: pwsh
         env:

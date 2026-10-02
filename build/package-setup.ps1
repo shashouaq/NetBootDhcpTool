@@ -31,6 +31,8 @@ try {
     }
 } finally { $rsa.Dispose() }
 $version = [string]$manifest.version
+. (Join-Path $PSScriptRoot 'release-identity.ps1')
+$versionInfo = Get-NetBootVersionMetadata -Version $version -RepositoryRoot $root
 $fullPackages = @($manifest.sevenZipPackages | Where-Object { $_.kind -ceq 'Full' })
 if ($fullPackages.Count -ne 1) { throw 'The signed V2 manifest must contain exactly one Full 7z package.' }
 $fullPackage = $fullPackages[0]
@@ -63,9 +65,11 @@ try {
     & $DotnetPath publish (Join-Path $root 'src\NetBootDhcpTool.SetupHelper\NetBootDhcpTool.SetupHelper.csproj') `
         -c Release -r win-x64 --self-contained true --no-restore `
         -p:PublishSingleFile=true -p:EnableCompressionInSingleFile=true -p:DebugType=None -p:DebugSymbols=false `
-        -o $helperOutput
+        "-p:Version=$version" -o $helperOutput
     if ($LASTEXITCODE -ne 0) { throw "Setup helper publish failed with exit code $LASTEXITCODE." }
     if (-not (Test-Path -LiteralPath $helperPath -PathType Leaf)) { throw 'The self-contained setup helper was not produced.' }
+    . (Join-Path $PSScriptRoot 'pe-version.ps1')
+    $null = Assert-NetBootPEVersion -Path $helperPath -Version $version -Description 'NetBoot DHCP Tool Setup Helper'
 
     $script = Join-Path $root 'installer\NetBootDhcpTool.Setup.nsi'
     $resultSource = [System.IO.File]::ReadAllText((Join-Path $root 'src\NetBootDhcpTool.Core\UpdateResultProtocol.cs'))
@@ -73,12 +77,13 @@ try {
     if ([string]::IsNullOrWhiteSpace($cancelCode)) { throw 'Cannot read the shared user-cancel exit code.' }
     Push-Location $root
     try {
-        & $MakensisPath "-DPRODUCT_VERSION=$version" "-DSETUP_HELPER=$helperPath" "-DMANIFEST=$manifestPath" `
+        & $MakensisPath "-DPRODUCT_VERSION=$version" "-DPE_VERSION=$($versionInfo.NumericVersion)" "-DPRODUCT_NAME=$($versionInfo.ProductName)" "-DCOMPANY_NAME=$($versionInfo.CompanyName)" "-DPRODUCT_COPYRIGHT=$($versionInfo.Copyright)" "-DSETUP_HELPER=$helperPath" "-DMANIFEST=$manifestPath" `
             "-DSIGNATURE=$signaturePath" "-DFULL_PACKAGE_NAME=$($fullPackage.fileName)" "-DOUTPUT_DIRECTORY=$output" "-DUSER_CANCELLED_EXIT_CODE=$cancelCode" $script
         if ($LASTEXITCODE -ne 0) { throw "NSIS packaging failed with exit code $LASTEXITCODE." }
     } finally { Pop-Location }
 
     $setupInfo = Get-Item -LiteralPath $setupPath
+    $null = Assert-NetBootPEVersion -Path $setupPath -Version $version -Description 'NetBoot DHCP Tool Setup'
     $combinedSize = $setupInfo.Length + $fullInfo.Length
     $warningThreshold = 95000000L
     foreach ($asset in @(

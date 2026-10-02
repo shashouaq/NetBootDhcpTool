@@ -1,0 +1,6 @@
+<Project>
+  <PropertyGroup>
+    <!-- The SDK maps AssemblyTitle to the Windows FileDescription resource. -->
+    <AssemblyTitle>$(Description)</AssemblyTitle>
+  </PropertyGroup>
+</Project>

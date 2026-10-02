@@ -13,8 +13,7 @@ $root = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $identity = Get-NetBootReleaseIdentity -Tag $Tag -ReleaseCandidate:$ReleaseCandidate
 $output = [System.IO.Path]::GetFullPath($OutputDirectory)
 $appProject = Join-Path $root 'src\NetBootDhcpTool.App\NetBootDhcpTool.App.csproj'
-[xml]$project = Get-Content -LiteralPath $appProject
-$version = [string]$project.Project.PropertyGroup.Version
+$version = (Get-NetBootVersionMetadata -RepositoryRoot $root).Version
 if ($identity.Version -cne $version) { throw "Release tag $Tag does not match application version $version." }
 if (Test-Path -LiteralPath $output) { throw "Release output already exists; refusing to rebuild over it: $output" }
 if ($GitHubRepository -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { throw 'GitHubRepository must use owner/repository form.' }
@@ -73,6 +72,8 @@ try {
     $makensis = if (-not [string]::IsNullOrWhiteSpace($env:MAKENSIS_PATH)) { $env:MAKENSIS_PATH } else { 'makensis.exe' }
     & (Join-Path $root 'build\package-setup.ps1') -OutputDirectory $buildOutput -MakensisPath $makensis -DotnetPath $dotnet
     if ($LASTEXITCODE -ne 0) { throw "Setup packaging failed with exit code $LASTEXITCODE." }
+    . (Join-Path $root 'build\pe-version.ps1')
+    Assert-NetBootReleaseVersions -Directory $buildOutput -Version $version
 
     $sevenZip = 'C:\Program Files\7-Zip\7z.exe'
     if (-not (Test-Path -LiteralPath $sevenZip -PathType Leaf)) { throw '7-Zip is required to verify the release archives on the GitHub-hosted runner.' }

@@ -16,6 +16,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $script:MirrorRoot = Split-Path -Parent $PSScriptRoot
 $script:RepositoryRoot = $script:MirrorRoot
+Import-Module (Join-Path $script:MirrorRoot 'build/release-pipeline/ReleaseTransport.psm1') -Force
 . (Join-Path $PSScriptRoot 'Get-GiteeCredential.ps1') -LoadOnly
 . (Join-Path $script:MirrorRoot 'build\release-identity.ps1')
 $null = Get-NetBootReleaseIdentity -Tag $Tag -ReleaseCandidate:$ReleaseCandidate
@@ -59,6 +60,8 @@ function Invoke-MirrorHttp {
         [AllowEmptyString()][string]$Body,
         [string]$ContentType = 'application/json; charset=utf-8',
         [string]$OutFile,
+        [long]$ExpectedSize=-1,
+        [string]$ExpectedSha256,
         [string]$UploadFile,
         [hashtable]$FormFields = @{},
         [ValidateRange(1, 300)][int]$TimeoutSec = 45
@@ -86,7 +89,13 @@ function Invoke-MirrorHttp {
             $transferSeconds = if ($secondsMatch.Success) { [double]::Parse($secondsMatch.Groups['seconds'].Value, [Globalization.CultureInfo]::InvariantCulture) } else { [math]::Round($uploadTimer.Elapsed.TotalSeconds, 3) }
             $uploadedBytes = if ($uploadedMatch.Success) { [long]::Parse($uploadedMatch.Groups['bytes'].Value, [Globalization.CultureInfo]::InvariantCulture) } else { 0L }
             $speedBytesPerSecond = if ($speedMatch.Success) { [long]::Parse($speedMatch.Groups['bytesPerSecond'].Value, [Globalization.CultureInfo]::InvariantCulture) } else { 0L }
-            if ($statusCode -eq 0) { throw "Gitee attachment upload transport failed: curl_exit=$exitCode http_status=000 seconds=$transferSeconds uploaded_bytes=$uploadedBytes speed_bytes_per_second=$speedBytesPerSecond." }
+            if ($statusCode -eq 0) {
+                $category = Get-ReleaseTransportCategory $stats
+                if ($exitCode -eq 28) { $category='timeout' }
+                if ($exitCode -in @(18,52,55,56,92) -and $category -ne 'certificate') { $category='connection-reset' }
+                if ($exitCode -in @(51,60,77,83,90,91)) { $category='certificate' }
+                throw "Gitee attachment upload transport failed: [$category] curl_exit=$exitCode http_status=000 seconds=$transferSeconds uploaded_bytes=$uploadedBytes speed_bytes_per_second=$speedBytesPerSecond."
+            }
             $content = if (Test-Path -LiteralPath $responsePath -PathType Leaf) { [System.IO.File]::ReadAllText($responsePath) } else { '' }
             return [pscustomobject]@{ StatusCode = $statusCode; Content = $content; Headers = @{}; ExitCode = $exitCode; TimeSeconds = $transferSeconds; UploadedBytes = $uploadedBytes; SpeedBytesPerSecond = $speedBytesPerSecond }
         } finally {
@@ -94,62 +103,10 @@ function Invoke-MirrorHttp {
         }
     }
 
-    $requestTimer = [System.Diagnostics.Stopwatch]::StartNew()
-    $request = [System.Net.HttpWebRequest]::Create($Uri)
-    $request.Method = $Method
-    $request.Timeout = [Math]::Min([int]::MaxValue, $TimeoutSec * 1000)
-    $request.ReadWriteTimeout = [Math]::Min([int]::MaxValue, $TimeoutSec * 1000)
-    $request.AllowAutoRedirect = $true
-    $request.MaximumAutomaticRedirections = 10
-    foreach ($headerName in $Headers.Keys) {
-        switch ([string]$headerName) {
-            { $_ -ieq 'User-Agent' } { $request.UserAgent = [string]$Headers[$headerName]; continue }
-            { $_ -ieq 'Accept' } { $request.Accept = [string]$Headers[$headerName]; continue }
-            default { $request.Headers[[string]$headerName] = [string]$Headers[$headerName] }
-        }
+    if ($OutFile -and $ExpectedSize -ge 0 -and $ExpectedSha256) {
+        return Invoke-ReleaseDownload -Uri $Uri -Destination $OutFile -AssetName ([IO.Path]::GetFileName($OutFile)) -ExpectedSize $ExpectedSize -ExpectedSha256 $ExpectedSha256 -Stage mirror-readback
     }
-    if ($Method -in @('Post', 'Patch')) {
-        $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes([string]$Body)
-        $request.ContentType = $ContentType
-        $request.ContentLength = $bodyBytes.Length
-        $requestStream = $request.GetRequestStream()
-        try { $requestStream.Write($bodyBytes, 0, $bodyBytes.Length) }
-        finally { $requestStream.Dispose() }
-    }
-
-    $httpResponse = $null
-    try {
-        try { $httpResponse = [System.Net.HttpWebResponse]$request.GetResponse() }
-        catch [System.Net.WebException] {
-            if ($null -eq $_.Exception.Response) { throw }
-            $httpResponse = [System.Net.HttpWebResponse]$_.Exception.Response
-        }
-        $statusCode = [int]$httpResponse.StatusCode
-        $content = ''
-        $responseStream = $httpResponse.GetResponseStream()
-        if ($null -ne $responseStream) {
-            if ($OutFile -and $statusCode -ge 200 -and $statusCode -lt 300) {
-                $fileStream = [System.IO.File]::Open($OutFile, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
-                try { $responseStream.CopyTo($fileStream) }
-                finally { $fileStream.Dispose() }
-            } else {
-                $reader = [System.IO.StreamReader]::new($responseStream, [System.Text.Encoding]::UTF8, $true)
-                try { $content = $reader.ReadToEnd() }
-                finally { $reader.Dispose() }
-            }
-        }
-        $requestTimer.Stop()
-        return [pscustomobject]@{ StatusCode = $statusCode; Content = $content; Headers = $httpResponse.Headers; TimeSeconds = [math]::Round($requestTimer.Elapsed.TotalSeconds, 3) }
-    } catch {
-        $requestTimer.Stop()
-        $failure = $_.Exception
-        while ($null -ne $failure.InnerException) { $failure = $failure.InnerException }
-        $detail = "$($failure.GetType().Name): $($failure.Message)"
-        $detail = Protect-GiteeDiagnostic $detail
-        throw "HTTPS request to $(([uri]$Uri).Host) failed ($Method) after $([math]::Round($requestTimer.Elapsed.TotalSeconds, 3)) seconds: $detail"
-    } finally {
-        if ($null -ne $httpResponse) { $httpResponse.Dispose() }
-    }
+    return Invoke-ReleaseHttp -Uri $Uri -Method $Method -Headers $Headers -Body $Body -ContentType $ContentType -OutFile $OutFile -TimeoutSec $TimeoutSec -Stage mirror-api
 }
 
 function Get-MirrorSha256([string]$Path) {
@@ -450,7 +407,7 @@ function Assert-GiteePublicAsset([object]$Attachment, [object]$LocalAsset, [long
     $startedAt = [DateTimeOffset]::UtcNow
     try {
         $url = Get-GiteeMirrorDownloadUrl $Attachment $ReleaseId $Owner $Repository $Tag ([string]$LocalAsset.Name)
-        $response = Invoke-MirrorHttp -Uri $url -Headers @{ 'User-Agent' = 'NetBootDhcpTool-GiteeMirror/1.0' } -OutFile $path -TimeoutSec 180
+        $response = Invoke-MirrorHttp -Uri $url -Headers @{ 'User-Agent' = 'NetBootDhcpTool-GiteeMirror/1.0' } -OutFile $path -ExpectedSize $LocalAsset.Size -ExpectedSha256 $LocalAsset.Sha256 -TimeoutSec 180
         $endedAt = [DateTimeOffset]::UtcNow
         if ($response.StatusCode -ne 200 -or -not (Test-Path -LiteralPath $path -PathType Leaf)) {
             throw "Gitee $Stage public download failed for $($LocalAsset.Name) (HTTP $($response.StatusCode))."
@@ -517,7 +474,7 @@ function Download-VerifiedGitHubAsset([object]$Asset, [string]$Destination) {
     }
     $partialPath = $Destination + '.partial-' + [guid]::NewGuid().ToString('N')
     try {
-        $response = Invoke-MirrorHttp -Uri $downloadUrl.AbsoluteUri -Headers @{ 'User-Agent' = 'NetBootDhcpTool-GiteeMirror/1.0' } -OutFile $partialPath -TimeoutSec 180
+        $response = Invoke-MirrorHttp -Uri $downloadUrl.AbsoluteUri -Headers @{ 'User-Agent' = 'NetBootDhcpTool-GiteeMirror/1.0' } -OutFile $partialPath -ExpectedSize $Asset.size -ExpectedSha256 (Get-GitHubAssetSha256 $Asset) -TimeoutSec 180
         if ($response.StatusCode -ne 200) { throw "GitHub download failed for $($Asset.name) with HTTP $($response.StatusCode)." }
         $null = Assert-GitHubAssetFile $Asset $partialPath
         Move-Item -LiteralPath $partialPath -Destination $Destination -Force
@@ -541,7 +498,11 @@ function New-GiteeReleaseForMirror([string]$Tag, [string]$Owner, [string]$Reposi
         prerelease = $true
     }
     $uri = "https://gitee.com/api/v5/repos/$Owner/$Repository/releases"
-    $response = Invoke-MirrorHttp -Uri $uri -Method Post -Headers (Get-GiteeApiHeaders $Token) -Body (ConvertTo-Json -InputObject $payload -Depth 8 -Compress)
+    try { $response = Invoke-MirrorHttp -Uri $uri -Method Post -Headers (Get-GiteeApiHeaders $Token) -Body (ConvertTo-Json -InputObject $payload -Depth 8 -Compress) }
+    catch {
+        if ($_.Exception.Message -match 'certificate|permanent-transport') { throw }
+        $response = [pscustomobject]@{StatusCode=0;Content=''}
+    }
     if ($response.StatusCode -notin @(200, 201)) {
         $recovered = Get-GiteeReleaseForMirror $Tag $Owner $Repository $Token
         if ($null -eq $recovered) { throw "Gitee Release creation returned HTTP $($response.StatusCode); no Release for $Tag was confirmed." }
@@ -741,7 +702,13 @@ function Publish-GiteeMirror {
             $uploadTimer = [System.Diagnostics.Stopwatch]::StartNew()
             $uploadEndedAt = $null
             try {
-                $upload = Invoke-MirrorHttp -Uri $uploadUri -Method Post -Headers $headers -UploadFile $local.Path -FormFields @{ access_token = $Token } -TimeoutSec $UploadTimeoutSec
+                try {
+                    $upload = Invoke-MirrorHttp -Uri $uploadUri -Method Post -Headers $headers -UploadFile $local.Path -FormFields @{ access_token = $Token } -TimeoutSec $UploadTimeoutSec
+                } catch {
+                    if ($_.Exception.Message -match 'certificate|permanent-transport' -or (Get-ReleaseTransportCategory $_) -eq 'permanent-transport') { throw }
+                    # The server may already have stored it. Reconcile by name, then size/SHA before continuing.
+                    $upload = [pscustomobject]@{StatusCode=0;Content='';ExitCode=$null;TimeSeconds=$uploadTimer.Elapsed.TotalSeconds;UploadedBytes=$null;SpeedBytesPerSecond=$null;Headers=@{}}
+                }
                 $uploadTimer.Stop()
                 $uploadEndedAt = [DateTimeOffset]::UtcNow
                 $elapsed = if ($null -ne $upload.TimeSeconds) { [double]$upload.TimeSeconds } else { [math]::Round($uploadTimer.Elapsed.TotalSeconds, 3) }

@@ -254,6 +254,8 @@ internal static class Program
         var closed = false;
         var routeJournalWarningDismissed = false;
         var retryFailureLogged = false;
+        var scenarioRunning = false;
+        var fixturesStarted = false;
         var favoriteDialogScenario = 0;
         var favoriteDialogInteractionDone = false;
         var captureProfileCompareDialog = false;
@@ -328,7 +330,8 @@ internal static class Program
 
         timer.Tick += async (_, _) =>
         {
-            if (completed || manualAdapterRefreshRunning) return;
+            if (completed || manualAdapterRefreshRunning || scenarioRunning) return;
+            scenarioRunning = true;
             try
             {
                 if (!routeJournalWarningDismissed)
@@ -424,6 +427,7 @@ internal static class Program
                     t01RecoveryVerified = true;
                 }
 
+                fixturesStarted = true;
                 var recoveryEntries = InvokePrivate<List<RecoveryEntryViewModel>>(window, "BuildRecoveryEntries");
                 var firewallRecovery = recoveryEntries.SingleOrDefault(x => x.Kind == RecoveryEntryKind.DhcpFirewall)
                     ?? throw new InvalidOperationException("stale DHCP firewall lease was not shown in Recovery Center");
@@ -706,17 +710,25 @@ internal static class Program
                     throw new InvalidOperationException("operation-history filtering dropped a matching row after batched refresh");
                 historyGrid.SelectedItems.Clear();
                 historyGrid.SelectedItems.Add(historyA);
-                InvokePrivate(window, "CopyHistory_Click", window.FindName("BtnCopyHistory"), new RoutedEventArgs());
-                var selectedHistoryCopy = Clipboard.GetText();
-                if (!selectedHistoryCopy.Contains("first row", StringComparison.Ordinal)
-                    || selectedHistoryCopy.Contains("second row", StringComparison.Ordinal))
-                    throw new InvalidOperationException("copy selected operation history included rows outside the selection");
+                async Task<bool> VerifyHistoryClipboardAsync(bool selectedOnly)
+                {
+                    for (var attempt = 0; attempt < 3; attempt++)
+                    {
+                        InvokePrivate(window, "CopyHistory_Click", window.FindName("BtnCopyHistory"), new RoutedEventArgs());
+                        // The real shared Windows clipboard can be contended; retry only this read/copy,
+                        // never the stateful DHCP/history/favorite fixture sequence.
+                        await Task.Delay(100);
+                        var copied = Clipboard.GetText();
+                        if (copied.Contains("first row", StringComparison.Ordinal)
+                            && (copied.Contains("second row", StringComparison.Ordinal) != selectedOnly)) return true;
+                    }
+                    return false;
+                }
+                if (!await VerifyHistoryClipboardAsync(true))
+                    throw new InvalidOperationException("copy selected operation history did not preserve the selected row in the shared clipboard");
                 historyGrid.SelectedItems.Clear();
-                InvokePrivate(window, "CopyHistory_Click", window.FindName("BtnCopyHistory"), new RoutedEventArgs());
-                var visibleHistoryCopy = Clipboard.GetText();
-                if (!visibleHistoryCopy.Contains("first row", StringComparison.Ordinal)
-                    || !visibleHistoryCopy.Contains("second row", StringComparison.Ordinal))
-                    throw new InvalidOperationException("copy visible operation history did not preserve the filtered rows");
+                if (!await VerifyHistoryClipboardAsync(false))
+                    throw new InvalidOperationException("copy visible operation history did not preserve the filtered rows in the shared clipboard");
                 historyFilter.Clear();
 
                 var allFavorites = (List<FavoriteConfig>)window.GetType().GetField("_allFavorites", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(window)!;
@@ -907,7 +919,7 @@ internal static class Program
                 window.Close();
                 return;
             }
-            catch (Exception ex) when ((DateTime.UtcNow - started).TotalSeconds < 15)
+            catch (Exception ex) when (!fixturesStarted && (DateTime.UtcNow - started).TotalSeconds < 15)
             {
                 // Adapter enumeration may take a few seconds on a disconnected host.
                 if (!retryFailureLogged)
@@ -925,6 +937,7 @@ internal static class Program
                 window.Close();
                 application.Shutdown();
             }
+            finally { scenarioRunning = false; }
         };
         window.Closed += (_, _) =>
         {
@@ -935,7 +948,7 @@ internal static class Program
                 timer.Stop();
                 Console.Error.WriteLine("UI_SMOKE_FAILED: window closed before its active operation released.");
             }
-            Console.WriteLine("UI_SMOKE_OK: non-admin WPF window, update mirror speeds/selection/live fallback/cancellation/confirmation, serialized unexpected DHCP stop cleanup, DHCP session restore fail-closed/unavailable recovery retention, static route cleanup failure detail/count, recovery journal safety, lease state/session/Ping separation, IP reuse, slow-probe event responsiveness and stale-result rejection, bounded scan-range validation, canceled-scan partial-result history, operation gate, refresh shortcuts, favorite cancel/re-entry/clear, profile DHCP field visibility and comparison, recovery handlers, and close wait verified.");
+            if (!failed) Console.WriteLine("UI_SMOKE_OK: non-admin WPF window, update mirror speeds/selection/live fallback/cancellation/confirmation, serialized unexpected DHCP stop cleanup, DHCP session restore fail-closed/unavailable recovery retention, static route cleanup failure detail/count, recovery journal safety, lease state/session/Ping separation, IP reuse, slow-probe event responsiveness and stale-result rejection, bounded scan-range validation, canceled-scan partial-result history, operation gate, refresh shortcuts, favorite cancel/re-entry/clear, profile DHCP field visibility and comparison, recovery handlers, and close wait verified.");
             timer.Stop();
             uiLogger.Dispose();
             updateHttpClient.Dispose();

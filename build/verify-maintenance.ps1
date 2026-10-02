@@ -1,12 +1,10 @@
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$projectPath = Join-Path $repoRoot 'src\NetBootDhcpTool.App\NetBootDhcpTool.App.csproj'
-[xml]$project = Get-Content -LiteralPath $projectPath
-$version = [string]$project.Project.PropertyGroup.Version
-if ([string]::IsNullOrWhiteSpace($version)) { throw 'Application version is missing from the app project.' }
-if ([string]$project.Project.PropertyGroup.AssemblyVersion -ne "$version.0" -or [string]$project.Project.PropertyGroup.FileVersion -ne "$version.0") {
-    throw "AssemblyVersion and FileVersion must match application version $version.0."
-}
+. (Join-Path $PSScriptRoot 'release-identity.ps1')
+$metadata = Get-NetBootVersionMetadata -RepositoryRoot $repoRoot
+$version = $metadata.Version
+[xml]$app = Get-Content (Join-Path $repoRoot 'src/NetBootDhcpTool.App/NetBootDhcpTool.App.csproj')
+if ($app.Project.PropertyGroup.Version -or $app.Project.PropertyGroup.AssemblyVersion -or $app.Project.PropertyGroup.FileVersion) { throw 'App must inherit version metadata from the single version source.' }
 
 $readme = Get-Content -Raw -LiteralPath (Join-Path $repoRoot 'README.md')
 $maintenance = Get-Content -Raw -LiteralPath (Join-Path $repoRoot 'docs\MAINTENANCE_GUIDE.md')

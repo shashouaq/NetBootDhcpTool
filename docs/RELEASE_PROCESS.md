@@ -16,8 +16,11 @@ Evidence: `D:\Release\_t19_formal_finalization_20261001\formal-acceptance-summar
 
 ## Version Source
 
-- The application version is defined in `src/NetBootDhcpTool.App/NetBootDhcpTool.App.csproj`.
-- `build/publish.ps1` reads that version and must not use a separate hard-coded version.
+- `build/Version.props` is the checked-in product version and identity source. `Directory.Build.props` imports it for App, Updater, SetupHelper and supporting projects; individual project files must not override Version/AssemblyVersion/FileVersion. Explicit MSBuild `-p:Version` is reserved for isolated validation or an authorized build.
+- `build/release-identity.ps1` reads that same source for local packaging, hosted formal/RC preparation, installer compilation, maintenance checks and the archived publisher. NSIS has no independent default version.
+- SemVer `M.m.p[-prerelease][+metadata]` maps to numeric Windows FileVersion/AssemblyVersion/VIProductVersion/VIFileVersion `M.m.p.0` (components 0..65534). String ProductVersion/InformationalVersion retains the target SemVer; automatic source SHA suffixes are disabled. Existing RC protocol remains unchanged: the RC tag carries `-rc.N`, while its signed manifest and binaries use the base product version. No released RC or stable asset is restamped.
+- NSIS receives both PRODUCT_VERSION and PE_VERSION, plus ProductName/FileDescription/CompanyName/LegalCopyright. App, Updater and SetupHelper share identity and carry component descriptions.
+- `build/pe-version.ps1` checks real PE resources, portable/Full inventories, filenames and embedded install/update/latest-v2 versions. Hosted preparation runs it before exposing a bundle for publication; `package-setup.ps1` independently checks SetupHelper and final Setup. A mismatch stops preparation.
 - Release tags must use `v<version>`, for example `v1.0.12`.
 - RCs use explicit `v<version>-rc.<N>` tags and remain prereleases. Run `release-candidate.yml` from main only after that exact commit passed Windows CI and the local T19 process/lifecycle gates. The RC job repeats the official NuGet audit, uses the protected signing secret once, and reads back each asset. It never calls the stable promotion path; `-ReleaseCandidate` rejects stable tags and formal mode rejects RC tags.
 - The repository targets .NET 10 and pins SDK `10.0.401` in `global.json`. Use `build/resolve-dotnet.ps1` so local builds honor that pin; it bootstraps the pinned SDK when needed.
@@ -48,6 +51,26 @@ git diff --check
 For static-route-specific acceptance, follow the [maintenance guide](MAINTENANCE_GUIDE.md#standard-change-workflow); it defines the isolated Hyper-V route smoke and evidence required.
 
 For documentation-only checks and change-log requirements, follow the [maintenance guide](MAINTENANCE_GUIDE.md#verification-evidence). A full build is not required unless the documentation changes packaging or release behavior.
+
+## Release HTTP resilience / post-v1.1.0 maintenance
+
+`build/release-pipeline/ReleaseTransport.psm1` owns HTTPS reads/downloads and classification. Callers include GitHub formal/RC CI and release/asset lookup, GitHub anonymous asset readback, independent Gitee source discovery/attachments/public readback, DPAPI credential permission checks, and archived publisher reads. Application/updater protocol, signing, dual-source rules and credential storage remain governed by their existing contracts.
+
+- GET defaults to four logical attempts (initial + three retries), configurable 1..6. Retry EOF, connection/read timeout, connection reset, interrupted TLS, connection resolution/refusal, HTTP 408/429/500..599. Exponential delay 2/4/8 seconds plus 0..2 seconds jitter; Retry-After integer/date takes precedence. A wait exceeding 60 seconds fails this run rather than waiting indefinitely.
+- Certificate/trust/revocation errors, unknown permanent transport errors, HTTP 401/403/404 and other permanent 4xx do not retry. A lookup may explicitly interpret 404 as absence. Hash/size/signature/version/immutable-name conflicts fail at their owning gate.
+- PowerShell connects within 15 seconds; API read idle timeout defaults to 30 seconds. PowerShell 7.4+ uses separate connection/operation timeout parameters; older versions use equivalent native timeouts and HTTPS-only redirects. Curl connects within 15 seconds, has a 180-second total timeout and a 60-second stalled-transfer guard. TLS verification is always enabled.
+- A GitHub GET EOF/interrupted TLS may use `reliable_http.py` with pinned `httpx==0.28.1`. This is one fallback per logical attempt, so there are at most four primary and four fallback GETs by default. Child lifetime is bounded at 240 seconds; HTTPX has explicit connect/read/write/pool timeouts. Only GitHub HTTPS hosts are allowed; redirects must retain HTTPS and cannot contain userinfo. Certificate errors never select fallback. CI installs `requirements.txt`; local runs may specify NETBOOT_HTTPX_PYTHON/NETBOOT_HTTPX_PYTHONPATH for an existing isolated runtime.
+- API credentials travel through child stdin, never command arguments. Public asset GETs are anonymous. Logs contain stage/category/attempt/elapsed/delay without tokens, Authorization headers or raw transport exception text.
+- Downloads use unique partial files; expected size/SHA-256 is checked before atomic promotion. Binary Python fallback requires both expected fields. Old metadata without a digest may use native readback into temporary storage followed by the existing immutable local-byte comparison; it cannot use unchecked Python fallback.
+- POST/PATCH/DELETE get one transport attempt and zero automatic redirects on every supported PowerShell path; a 307/308 cannot silently repeat the write. After an uncertain create/upload reply, the publisher queries the exact tag/name/attachment and verifies identity, size/hash and bytes before reusing it. It never treats transport retry as write idempotency. Same-name different-byte assets still fail; release state/cache, frozen legacy manifests and DPAPI cleanup remain authoritative.
+
+Offline regression entries: `build/tests/http-resilience.tests.ps1`, `release-resilience.tests.ps1`, `gitee-mirror.tests.ps1`, `gitee-credential.tests.ps1`, `pe-version.tests.ps1` and `python-http.tests.py`. PE regression requires pinned NSIS 3.12. For a complete prepared bundle, dot-source `build/pe-version.ps1` and run `Assert-NetBootReleaseVersions -Directory <bundle> -Version <target>` in addition to signature/hash gates. See [T30](tasks/T30.md) for current local evidence and the isolated Test N+1 boundary.
+
+## Fresh official dependency audit
+
+`build/release-pipeline/Invoke-FreshNuGetAudit.ps1` is shared by Windows CI, RC and the formal build job before signing. It creates a new evidence directory/HTTP cache, restores with --force-evaluate/--no-http-cache, uses only the official NuGet v3 source and audits all transitive dependencies at low severity. It records the dependency graph and a fresh vulnerable-package query, verifies every source project/framework is represented, and rejects NU1900..NU1905, query errors and reported vulnerabilities. Existing evidence is never overwritten; the HTTP cache environment is restored in finally. An unavailable feed is a failed audit, not a clean report. Offline gate regressions are in `build/tests/nuget-audit.tests.ps1`.
+
+The 2026-10-02 local 1.1.1 preparation has successful product/tool regressions and test-key bundle checks, but local NuGet TLS/NU1900 prevents fresh audit acceptance. The user subsequently authorized the complete release workflow. Require exact source CI plus the formal job's independent fresh audit before production signing/publication. The current accepted official release remains v1.1.0 until new publication and public acceptance succeed. Test-key assets cannot be uploaded.
 
 ## Installer result and isolation
 

@@ -94,6 +94,8 @@ function Reset-MirrorMock([object]$Fixture) {
         GiteeFiles = @{}
         NextAttachmentId = 500
         UploadCount = 0
+        LoseUploadResponse = $false
+        LoseCreateResponse = $false
         GiteeApiCallCount = 0
         EventLog = [System.Collections.Generic.List[string]]::new()
     }
@@ -108,6 +110,8 @@ function Invoke-MirrorHttp {
         [AllowEmptyString()][string]$Body,
         [string]$ContentType = 'application/json; charset=utf-8',
         [string]$OutFile,
+        [long]$ExpectedSize=-1,
+        [string]$ExpectedSha256,
         [string]$UploadFile,
         [hashtable]$FormFields = @{},
         [ValidateRange(1, 900)][int]$TimeoutSec = 45
@@ -129,6 +133,7 @@ function Invoke-MirrorHttp {
         $attachment = [ordered]@{ id = $id; name = $name; size = [long](Get-Item -LiteralPath $destination).Length; browser_download_url = "https://gitee.com/joel20230302/NetBootDhcpTool/releases/download/$($global:GiteeMirrorMock.Fixture.Tag)/$name" }
         $global:GiteeMirrorMock.Attachments.Add($attachment)
         $content = ConvertTo-Json -InputObject $attachment -Compress
+        if($global:GiteeMirrorMock.LoseUploadResponse){$global:GiteeMirrorMock.LoseUploadResponse=$false;throw '[eof] unexpected EOF after storage'}
     } elseif ($uriObject.Host -eq 'api.github.com' -and $uriObject.AbsolutePath -match '/releases/tags/v1\.0\.20(?:-rc\.1)?$') {
         Assert-True ($Headers.Authorization -ceq 'Bearer test-github-token') 'GitHub Release REST requests must use the supplied read-only token.'
         $content = ConvertTo-Json -InputObject $global:GiteeMirrorMock.Fixture.Release -Depth 8 -Compress
@@ -148,6 +153,7 @@ function Invoke-MirrorHttp {
         $payload = ConvertFrom-Json -InputObject $Body -AsHashtable
         $global:GiteeMirrorMock.Release = [ordered]@{ id = 456; tag_name = [string]$payload.tag_name; name = [string]$payload.name; body = [string]$payload.body; prerelease = [bool]$payload.prerelease }
         $content = ConvertTo-Json -InputObject $global:GiteeMirrorMock.Release -Depth 8 -Compress
+        if($Method -eq 'Post' -and $global:GiteeMirrorMock.LoseCreateResponse){$global:GiteeMirrorMock.LoseCreateResponse=$false;throw '[eof] unexpected EOF after creation'}
     } elseif ($uriObject.Host -eq 'gitee.com' -and $uriObject.AbsolutePath -match '/releases/456/attach_files/(?<id>\d+)$' -and $Method -eq 'Get') {
         $global:GiteeMirrorMock.GiteeApiCallCount++
         $id = $Matches.id
@@ -329,6 +335,17 @@ try {
     Assert-True $stableReuseRejected 'A stable Gitee Release cannot be repurposed as an RC.'
     $script:MirrorIsCandidate = $false
 
+    $script:MirrorIsCandidate=$false
+    $lostFixtureRoot=Join-Path $testRoot 'lost-response'
+    New-Item -ItemType Directory $lostFixtureRoot|Out-Null
+    $lostFixture=New-MirrorFixture $lostFixtureRoot
+    Reset-MirrorMock $lostFixture
+    $global:GiteeMirrorMock.LoseUploadResponse=$true
+    $global:GiteeMirrorMock.LoseCreateResponse=$true
+    $recovered=Publish-GiteeMirror -Tag $lostFixture.Tag -Token 'test-token' -AssetDirectory $lostFixtureRoot
+    Assert-True ($global:GiteeMirrorMock.UploadCount -eq $lostFixture.Assets.Count) 'Lost upload reply caused duplicate POST.'
+    Assert-True (@($recovered.UploadTimings.Values|Where-Object State -EQ RECOVERED).Count -eq 1) 'Lost stored upload was not recovered by size/SHA readback.'
+    Write-Output 'GITEE_UNKNOWN_WRITE_RECONCILIATION_OK create=1 upload=1 duplicate_posts=0'
     Write-Output 'GITEE_MIRROR_TESTS_OK api_only=1 asset_directory=1 local_hash_hard_fail=1 promote_after_public_hash=1 resume=1 mismatched_sha_hard_fail=1 duplicates_preserved=1 size_preflight=1 reject_before_gitee_write=1'
 } finally {
     if ($null -eq $priorGitHubToken) { Remove-Item Env:GITHUB_TOKEN -ErrorAction SilentlyContinue } else { $env:GITHUB_TOKEN = $priorGitHubToken }

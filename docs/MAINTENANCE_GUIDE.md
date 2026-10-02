@@ -1,4 +1,4 @@
-# Maintenance Guide
+﻿# Maintenance Guide
 
 This guide is the operating standard for maintaining NetBoot DHCP Tool. Follow it for every code, configuration, documentation, packaging, and release change.
 
@@ -16,7 +16,8 @@ The 2026-09-23 audit baseline and unperformed real-network checks are recorded i
 - Gitee distribution repository: `https://gitee.com/joel20230302/NetBootDhcpTool`
 - Default branch: `main`
 - Release tag format: `v<version>`
-- Current application version: `1.1.0`
+- Current application version: `1.1.1`
+- Publication state: v1.1.1 release authorized on 2026-10-02; exact CI, production build and public acceptance pending. Latest accepted formal release remains v1.1.0 until those gates pass.
 - Target framework: .NET 10; the repository pins SDK `10.0.401` in `global.json` with `latestFeature` roll-forward.
 - Resolve the SDK through `build/resolve-dotnet.ps1`; it honors the repository pin and bootstraps that SDK when needed. The first run may need network access.
 - Legacy GitHub manifest URL (frozen for ZIP-only clients):
@@ -152,7 +153,11 @@ For ordinary application changes without explicit publication authorization, sto
 
 ## Version Upgrade Workflow
 
-Update the version in `src/NetBootDhcpTool.App/NetBootDhcpTool.App.csproj`, review intentional old-version references, and synchronize the user summary in `docs/RELEASE_NOTES.md` with the applicable `docs/FEATURE_CHANGELOG.md` section. Use [RELEASE_PROCESS](RELEASE_PROCESS.md) for the sole set of release validation, packaging, commit/tag, GitHub upload, and remote verification steps.
+Update the version only in `build/Version.props`, review intentional old-version references, and synchronize the user summary in `docs/RELEASE_NOTES.md` with the applicable `docs/FEATURE_CHANGELOG.md` section. Use [RELEASE_PROCESS](RELEASE_PROCESS.md) for the sole set of release validation, packaging, commit/tag, GitHub upload, and remote verification steps.
+
+PE metadata and release transport checks are part of Windows CI. Run `build/tests/pe-version.tests.ps1` with NSIS 3.12, `build/tests/http-resilience.tests.ps1`, `build/tests/release-resilience.tests.ps1` and `python build/tests/python-http.tests.py` with the pinned fallback requirements, plus existing release/mirror/credential regressions. Complete bundle preparation must pass `Assert-NetBootReleaseVersions` before publication. Follow [release resilience rules](RELEASE_PROCESS.md) for retries, verified partial files and uncertain-write reconciliation.
+
+The 2026-10-01 maintenance delivery ended at source version 1.1.0. The 2026-10-02 follow-up prepares a local 1.1.1 draft, including write-redirect and anonymous-fallback regression fixes; formal publication still requires explicit authorization. Test N+1 uses a separate source snapshot, temporary test trust key and owned integration roots; it is not a formal 1.1.1 release. The immutable v1.1.0 tag/assets and frozen legacy manifests must not be rebuilt or replaced. [T30](tasks/T30.md) records implementation and local evidence; T19 remains DONE / ACCEPTED.
 
 ## Local Cleanup Policy
 

@@ -1,6 +1,6 @@
 # NetBoot DHCP Tool
 
-Version: 1.1.0
+Version: 1.1.1
 
 Authors: Joel & Codex
 
@@ -8,9 +8,9 @@ Windows portable IPv4 DHCP, adapter IP configuration, IPv4/IPv6 static route rul
 
 ## Maintenance Entry / 维护入口
 
-Start with the [maintenance guide](docs/MAINTENANCE_GUIDE.md), then read only the selected [approved work item](docs/TODO.md) and its source references. [PROJECT_MEMORY.md](PROJECT_MEMORY.md) holds stable product/network boundaries; the [release process](docs/RELEASE_PROCESS.md) owns publication steps. The [change log](docs/FEATURE_CHANGELOG.md) records completed changes, not future work. T01-T29 implementation and acceptance status is tracked in the [work-item index](docs/TODO.md); the most recently published version is recorded in the [release process](docs/RELEASE_PROCESS.md).
+Start with the [maintenance guide](docs/MAINTENANCE_GUIDE.md), then read only the selected [approved work item](docs/TODO.md) and its source references. [PROJECT_MEMORY.md](PROJECT_MEMORY.md) holds stable product/network boundaries; the [release process](docs/RELEASE_PROCESS.md) owns publication steps. The [change log](docs/FEATURE_CHANGELOG.md) records completed changes, not future work. T01-T30 implementation and acceptance status is tracked in the [work-item index](docs/TODO.md); the most recently published version is recorded in the [release process](docs/RELEASE_PROCESS.md).
 
-维护顺序：维护指南 → 待办索引 → 单个任务及相关代码。T01-T29 的实施与验收状态以[待办索引](docs/TODO.md)为准；发布步骤及远端发布证据以[发布流程](docs/RELEASE_PROCESS.md)为准。无需每次读取全部任务或历史日志。仅明确授权“发布/release”后才能提交、推送或发布。
+维护顺序：维护指南 → 待办索引 → 单个任务及相关代码。T01-T30 的实施与验收状态以[待办索引](docs/TODO.md)为准；发布步骤及远端发布证据以[发布流程](docs/RELEASE_PROCESS.md)为准。无需每次读取全部任务或历史日志。仅明确授权“发布/release”后才能提交、推送或发布。
 
 At startup, the application claims a system-wide mutex keyed by the normalized full data-directory path before it migrates legacy files, creates defaults, or reads recovery journals. The owner keeps the mutex through asynchronous exit cleanup. A second process shows a bilingual notice and exits without changing shared files; an abnormal exit releases the mutex so a later run can inspect the preserved recovery data.
 
@@ -32,7 +32,7 @@ Every application action button has a small, visible-by-default round `?` help i
 
 ## Version Check
 
-The application displays its running version when it starts. The 1.1.0 migration candidate uses a separate signed `latest-v2.json` channel and Full 7z packages; the legacy `latest.json` channel remains frozen for ZIP-only clients. Users upgrading from older versions must run the full Setup once. It preserves user configuration and data, then subsequent releases use in-app 7z updates. The app probes only mirrors whose signed version, package filename, size, and SHA-256 match, prioritizes the faster eligible source, and falls back to the other approved source when a mirror fails. The updater independently verifies the manifest signature and package bytes, applies one transaction through safe staging and rollback, then verifies startup health. This 1.1.0 candidate has not been formally released.
+The application displays its running version when it starts. The accepted v1.1.0 release introduced a separate signed `latest-v2.json` channel and Full 7z packages; the legacy `latest.json` channel remains frozen for ZIP-only clients. Users upgrading from older versions must run the full Setup once. It preserves user configuration and data, then subsequent releases use in-app 7z updates. The app probes only mirrors whose signed version, package filename, size, and SHA-256 match, prioritizes the faster eligible source, and falls back to the other approved source when a mirror fails. The updater independently verifies the manifest signature and package bytes, applies one transaction through safe staging and rollback, then verifies startup health. The v1.1.1 maintenance release is authorized and awaits exact CI, production signing and public acceptance. The accepted v1.1.0 release remains immutable.
 
 ## Build
 

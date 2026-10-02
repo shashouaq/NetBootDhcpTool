@@ -5,6 +5,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AssemblyName>NetBootDhcpTool.SetupHelper</AssemblyName>
+    <Description>NetBoot DHCP Tool Setup Helper</Description>
     <RootNamespace>NetBootDhcpTool.SetupHelper</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
   </PropertyGroup>

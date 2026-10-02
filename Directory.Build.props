@@ -1,0 +1,14 @@
+<Project>
+  <Import Project="$(MSBuildThisFileDirectory)build/Version.props" />
+  <PropertyGroup>
+    <NetBootNumericVersion>$([System.Text.RegularExpressions.Regex]::Replace('$(Version)', '^([0-9]+\.[0-9]+\.[0-9]+)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$', '$1.0'))</NetBootNumericVersion>
+    <AssemblyVersion>$(NetBootNumericVersion)</AssemblyVersion>
+    <FileVersion>$(NetBootNumericVersion)</FileVersion>
+    <InformationalVersion>$(Version)</InformationalVersion>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+    <Product>$(NetBootProductName)</Product>
+    <Company>$(NetBootCompanyName)</Company>
+    <Copyright>$(NetBootCopyright)</Copyright>
+    <Description Condition="'$(Description)' == ''">$(MSBuildProjectName)</Description>
+  </PropertyGroup>
+</Project>

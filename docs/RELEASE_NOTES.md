@@ -1,5 +1,25 @@
 ﻿# Release Notes
 
+## v1.1.1
+
+### zh-CN
+
+本版本统一 Windows 文件版本属性，并提高发布工具处理临时网络故障的可靠性。
+
+- App、Updater、SetupHelper 和 Setup 的 Windows 文件属性统一显示产品版本与组件说明。
+- 发布工具为 GitHub/Gitee 读取增加有限重试和受校验的只读 fallback；未知上传结果先核对已存资产，写请求不自动跟随重定向。
+- v1.1.0 已完成首次安装的用户沿用应用内 Full 7z 更新；更早版本仍需通过匹配的 Setup 与 Full 7z 完成一次完整安装。
+- 安装和更新继续使用既有签名、文件校验、启动健康确认及回滚流程，保留用户数据。
+
+### en-US
+
+This maintenance release aligns Windows file version properties and improves release tooling reliability during transient network failures.
+
+- Windows file properties show consistent product versions and component descriptions for App, Updater, SetupHelper and Setup.
+- Release tooling adds bounded retries and verified read-only fallback for GitHub/Gitee reads. Uncertain uploads are reconciled against stored assets; write requests do not follow redirects automatically.
+- Users already migrated through v1.1.0 continue using in-app Full 7z updates. Older versions still require one full installation using the matching Setup and Full 7z.
+- Installation and updates retain the existing signature, inventory, startup-health and rollback checks and preserve user data.
+
 ## v1.1.0
 
 ### zh-CN

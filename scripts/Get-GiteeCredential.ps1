@@ -62,25 +62,18 @@ function Invoke-GiteeCredentialQuery {
         $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Credential)
         $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
         if ([string]::IsNullOrWhiteSpace($plain) -or $plain -match '[\r\n\x00]') { throw 'Gitee credential is empty or malformed; configure it explicitly.' }
-        Add-Type -AssemblyName System.Net.Http
-        $handler = [Net.Http.HttpClientHandler]::new()
-        $handler.AllowAutoRedirect = $false
-        $client = [Net.Http.HttpClient]::new($handler)
-        $client.Timeout = [TimeSpan]::FromSeconds(30)
-        $client.DefaultRequestHeaders.Authorization = [Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer', $plain)
-        $client.DefaultRequestHeaders.UserAgent.ParseAdd('NetBootDhcpTool-CredentialCheck/1.0')
-        $response = $client.GetAsync('https://gitee.com/api/v5' + $RelativePath).GetAwaiter().GetResult()
+        Import-Module (Join-Path $script:GiteeCredentialRepositoryRoot 'build/release-pipeline/ReleaseTransport.psm1')
+        $response = Invoke-ReleaseHttp -Uri ('https://gitee.com/api/v5' + $RelativePath) -Headers @{Authorization=('Bearer '+$plain);'User-Agent'='NetBootDhcpTool-CredentialCheck/1.0'} -MaximumRedirection 0 -Stage credential-read
         $status = [int]$response.StatusCode
         $record = $null
         if ($status -eq 200) {
-            $body = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
-            try { $record = $body | ConvertFrom-Json -ErrorAction Stop } catch { throw 'Gitee credential query returned invalid JSON.' }
+            try { $record = $response.Content | ConvertFrom-Json -ErrorAction Stop } catch { throw 'Gitee credential query returned invalid JSON.' }
         }
         return [pscustomobject]@{ HttpStatus=$status; Record=$record }
     } catch {
         throw 'Gitee credential query could not complete. Check connectivity; the saved credential was not replaced or deleted.'
     } finally {
-        if ($response) { $response.Dispose() }; if ($client) { $client.Dispose() } elseif ($handler) { $handler.Dispose() }
+        if ($client) { $client.Dispose() } elseif ($handler) { $handler.Dispose() }
         if ($bstr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
         $plain = $null
     }

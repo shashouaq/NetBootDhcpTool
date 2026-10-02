@@ -21,7 +21,9 @@ $cancelCode = [int][regex]::Match($codeSource, 'Cancelled\s*=\s*(\d+)').Groups[1
 $manifest = Join-Path $fixture 'cases\success\manifest.json'
 $signature = Join-Path $fixture 'cases\success\manifest.sig'
 $helper = Join-Path $fixture 'helper\NetBootDhcpTool.SetupHelper.exe'
-& $MakensisPath '-DPRODUCT_VERSION=1.1.0' "-DSETUP_HELPER=$helper" "-DMANIFEST=$manifest" "-DSIGNATURE=$signature" '-DFULL_PACKAGE_NAME=NetBootDhcpTool-full-v1.1.0.7z' "-DOUTPUT_DIRECTORY=$test" "-DUSER_CANCELLED_EXIT_CODE=$cancelCode" (Join-Path $repo 'installer\NetBootDhcpTool.Setup.nsi') *> (Join-Path $test 'compile.log')
+. (Join-Path $repo 'build/release-identity.ps1')
+$metadata = Get-NetBootVersionMetadata -Version '1.1.0'
+& $MakensisPath '-DPRODUCT_VERSION=1.1.0' "-DPE_VERSION=$($metadata.NumericVersion)" "-DPRODUCT_NAME=$($metadata.ProductName)" "-DCOMPANY_NAME=$($metadata.CompanyName)" "-DPRODUCT_COPYRIGHT=$($metadata.Copyright)" "-DSETUP_HELPER=$helper" "-DMANIFEST=$manifest" "-DSIGNATURE=$signature" '-DFULL_PACKAGE_NAME=NetBootDhcpTool-full-v1.1.0.7z' "-DOUTPUT_DIRECTORY=$test" "-DUSER_CANCELLED_EXIT_CODE=$cancelCode" (Join-Path $repo 'installer\NetBootDhcpTool.Setup.nsi') *> (Join-Path $test 'compile.log')
 if ($LASTEXITCODE -ne 0) { throw 'Cancellation Setup compilation failed.' }
 Add-Type @'
 using System;

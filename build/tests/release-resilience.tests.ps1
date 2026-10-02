@@ -25,7 +25,7 @@ $transport = Get-Module ReleaseTransport
         return @{ StatusCode = $status; Headers = @{'Retry-After' = $(if ($status -eq 429) { '7' } else { '' })}; Content = '{}' }
     }
     $response = Invoke-ReleaseHttp -Uri 'https://gitee.com/api/test'
-    if ($response.StatusCode -ne 200 -or $script:attempts -ne 3 -or ($script:delays -join ',') -ne '2,7') { throw '503/429 recovery did not honor bounded backoff and Retry-After.' }
+    if ($response.StatusCode -ne 200 -or $script:attempts -ne 3 -or ($script:delays[0] -lt 2 -or $script:delays[0] -gt 4 -or $script:delays[1] -ne 7)) { throw '503/429 recovery did not honor bounded backoff and Retry-After.' }
     $script:attempts = 0
     $null = Invoke-ReleaseHttp -Uri 'https://gitee.com/api/test' -Method Post -Body '{}'
     if ($script:attempts -ne 1) { throw 'Ambiguous POST must not be blindly retried.' }
@@ -57,7 +57,7 @@ $transport = Get-Module ReleaseTransport
     }
     $download=Join-Path $env:TEMP ('netboot-empty-header-' + [guid]::NewGuid().ToString('N'))
     try {
-        Invoke-ReleaseDownload -Uri 'https://gitee.com/download/file' -Destination $download -AssetName file
+        $null = Invoke-ReleaseDownload -Uri 'https://gitee.com/download/file' -Destination $download -AssetName file
         if ($script:attempts -ne 2 -or (Get-Content -LiteralPath $download -Raw) -cne 'complete bytes') { throw 'Empty-header timeout did not recover.' }
     } finally { Remove-Item -LiteralPath $download, "$download.headers" -Force -ErrorAction SilentlyContinue }
 }

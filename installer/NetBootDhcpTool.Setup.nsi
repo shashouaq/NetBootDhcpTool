@@ -2,8 +2,20 @@
 !include "MUI2.nsh"
 
 !ifndef PRODUCT_VERSION
-  !define PRODUCT_VERSION "1.1.0"
+  !error "PRODUCT_VERSION must be supplied by the release version source."
 !endif
+!ifndef PE_VERSION
+  !error "PE_VERSION must be supplied by the release version source."
+!endif
+VIProductVersion "${PE_VERSION}"
+VIFileVersion "${PE_VERSION}"
+VIAddVersionKey /LANG=1033 "ProductName" "${PRODUCT_NAME}"
+VIAddVersionKey /LANG=1033 "FileDescription" "${PRODUCT_NAME} Setup"
+VIAddVersionKey /LANG=1033 "FileVersion" "${PE_VERSION}"
+VIAddVersionKey /LANG=1033 "ProductVersion" "${PRODUCT_VERSION}"
+VIAddVersionKey /LANG=1033 "CompanyName" "${COMPANY_NAME}"
+VIAddVersionKey /LANG=1033 "LegalCopyright" "${PRODUCT_COPYRIGHT}"
+VIAddVersionKey /LANG=1033 "OriginalFilename" "NetBootDhcpTool-Setup-v${PRODUCT_VERSION}.exe"
 !ifndef SETUP_HELPER
   !define SETUP_HELPER "..\artifacts\setup\NetBootDhcpTool.SetupHelper.exe"
 !endif

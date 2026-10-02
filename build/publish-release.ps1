@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [Parameter(Mandatory)][ValidatePattern('^v\d+\.\d+\.\d+$')][string]$Tag,
     [Parameter(Mandatory)][string]$SourceCommit,
@@ -59,9 +59,8 @@ function Write-ReleaseSummary([bool]$Succeeded) {
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $version = Get-ReleaseVersionFromTag $Tag
 $expectedArchiveName = Get-ReleaseArchiveName $Tag
-$projectPath = Join-Path $repoRoot 'src\NetBootDhcpTool.App\NetBootDhcpTool.App.csproj'
-[xml]$project = Get-Content -LiteralPath $projectPath
-$projectVersion = [string]$project.Project.PropertyGroup.Version
+. (Join-Path $PSScriptRoot 'release-identity.ps1')
+$projectVersion = (Get-NetBootVersionMetadata -RepositoryRoot $repoRoot).Version
 if ($projectVersion -cne $version) { throw "Tag $Tag does not match application version $projectVersion." }
 if ($SourceCommit -notmatch '^[a-fA-F0-9]{40}$') { throw 'SourceCommit must be a full Git SHA.' }
 if ($RepairManifestSha256 -and $RepairManifestSha256 -notmatch '^[a-fA-F0-9]{64}$') { throw 'Manifest repair requires the exact old SHA-256.' }
@@ -138,7 +137,7 @@ function Invoke-GitChecked {
         $exitCode = $LASTEXITCODE
         if ($exitCode -eq 0 -or $Arguments[0] -notin @('fetch', 'push') -or $attempt -eq 4 -or -not (Test-GitHubTransientError $output)) { break }
         Write-Host "[Retry] Git $($Arguments[0]) transport failed; retrying the same non-forced ref operation ($attempt/4)."
-        Start-Sleep -Seconds (Get-ReleaseRetryDelay -Attempt $attempt)
+        Start-Sleep -Seconds (Get-ReleaseRetryDelay -Attempt $attempt -Jitter)
     }
     if ($exitCode -ne 0) {
         throw "Git command failed (exit $exitCode): $($output.Trim())"
@@ -152,32 +151,33 @@ function Invoke-Gh {
         [switch]$AllowFailure
     )
 
-    $retrySafe = $Arguments[0] -eq 'api' -or ($Arguments[0] -eq 'release' -and $Arguments[1] -in @('view', 'download', 'edit'))
+    $retrySafe = ($Arguments[0] -eq 'api' -and $Arguments -notcontains '--method' -and $Arguments -notcontains '-X') -or ($Arguments[0] -eq 'release' -and $Arguments[1] -in @('view', 'download'))
     for ($attempt = 1; $attempt -le 4; $attempt++) {
         $output = & gh @Arguments 2>&1 | Out-String
         $exitCode = $LASTEXITCODE
         if ($exitCode -eq 0 -or -not $retrySafe -or $attempt -eq 4 -or -not (Test-GitHubTransientError $output)) { break }
         Write-Host "[Retry] GitHub $($Arguments[0]) $($Arguments[1]) transient failure; attempt $attempt/4."
-        Start-Sleep -Seconds (Get-ReleaseRetryDelay -Attempt $attempt)
+        Start-Sleep -Seconds (Get-ReleaseRetryDelay -Attempt $attempt -Jitter)
     }
     if ($exitCode -ne 0 -and -not $AllowFailure) {
-        throw "GitHub CLI command failed (exit $exitCode): $($output.Trim())"
+        throw "GitHub CLI command failed (exit $exitCode; category=$(Get-ReleaseTransportCategory $output))."
     }
     return [pscustomobject]@{ ExitCode = $exitCode; Output = $output.Trim() }
 }
 
 function Test-GitHubTransientError([string]$Message) {
-    return $Message -match '(?i)(HTTP (408|429|500|502|503|504)|rate limit|timed? ?out|timeout|TLS|SSL|connection|wsarecv|EOF|no such host|temporar)'
+    if ((Get-ReleaseTransportCategory $Message) -eq 'certificate' -or $Message -match 'HTTP (401|403|404)') { return $false }
+    return $Message -match '(?i)HTTP (408|429|5\d\d)' -or (Get-ReleaseTransportCategory $Message) -in @('eof','connect-timeout','read-timeout','timeout','connection-reset','tls-interruption','connect')
 }
 
 function Get-GitHubRelease {
-    $result = Invoke-Gh -Arguments @('release', 'view', $Tag, '--repo', $GitHubRepository, '--json', 'tagName,name,body,isDraft,isPrerelease,assets') -AllowFailure
-    if ($result.ExitCode -ne 0) {
-        if ($result.Output -match '(?i)\brelease not found\b') { return $null }
-        throw "GitHub Release lookup failed for ${Tag}: $($result.Output)"
-    }
-    try { return $result.Output | ConvertFrom-Json -AsHashtable -ErrorAction Stop }
-    catch { throw "GitHub Release lookup returned invalid JSON for $Tag." }
+    $response = Invoke-ReleaseHttp -Uri "https://api.github.com/repos/$GitHubRepository/releases/tags/$Tag" -Headers @{Authorization="Bearer $env:GH_TOKEN";Accept='application/vnd.github+json'} -Stage 'legacy-github-api'
+    if ($response.StatusCode -eq 404) { return $null }
+    if ($response.StatusCode -ne 200) { throw "GitHub Release lookup returned HTTP $($response.StatusCode)." }
+    try { $release = $response.Content | ConvertFrom-Json -AsHashtable -ErrorAction Stop }
+    catch { throw 'GitHub Release lookup returned invalid JSON.' }
+    foreach ($asset in $release.assets) { $asset.apiUrl = $asset.url }
+    return @{tagName=$release.tag_name;name=$release.name;body=$release.body;isDraft=$release.draft;isPrerelease=$release.prerelease;assets=$release.assets}
 }
 
 function Get-GitHubAsset([string]$Name) {
@@ -225,9 +225,14 @@ function Assert-ReleaseAssetFileName {
 
 function Download-GitHubAsset([string]$Name, [string]$DestinationDirectory) {
     New-Item -ItemType Directory -Path $DestinationDirectory -Force | Out-Null
-    $result = Invoke-Gh -Arguments @('release', 'download', $Tag, '--repo', $GitHubRepository, '--pattern', $Name, '--dir', $DestinationDirectory, '--clobber')
+    $asset = Get-GitHubAsset $Name
+    if ($null -eq $asset) { throw 'GitHub asset is absent.' }
     $path = Join-Path $DestinationDirectory $Name
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "GitHub download did not create $Name." }
+    $digest = if ($asset.digest -match '^sha256:([a-fA-F0-9]{64})$') { $Matches[1] } else { '' }
+    # Anonymous public readback; when old API metadata has no digest, callers
+    # still compare the completed file to the immutable local bundle. A Python
+    # binary fallback is refused without both expected size and SHA-256.
+    Invoke-ReleaseDownload -Uri ([string]$asset.browser_download_url) -Destination $path -AssetName $Name -ExpectedSize ([long]$asset.size) -ExpectedSha256 $digest -Stage 'legacy-github-download'
     return $path
 }
 
@@ -251,7 +256,7 @@ function Ensure-GitHubAsset {
             if ($upload.ExitCode -eq 0) { break }
             # GitHub enforces unique asset names. Reconcile after every interrupted
             # request; never use --clobber for an upload or overwrite different bytes.
-            Start-Sleep -Seconds (Get-ReleaseRetryDelay -Attempt $attempt)
+            Start-Sleep -Seconds (Get-ReleaseRetryDelay -Attempt $attempt -Jitter)
             $asset = Get-GitHubAsset $Name
             if ($null -ne $asset) {
                 if ([long]$asset.size -ne [long](Get-Item -LiteralPath $LocalPath).Length) {
@@ -417,7 +422,7 @@ function Invoke-CurlDownload {
     )
 
     $safeUri = Assert-SafeGiteeDownloadUrl $Uri
-    Invoke-ReleaseDownload -Uri $safeUri -Destination $Destination -AssetName $AssetName
+    $null = Invoke-ReleaseDownload -Uri $safeUri -Destination $Destination -AssetName $AssetName
 }
 
 function Get-GiteeAssetReadback {
