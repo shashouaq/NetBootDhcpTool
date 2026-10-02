@@ -17,7 +17,7 @@ The 2026-09-23 audit baseline and unperformed real-network checks are recorded i
 - Default branch: `main`
 - Release tag format: `v<version>`
 - Current application version: `1.1.1`
-- Publication state: v1.1.1 release authorized on 2026-10-02; exact CI, production build and public acceptance pending. Latest accepted formal release remains v1.1.0 until those gates pass.
+- Publication state: v1.1.1 formally published and accepted on 2026-10-02 on GitHub and Gitee; exact CI, independent fresh official audits, production asset/public-readback and isolated Setup/Updater acceptance passed. v1.1.0 remains immutable.
 - Target framework: .NET 10; the repository pins SDK `10.0.401` in `global.json` with `latestFeature` roll-forward.
 - Resolve the SDK through `build/resolve-dotnet.ps1`; it honors the repository pin and bootstraps that SDK when needed. The first run may need network access.
 - Legacy GitHub manifest URL (frozen for ZIP-only clients):

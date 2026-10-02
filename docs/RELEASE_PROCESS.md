@@ -4,7 +4,15 @@ This project uses a single repeatable release path for local packaging, GitHub p
 
 For day-to-day maintenance, required change-log practice, GitHub synchronization, and upgrade work, start with `docs\MAINTENANCE_GUIDE.md`.
 
-## Current accepted formal release — v1.1.0 / 2026-10-01
+## Current accepted formal release — v1.1.1 / 2026-10-02
+
+Immutable tag `v1.1.1` points to `63ff41962737ff83674751776a28af5937fa312a`. Exact Windows CI [37017710666](https://github.com/shashouaq/NetBootDhcpTool/actions/runs/37017710666) and Formal Release [37018087873](https://github.com/shashouaq/NetBootDhcpTool/actions/runs/37018087873) passed. Both independent audit artifacts cover all 11 source projects/frameworks using fresh official NuGet data and report no vulnerabilities. [GitHub v1.1.1](https://github.com/shashouaq/NetBootDhcpTool/releases/tag/v1.1.1) (401878068) and [Gitee v1.1.1](https://gitee.com/joel20230302/NetBootDhcpTool/releases/tag/v1.1.1) (1180348) are stable; Gitee source/tag match the immutable release commit.
+
+Setup is 33,395,982 bytes, SHA-256 `f77ddcbd684026d4657abdd0bbccc7041df7866939e791c2ce37d66c6e120283`; Full 7z is 58,272,583 bytes, SHA-256 `7477aa9093eba1fa39bbff7710741ba5f845e9ba1e74c1d2222a07d4425f4885`. Both hosts' nine original files independently passed anonymous public download, size/SHA, sidecar, production signature, version/inventory and byte comparison. App, Updater, embedded SetupHelper and Setup have FileVersion `1.1.1.0` and ProductVersion `1.1.1`. The legacy manifest/signature hashes remain the frozen values below.
+
+Actual client stable discovery passed a separate recheck; both injected first-source package failures downloaded verified Full bytes from the other public HTTPS host. Four isolated production-asset transactions (Setup and actual App→Updater handoff for each host) reached HEALTHY/exit 0, verified 20 managed files each, preserved stable user/configuration/network data, and left the system IP/route/interface/DNS snapshot unchanged. Existing DPAPI credentials were reused/cleared; evidence credential checking passed. The initial cold discovery timeout and other earlier failures are retained and are not counted as successes. See [T30](tasks/T30.md) and `D:\Release\_v111_formal_20261002`; post-publication documentation closure never moves this tag or rebuilds its assets. T19 remains DONE / ACCEPTED.
+
+## Historical accepted formal release — v1.1.0 / 2026-10-01
 
 Formal tag `v1.1.0` is immutable at `eee134989cb5a5d1bc787bdca84c838a3e7f82f5`, after exact Windows CI `36801421119` and Formal Release `36801690987`. [GitHub v1.1.0](https://github.com/shashouaq/NetBootDhcpTool/releases/tag/v1.1.0) (400579440) and [Gitee v1.1.0](https://gitee.com/joel20230302/NetBootDhcpTool/releases/tag/v1.1.0) (1177896) are stable. T19 is DONE / ACCEPTED: both hosts' nine files were independently downloaded publicly, verified against signed metadata/sidecars and compared byte for byte; both single-source full installs and both failover-payload installs reached HEALTHY with Setup exit 0 and preserved settings/network/user data.
 
