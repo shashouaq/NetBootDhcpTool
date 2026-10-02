@@ -102,6 +102,14 @@ jobs:
       - name: Fresh official dependency audit before signing
         shell: pwsh
         run: .\build\release-pipeline\Invoke-FreshNuGetAudit.ps1 -EvidenceDirectory (Join-Path $env:RUNNER_TEMP 'formal-audit')
+      - name: Preserve independent pre-sign audit evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: formal-audit-${{ inputs.release_tag }}
+          path: ${{ runner.temp }}\formal-audit\*
+          retention-days: 90
+          if-no-files-found: error
 
       - name: Ensure 7-Zip is available
         shell: pwsh

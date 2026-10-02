@@ -22,6 +22,8 @@ try {
         if($LASTEXITCODE -ne 0 -or (Select-String -LiteralPath $restoreLog -Pattern 'NU190[0-5]' -Quiet)){throw 'Fresh vulnerability audit failed or its official feed was unavailable.'}
         & $DotnetPath list $solution package --include-transitive --format json > (Join-Path $evidence 'package-graph.json')
         if($LASTEXITCODE){throw 'Could not record the dependency graph.'}
+        $graph=Get-Content -LiteralPath (Join-Path $evidence 'package-graph.json') -Raw|ConvertFrom-Json
+        if($graph.errors){throw 'The dependency graph reported errors.'}
         $reportPath=Join-Path $evidence 'vulnerabilities.json'
         & $DotnetPath list $solution package --vulnerable --include-transitive --source $feed --format json > $reportPath
         if($LASTEXITCODE){throw 'Official vulnerability query failed.'}
@@ -30,7 +32,11 @@ try {
         $expected=@(Get-ChildItem -LiteralPath (Join-Path $RepositoryRoot 'src') -Recurse -Filter '*.csproj').FullName
         $actual=@($report.projects|ForEach-Object {[IO.Path]::GetFullPath($_.path)})
         if(@($expected|Where-Object {$_ -notin $actual}).Count){throw 'Vulnerability query did not cover every source project.'}
-        foreach($project in $report.projects){
+        $graphPaths=@($graph.projects|ForEach-Object {[IO.Path]::GetFullPath($_.path)})
+        if(@($expected|Where-Object {$_ -notin $graphPaths}).Count){throw 'Dependency graph did not cover every source project.'}
+        # --vulnerable filters out frameworks with no findings. Coverage belongs
+        # to the unfiltered graph, while the filtered report must have no findings.
+        foreach($project in $graph.projects){
             if(-not @($project.frameworks|Where-Object {$_}).Count){throw 'Vulnerability query omitted framework coverage.'}
         }
         foreach($framework in $report.projects.frameworks){

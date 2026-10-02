@@ -18,28 +18,36 @@ function Invoke-FixtureAuditDotnet {
         if($global:NetBootAuditFixtureState.Mode -eq 'feed'){return 'warning NU1900: feed unavailable'}
         return 'restore passed'
     }
-    if($args -notcontains '--vulnerable'){return '{"projects":[]}'}
     $framework=@{framework='net10.0';topLevelPackages=@();transitivePackages=@()}
+    if($args -notcontains '--vulnerable'){
+        $graph=@{projects=@(@{path=$project;frameworks=@($framework)})}
+        if($global:NetBootAuditFixtureState.Mode -eq 'framework'){$graph.projects[0].frameworks=@()}
+        if($global:NetBootAuditFixtureState.Mode -eq 'graph-coverage'){$graph.projects=@()}
+        if($global:NetBootAuditFixtureState.Mode -eq 'graph-errors'){$graph.errors=@('dependency graph failed')}
+        return ($graph|ConvertTo-Json -Depth 8)
+    }
     if($global:NetBootAuditFixtureState.Mode -eq 'vulnerable'){$framework.transitivePackages=@(@{id='unsafe-fixture';resolvedVersion='1.0.0'})}
-    $data=@{projects=@(@{path=$project;frameworks=@($framework)})}
+    # Real healthy --vulnerable JSON retains the project path but omits frameworks.
+    $data=@{projects=@(@{path=$project})}
+    if($global:NetBootAuditFixtureState.Mode -in @('vulnerable','empty-filtered')){$data.projects[0].frameworks=@($framework)}
     if($global:NetBootAuditFixtureState.Mode -eq 'errors'){$data.errors=@('official query unavailable')}
     if($global:NetBootAuditFixtureState.Mode -eq 'coverage'){$data.projects=@(@{path=(Join-Path $root 'missing.csproj');frameworks=@($framework)})}
-    if($global:NetBootAuditFixtureState.Mode -eq 'framework'){$data.projects=@(@{path=$project;frameworks=@()})}
     if($global:NetBootAuditFixtureState.Mode -eq 'query-exit'){$global:LASTEXITCODE=1;return 'query failed'}
     return ($data|ConvertTo-Json -Depth 8)
 }
 try {
     $cases=0
-    foreach($mode in @('healthy','feed','restore-exit','vulnerable','errors','coverage','framework','query-exit')){
+    foreach($mode in @('healthy','empty-filtered','feed','restore-exit','vulnerable','errors','coverage','framework','graph-coverage','graph-errors','query-exit')){
         $global:NetBootAuditFixtureState=@{Mode=$mode;Evidence=(Join-Path $root $mode)}
         $env:NUGET_HTTP_CACHE_PATH='fixture-previous-cache'
         $failed=$false;$detail=''
         try{& (Join-Path $repo 'build/release-pipeline/Invoke-FreshNuGetAudit.ps1') -RepositoryRoot $root -EvidenceDirectory $global:NetBootAuditFixtureState.Evidence -DotnetPath 'Invoke-FixtureAuditDotnet'}catch{$failed=$true;$detail=$_.Exception.Message}
-        if(($mode -eq 'healthy') -eq $failed){throw "Unexpected audit decision for ${mode}: $detail"}
-        $expectedError=@{feed='official feed was unavailable';'restore-exit'='official feed was unavailable';vulnerable='vulnerable packages';errors='reported errors';coverage='did not cover';framework='omitted framework';'query-exit'='query failed'}
+        $healthy=$mode -in @('healthy','empty-filtered')
+        if($healthy -eq $failed){throw "Unexpected audit decision for ${mode}: $detail"}
+        $expectedError=@{feed='official feed was unavailable';'restore-exit'='official feed was unavailable';vulnerable='vulnerable packages';errors='reported errors';coverage='did not cover';framework='omitted framework';'graph-coverage'='did not cover';'graph-errors'='reported errors';'query-exit'='query failed'}
         if($failed -and $detail -notmatch $expectedError[$mode]){throw "Wrong failure reason for ${mode}: $detail"}
         if($env:NUGET_HTTP_CACHE_PATH -cne 'fixture-previous-cache'){throw 'Audit leaked cache environment'}
-        if($mode -ne 'healthy' -and (Test-Path (Join-Path $global:NetBootAuditFixtureState.Evidence 'summary.json'))){throw 'Failed audit emitted success evidence'}
+        if(-not $healthy -and (Test-Path (Join-Path $global:NetBootAuditFixtureState.Evidence 'summary.json'))){throw 'Failed audit emitted success evidence'}
         $cases++
     }
     Write-Output "NUGET_AUDIT_TESTS_OK cases=$cases official_source=1 fresh_cache=1 transitive=1 feed_failure_hard_fail=1"
