@@ -4,6 +4,9 @@
 
 ## Product Requirements
 
+- Additive multi-IPv4 debugging uses `AdapterAddressManager` and a separate `adapter-address-session.json`: keep existing addresses, DHCP client, gateway/DNS/metric; add only temporary ActiveStore addresses after stable physical Ethernet identity and fresh route-overlap checks. Existing matching addresses never become tool-owned. This explicitly differs from the older isolation/replacement workflows below. 同网卡追加模式保留业务配置，不将整份旧快照覆盖当前网卡。
+- DHCP/static coexistence uses `netsh` append, not `New-NetIPAddress` which can disable DHCP. Read and journal the original switch before changing it; unrecognized system language/build blocks writes. Restore an owned switch only when no owned or external manual addresses remain. Intent/unknown/property-changed recovery requires explicit inspection; startup and closing a new read-only session never remove prior-run records. Source-specific ICMP and HTTP validate current adapter/address/route and own cancellation/transport lifetime. 原 DHCP 服务仍仅支持隔离链路上的一个明确作用域，多 IP 不等同 VLAN。
+
 - Authors shown in title/about/readme: Joel & Codex, contact 1406829360@qq.com.
 - Main use case is isolated field debugging through a selected Ethernet adapter.
 - Workspace root: `D:\project\NetBootDhcpTool`.
@@ -47,6 +50,8 @@
 - Compare all effective DHCP/manual-scan fields and normalized route targets as an order-independent multiset. Reject duplicate route targets rather than collapsing them. Normalize masks and CIDRs, prefer adapter ID with MAC/name relocation fallback, and recalculate interface metrics at preview time.
 
 ## Implementation Lessons
+
+Reusable troubleshooting methods and evidence are indexed in [engineering lessons](docs/troubleshooting/engineering-lessons.md); follow the [recording workflow](docs/MAINTENANCE_GUIDE.md#problem-resolution-records--问题解决记录) when a new failure is resolved. 本节保留稳定实现边界，具体排障方法通过经验索引复用，不另建任务状态。
 
 - Some Windows pseudo interfaces throw `NetworkInformationException 10043` from `GetIPv4Properties`; skip only that adapter and keep enumerating.
 - Windows PowerShell may display UTF-8 logs incorrectly unless files are created with UTF-8 BOM.
@@ -114,6 +119,7 @@ Select the evidence for a change from the [maintenance guide's verification map]
 
 - Collection state used by the main window is now held by `MainWindowViewModel`; keep new UI state out of the code-behind where practical.
 - Background work has narrow lifecycle owners: `PowerShellProcessRunner` handles only subprocess lifecycle; `HttpProbeService` owns its reusable probe transport; `LeaseProbeCoordinator` caps active/pending connectivity work and validates session, client, IP, and binding generation; `CoalescedRefreshCoordinator` serializes selected-adapter reads; update work belongs to `UpdateController`. Adapter status commits must recheck stable ID/index plus selection/workflow generations, and `AdapterStatusComparer` must cover every displayed field. This display-only snapshot never authorizes network writes. Keep system-write ownership and compensation in the existing services/workflow coordinator.
+- A DHCP session may retain one warm `PowerShellProcessSession` connected exclusively through the parent application's private inherited pipes. It caches module initialization, never network authorization data. Each command remains isolated, validates its response identity, and completes before its immediate recovery-journal commit. Never replay a write after an uncertain result. Failed/canceled start, normal/unexpected stop and normal exit must release the child; cancellation/timeout/error reaps the executing environment and independent compensation retains its own token and full readback.
 - Ordinary scan history may be batched and retains the most recent 500 rows; recovery journals, adapter snapshots, static-route intents, firewall leases, and DHCP lease state retain their existing immediate persistence boundaries. Session log files remain complete while the UI display is bounded; support-package readers must open an active log with read/write/delete sharing so the application can continue appending, then apply the configured redaction.
 - Favorite passwords use current-user Windows DPAPI; keep exports credential-free and ask the user to re-enter a password when a different Windows identity cannot decrypt it.
 - Favorite JSON import/export and per-favorite HTTPS preference are implemented; preserve the credential-free export boundary.

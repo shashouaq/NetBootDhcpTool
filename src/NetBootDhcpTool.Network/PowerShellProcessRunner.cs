@@ -13,6 +13,43 @@ internal sealed class PowerShellProcessRunner
     private readonly PowerShellScriptExecutor? _scriptExecutor;
     private readonly TimeSpan _timeout;
     private readonly Action<int>? _processStarted;
+    private readonly AsyncLocal<PowerShellProcessSession?> _session = new();
+    private PowerShellProcessSession? _retainedSession;
+
+    public IAsyncDisposable BeginSession(bool retainForDhcp = false)
+    {
+        if (_scriptExecutor is not null || _session.Value is not null) return EmptyScope.Instance;
+        var session = _retainedSession ?? new PowerShellProcessSession(_timeout, _processStarted);
+        if (retainForDhcp) _retainedSession = session;
+        _session.Value = session;
+        if (retainForDhcp) session.Prewarm();
+        return new SessionScope(this, session, retainForDhcp);
+    }
+
+    public ValueTask EndRetainedSessionAsync()
+    {
+        var session = _retainedSession;
+        _retainedSession = null;
+        if (ReferenceEquals(_session.Value, session)) _session.Value = null;
+        return session?.DisposeAsync() ?? ValueTask.CompletedTask;
+    }
+
+    private sealed class SessionScope(PowerShellProcessRunner owner, PowerShellProcessSession session, bool retain) : IAsyncDisposable
+    {
+        public ValueTask DisposeAsync()
+        {
+            if (ReferenceEquals(owner._session.Value, session)) owner._session.Value = null;
+            if (retain) return ValueTask.CompletedTask;
+            if (ReferenceEquals(owner._retainedSession, session)) owner._retainedSession = null;
+            return session.DisposeAsync();
+        }
+    }
+
+    private sealed class EmptyScope : IAsyncDisposable
+    {
+        public static readonly EmptyScope Instance = new();
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
 
     public PowerShellProcessRunner(
         ILogger logger,
@@ -52,6 +89,23 @@ internal sealed class PowerShellProcessRunner
             catch (Exception ex)
             {
                 _logger.Warn($"{summary} failed in injected executor: elapsedMs={timer.Elapsed.TotalMilliseconds:0} detail={Summarize(ex.Message)}");
+                throw;
+            }
+        }
+
+        if (_session.Value is { } session)
+        {
+            try
+            {
+                var output = await session.RunAsync(script, cancellationToken).ConfigureAwait(false);
+                _logger.Info(logOutput
+                    ? $"{summary} completed: exit=0 elapsedMs={timer.Elapsed.TotalMilliseconds:0} session=true detail={Summarize(output)}"
+                    : $"{summary} completed: exit=0 elapsedMs={timer.Elapsed.TotalMilliseconds:0} session=true");
+                return output;
+            }
+            catch (Exception ex)
+            {
+                _logger.Warn($"{summary} failed in workflow session: elapsedMs={timer.Elapsed.TotalMilliseconds:0} detail={Summarize(ex.Message)}");
                 throw;
             }
         }
@@ -105,7 +159,7 @@ internal sealed class PowerShellProcessRunner
         }
     }
 
-    private static ProcessStartInfo CreateStartInfo(string script)
+    internal static ProcessStartInfo CreateStartInfo(string script)
     {
         var executable = Path.Combine(Environment.SystemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe");
         if (!File.Exists(executable)) throw new InvalidOperationException("Windows PowerShell was not found / 未找到 Windows PowerShell");

@@ -18,7 +18,7 @@ public sealed class HttpProbeService : IAsyncDisposable
 
     public HttpProbeService() : this(CreateDefaultHandler, DefaultMaximumConcurrentRequests) { }
 
-    internal HttpProbeService(Func<HttpMessageHandler> handlerFactory, int maximumConcurrentRequests = DefaultMaximumConcurrentRequests)
+    public HttpProbeService(Func<HttpMessageHandler> handlerFactory, int maximumConcurrentRequests = DefaultMaximumConcurrentRequests)
     {
         ArgumentNullException.ThrowIfNull(handlerFactory);
         if (maximumConcurrentRequests is < 1 or > DefaultMaximumConcurrentRequests)

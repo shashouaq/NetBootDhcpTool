@@ -13,9 +13,12 @@ namespace NetBootDhcpTool.Network;
 
 public delegate Task<string> PowerShellScriptExecutor(string script, string summary, CancellationToken cancellationToken, bool logOutput);
 
-public sealed class NetworkAdapterService
+public sealed partial class NetworkAdapterService
 {
     public const int DhcpHostAdapterMetric = 9000;
+
+    public IAsyncDisposable BeginPowerShellBatch(bool retainForDhcp = false) => _powerShellProcessRunner.BeginSession(retainForDhcp);
+    public ValueTask EndDhcpPowerShellBatchAsync() => _powerShellProcessRunner.EndRetainedSessionAsync();
 
     private readonly ILogger _logger;
     private readonly PowerShellProcessRunner _powerShellProcessRunner;
@@ -633,7 +636,7 @@ $name={{PsQuote(rule.Name)}}; $display={{PsQuote(rule.DisplayName)}}; $descripti
 $group={{PsQuote(rule.Group)}}; $direction={{PsQuote(rule.Direction)}}; $interface={{PsQuote(rule.InterfaceAlias)}}; $program={{PsQuote(rule.ProgramPath)}}
 $localPort={{PsQuote(rule.LocalPort)}}; $remotePort={{PsQuote(rule.RemotePort)}}; $leaseId={{PsQuote(rule.LeaseId)}}; $instanceId={{PsQuote(rule.InstanceId)}}
 $rules=@(Get-NetFirewallRule -Name $name -ErrorAction SilentlyContinue)
-if ($rules.Count -eq 0) { 'OK'; exit 0 }
+if ($rules.Count -eq 0) { 'OK'; return }
 if ($rules.Count -ne 1) { throw 'Firewall rule identity is ambiguous; journal retained.' }
 $rule=$rules[0]
 $port=@(Get-NetFirewallPortFilter -AssociatedNetFirewallRule $rule -ErrorAction Stop)

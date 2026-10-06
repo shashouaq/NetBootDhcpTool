@@ -44,7 +44,7 @@ public sealed class NetworkScanTargetProbe : IScanTargetProbe
         if (!ping.success) return null;
 
         var details = await ProbeReachableDetailsAsync(ip, httpTimeoutMs, cancellationToken).ConfigureAwait(false);
-        return new ScanResult
+        var result = new ScanResult
         {
             IpAddress = ip.ToString(),
             PingOk = true,
@@ -54,6 +54,8 @@ public sealed class NetworkScanTargetProbe : IScanTargetProbe
             HttpsOk = details.HttpsOk,
             LastSeen = DateTime.Now
         };
+        result.Connectivity.Observe(ping.roundTripTime, result.LastSeen);
+        return result;
     }
 
     public async Task<NetworkProbeDetails> ProbeReachableDetailsAsync(IPAddress ip, int httpTimeoutMs, CancellationToken cancellationToken)

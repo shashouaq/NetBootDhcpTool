@@ -95,6 +95,20 @@ public partial class MainWindow
             });
         }
 
+        if (_addressManager is not null)
+        {
+            foreach (var address in _addressManager.Journal.Addresses)
+                entries.Add(new RecoveryEntryViewModel { Kind = RecoveryEntryKind.AdapterAddress, Payload = address,
+                    TypeDisplay = _lang.T("addresses.recover"), AdapterName = address.AdapterName, IdentityDisplay = address.AdapterId,
+                    CapturedAtDisplay = address.CreatedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss"),
+                    Summary = $"{address.IpAddress}/{address.PrefixLength} ActiveStore", StatusDisplay = address.State + " " + address.Error,
+                    IsAvailable = Adapters.Count(x => x.Id.Equals(address.AdapterId, StringComparison.OrdinalIgnoreCase)) == 1 });
+            foreach (var lease in _addressManager.Journal.Coexistence)
+                entries.Add(new RecoveryEntryViewModel { Kind = RecoveryEntryKind.AddressCoexistence, Payload = lease,
+                    TypeDisplay = _lang.T("addresses.coexist"), AdapterName = lease.AdapterId, IdentityDisplay = lease.AdapterId,
+                    CapturedAtDisplay = "-", Summary = _lang.T("addresses.coexist.body"), StatusDisplay = lease.State,
+                    IsAvailable = Adapters.Count(x => x.Id.Equals(lease.AdapterId, StringComparison.OrdinalIgnoreCase)) == 1 });
+        }
         return entries;
     }
 
@@ -115,6 +129,8 @@ public partial class MainWindow
             AdapterMacBackup backup => AppDialog.Show(this, Ui("recovery.restore.mac"), Ui("recovery.restore.mac.confirm", backup.AdapterName, backup.OriginalMacAddress), confirm: true, danger: true),
             AppliedStaticRoute route => AppDialog.Show(this, Ui("recovery.restore.routes"), Ui("recovery.restore.route.confirm", $"{route.DestinationPrefix} -> {route.AdapterName} ({route.NextHop})"), confirm: true, danger: true),
             DhcpFirewallRuleLease lease => AppDialog.Show(this, Ui("recovery.firewall.title"), Ui("recovery.restore.firewall.confirm", lease.InterfaceAlias, lease.Rules.Count), confirm: true, danger: true),
+            OwnedAdapterAddress address => AppDialog.Show(this, _lang.T("addresses.recover"), address.IpAddress + "\n" + _lang.T("addresses.remove.body"), confirm: true, danger: true),
+            AdapterCoexistenceLease lease => AppDialog.Show(this, _lang.T("addresses.coexist"), lease.AdapterId + "\n" + _lang.T("addresses.coexist.body"), confirm: true, danger: true),
             _ => false
         };
         if (!confirmed) return;
@@ -139,6 +155,17 @@ public partial class MainWindow
             SetBusy(true, Ui("recovery.operation.running"));
             switch (entry.Payload)
             {
+                case OwnedAdapterAddress address:
+                    if (_addressManager is null) throw new InvalidOperationException(_lang.T("addresses.storage.blocked"));
+                    await StopAddressMonitoringAsync();
+                    await _addressManager.RemoveAsync(address, OperationToken, true);
+                    RefreshAddressRecovery();
+                    break;
+                case AdapterCoexistenceLease lease:
+                    if (_addressManager is null) throw new InvalidOperationException(_lang.T("addresses.storage.blocked"));
+                    await _addressManager.RestoreCoexistenceAsync(lease.AdapterId, OperationToken, true);
+                    RefreshAddressRecovery();
+                    break;
                 case AdapterConfigBackup backup:
                 {
                     var adapter = ResolveAdapterForBackup(backup) ?? throw new InvalidOperationException(Ui("recovery.status.unavailable"));
@@ -198,6 +225,8 @@ public partial class MainWindow
 
     private async Task RestoreAdapterBackupAsync(NetworkAdapterInfo adapter, AdapterConfigBackup backup, CancellationToken ct)
     {
+        if (HasAddressRecovery(adapter.Id)) throw new InvalidOperationException("Clean appended addresses before full restore / 完整恢复前请先清理追加地址");
+        await StopAddressMonitoringAsync();
         var preRestoreSnapshot = await _adapterService.CaptureIPv4ConfigAsync(adapter, ct);
         var snapshot = new AdapterIpv4Snapshot
         {

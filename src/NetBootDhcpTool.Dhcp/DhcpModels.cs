@@ -1,6 +1,8 @@
 using System.Net;
 using System.ComponentModel;
 using System.Runtime.CompilerServices;
+using System.Text.Json.Serialization;
+using NetBootDhcpTool.Core;
 
 namespace NetBootDhcpTool.Dhcp;
 
@@ -49,6 +51,8 @@ public sealed class DhcpLease : INotifyPropertyChanged
     private string _remark = "";
 
     public event PropertyChangedEventHandler? PropertyChanged;
+    [JsonIgnore]
+    public PeerConnectivity Connectivity { get; } = new();
     public DateTime Time { get => _time; set => Set(ref _time, value); }
     public string MacAddress { get => _macAddress; set => Set(ref _macAddress, value); }
     public string IpAddress { get => _ipAddress; set => Set(ref _ipAddress, value); }
@@ -67,8 +71,8 @@ public sealed class DhcpLease : INotifyPropertyChanged
             OnPropertyChanged(nameof(StatusHelp));
         }
     }
-    public bool IsActiveLease { get => _isActiveLease; set => Set(ref _isActiveLease, value); }
-    public bool IsCurrentSession { get => _isCurrentSession; set { if (Set(ref _isCurrentSession, value)) OnPropertyChanged(nameof(SessionText)); } }
+    public bool IsActiveLease { get => _isActiveLease; set { if (Set(ref _isActiveLease, value) && !value) Connectivity.Stop(DateTime.Now); } }
+    public bool IsCurrentSession { get => _isCurrentSession; set { if (Set(ref _isCurrentSession, value)) { OnPropertyChanged(nameof(SessionText)); if (!value) Connectivity.Stop(DateTime.Now); } } }
     public string SessionId { get => _sessionId; set => Set(ref _sessionId, value); }
     public string SessionText => IsCurrentSession ? "Current / 当前会话" : "History / 历史";
     public string StatusText => Status switch
@@ -82,7 +86,7 @@ public sealed class DhcpLease : INotifyPropertyChanged
         _ => $"{Status} / 状态"
     };
     public string StatusHelp =>
-        "Assigned / 已分配: DHCP lease was assigned, waiting for ping confirmation.\n" +
+        "Assigned / 已分配: Address assignment does not prove connectivity; see the Connectivity column / 地址已分配，当前连通情况请看连通状态列。\n" +
         "Released / 已释放: Client released this binding.\n" +
         "Declined / 地址冲突: Client reported an address conflict and the address is quarantined.\n" +
         "Expired / 已过期: Lease time ended. Ping reachability is shown separately.";

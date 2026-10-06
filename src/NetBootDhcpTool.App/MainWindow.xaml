@@ -117,6 +117,16 @@
         </DataTrigger>
       </Style.Triggers>
     </Style>
+    <Style x:Key="ConnectivityText" TargetType="TextBlock" BasedOn="{StaticResource CellText}">
+      <Setter Property="ToolTip" Value="{Binding Connectivity.Help}"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+      <Style.Triggers>
+        <DataTrigger Binding="{Binding Connectivity.State}" Value="Online"><Setter Property="Foreground" Value="#137333"/></DataTrigger>
+        <DataTrigger Binding="{Binding Connectivity.State}" Value="Offline"><Setter Property="Foreground" Value="#B3261E"/></DataTrigger>
+        <DataTrigger Binding="{Binding Connectivity.State}" Value="Pending"><Setter Property="Foreground" Value="#B06000"/></DataTrigger>
+        <DataTrigger Binding="{Binding Connectivity.State}" Value="Stopped"><Setter Property="Foreground" Value="{DynamicResource MutedTextBrush}"/></DataTrigger>
+      </Style.Triggers>
+    </Style>
   </Window.Resources>
   <Grid x:Name="RootGrid" Background="{DynamicResource WindowBackgroundBrush}" xmlns:help="clr-namespace:NetBootDhcpTool.App">
   <DockPanel Margin="10" xmlns:help="clr-namespace:NetBootDhcpTool.App">
@@ -245,6 +255,7 @@
             <TextBox x:Name="DhcpLeaseSeconds" Width="80" Margin="6" TextChanged="DhcpNetworkInput_TextChanged" AutomationProperties.Name="DHCP lease seconds / DHCP 租约秒数"/>
             <CheckBox x:Name="DhcpConfirm" Margin="6" Checked="DhcpConfirmation_Changed" Unchecked="DhcpConfirmation_Changed"/>
             <CheckBox x:Name="RestoreOnStop" Margin="6" Checked="SettingsInput_Changed" Unchecked="SettingsInput_Changed"/>
+            <CheckBox x:Name="DhcpPreserveAddresses" Content="Preserve existing static addresses / 保留已有固定地址" Margin="6" ToolTip="Single DHCP scope on an isolated link; never use on a shared business DHCP network / 仅隔离链路单作用域，禁止用于共享业务 DHCP 网络"/>
             <Button x:Name="BtnPreviewDhcp" help:HelpButtonService.HelpKey="help.preview.dhcp" Click="PreviewDhcp_Click"/>
             <Button x:Name="BtnStartDhcp" help:HelpButtonService.HelpKey="help.start.dhcp" Click="StartDhcp_Click"/>
             <Button x:Name="BtnStopDhcp" help:HelpButtonService.HelpKey="help.stop.dhcp" Click="StopDhcp_Click"/>
@@ -265,18 +276,88 @@
                   </DataTemplate>
                 </DataGridTemplateColumn.CellTemplate>
               </DataGridTemplateColumn>
+              <DataGridTextColumn Header="Connectivity / 连通状态" Binding="{Binding Connectivity.Text}" Width="160" ElementStyle="{StaticResource ConnectivityText}"/>
               <DataGridTextColumn Header="Hostname / 主机名" Binding="{Binding Hostname}" Width="145" ElementStyle="{StaticResource CellText}"/>
               <DataGridTextColumn Header="Start / 开始" Binding="{Binding LeaseStart}" Width="145" ElementStyle="{StaticResource CellText}"/>
               <DataGridTextColumn Header="End / 结束" Binding="{Binding LeaseEnd}" Width="145" ElementStyle="{StaticResource CellText}"/>
               <DataGridTextColumn Header="Status / 状态" Binding="{Binding StatusText}" Width="125" ElementStyle="{StaticResource StatusText}"/>
+              <DataGridTextColumn Header="Changed at / 状态变化" Binding="{Binding Connectivity.ChangedAt, StringFormat={}{0:MM-dd HH:mm:ss}}" Width="160" ElementStyle="{StaticResource CellText}"/>
+              <DataGridTextColumn Header="Last probe / 最近探测" Binding="{Binding Connectivity.LastCheckedAt, StringFormat={}{0:HH:mm:ss}}" Width="130" ElementStyle="{StaticResource CellText}"/>
               <DataGridTextColumn Header="Session / 会话" Binding="{Binding SessionText}" Width="125" ElementStyle="{StaticResource CellText}"/>
               <DataGridTextColumn Header="Ping ms" Binding="{Binding PingLatencyMs}" Width="80" ElementStyle="{StaticResource CellText}"/>
-              <DataGridTextColumn Header="Remark / 备注" Binding="{Binding Remark}" Width="*" ElementStyle="{StaticResource CellText}"/>
+              <DataGridTextColumn Header="Remark / 备注" Binding="{Binding Remark}" Width="*" MinWidth="120" ElementStyle="{StaticResource CellText}"/>
             </DataGrid.Columns>
           </DataGrid>
           <TextBlock x:Name="TxtLeaseEmpty" Visibility="Collapsed" HorizontalAlignment="Center" VerticalAlignment="Center" TextAlignment="Center" Foreground="{DynamicResource MutedTextBrush}" FontSize="16" FontWeight="SemiBold" IsHitTestVisible="False"/>
           </Grid>
         </Grid>
+      </TabItem>
+      <TabItem x:Name="TabAddresses">
+        <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+          <StackPanel Margin="10">
+            <TextBlock x:Name="TxtAddressGuide" Margin="0,0,0,8"/>
+            <WrapPanel>
+              <TextBlock Text="Name / 用途"/><TextBox x:Name="AddressName" Width="110" Margin="6" AutomationProperties.Name="Address role / 地址用途"/>
+              <TextBlock Text="IPv4"/><TextBox x:Name="AddressIp" Width="125" Margin="6" AutomationProperties.Name="Additional IPv4 / 追加地址"/>
+              <TextBlock Text="Mask / 掩码"/><TextBox x:Name="AddressMask" Width="125" Margin="6" Text="255.255.255.0" AutomationProperties.Name="Address mask / 地址掩码"/>
+              <TextBlock Text="Target / 目标"/><TextBox x:Name="AddressTarget" Width="125" Margin="6" AutomationProperties.Name="Address scan target / 地址扫描目标"/>
+              <Button x:Name="BtnAddressDraft" Click="AddressDraft_Click" help:HelpButtonService.HelpKey="help.address.draft"/>
+              <Button x:Name="BtnAddressDrop" Click="AddressDrop_Click" help:HelpButtonService.HelpKey="help.address.drop"/>
+            </WrapPanel>
+            <DataGrid x:Name="AddressDraftGrid" Height="120" AutoGenerateColumns="False" CanUserAddRows="False" IsReadOnly="True" AutomationProperties.Name="Address plan / 地址方案">
+              <DataGrid.Columns>
+                <DataGridTextColumn Header="Role / 用途" Binding="{Binding Name}" Width="130"/>
+                <DataGridTextColumn Header="Adapter ID / 网卡身份" Binding="{Binding AdapterId}" Width="270"/>
+                <DataGridTextColumn Header="IPv4" Binding="{Binding IpAddress}" Width="130"/>
+                <DataGridTextColumn Header="Mask / 掩码" Binding="{Binding SubnetMask}" Width="130"/>
+                <DataGridTextColumn Header="Target / 目标" Binding="{Binding TargetIp}" Width="*"/>
+              </DataGrid.Columns>
+            </DataGrid>
+            <WrapPanel>
+              <Button x:Name="BtnAddressPreview" Click="AddressPreview_Click" help:HelpButtonService.HelpKey="help.address.preview"/>
+              <Button x:Name="BtnAddressApply" Click="AddressApply_Click" help:HelpButtonService.HelpKey="help.address.apply"/>
+              <Button x:Name="BtnAddressRefresh" Click="AddressRefresh_Click" help:HelpButtonService.HelpKey="help.address.refresh"/>
+              <Button x:Name="BtnAddressRemove" Click="AddressRemove_Click" help:HelpButtonService.HelpKey="help.address.remove"/>
+              <Button x:Name="BtnAddressProbe" Click="AddressProbe_Click" help:HelpButtonService.HelpKey="help.address.probe"/>
+              <Button x:Name="BtnAddressStop" Click="AddressStop_Click" help:HelpButtonService.HelpKey="help.address.stop"/>
+            </WrapPanel>
+            <TextBlock x:Name="AddressStatus" Margin="0,6" AutomationProperties.LiveSetting="Polite"/>
+            <DataGrid x:Name="AddressCurrentGrid" Height="130" AutoGenerateColumns="False" IsReadOnly="True" MouseDoubleClick="AddressCurrent_DoubleClick" AutomationProperties.Name="Current addresses / 当前地址">
+              <DataGrid.Columns>
+                <DataGridTextColumn Header="IPv4" Binding="{Binding IpAddress}" Width="130"/>
+                <DataGridTextColumn Header="Prefix / 前缀" Binding="{Binding PrefixLength}" Width="80"/>
+                <DataGridTextColumn Header="Source / 来源" Binding="{Binding Origin}" Width="160"/>
+                <DataGridTextColumn Header="Address state / 地址状态" Binding="{Binding State}" Width="180"/>
+                <DataGridTextColumn Header="Owner / 归属" Binding="{Binding Owner}" Width="*"/>
+              </DataGrid.Columns>
+            </DataGrid>
+            <DataGrid x:Name="AddressResultsGrid" Height="180" AutoGenerateColumns="False" IsReadOnly="True" AutomationProperties.Name="Subnet connectivity / 分网段连通性">
+              <DataGrid.Columns>
+                <DataGridTextColumn Header="Role / 用途" Binding="{Binding Remark}" Width="100"/>
+                <DataGridTextColumn Header="Source IP / 本机源地址" Binding="{Binding ConfiguredLocalIp}" Width="150"/>
+                <DataGridTextColumn Header="Target IP / 对端地址" Binding="{Binding IpAddress}" Width="140"/>
+                <DataGridTextColumn Header="Connectivity / 连通状态" Binding="{Binding Connectivity.Text}" Width="150" ElementStyle="{StaticResource ConnectivityText}"/>
+                <DataGridTextColumn Header="Changed / 状态变化" Binding="{Binding Connectivity.ChangedAt, StringFormat={}{0:HH:mm:ss}}" Width="110"/>
+                <DataGridTextColumn Header="Last probe / 最近探测" Binding="{Binding Connectivity.LastCheckedAt, StringFormat={}{0:HH:mm:ss}}" Width="125"/>
+                <DataGridCheckBoxColumn Header="Ping" Binding="{Binding PingOk}" Width="60"/>
+                <DataGridTextColumn Header="Web / 网页" Binding="{Binding WebText}" Width="*"/>
+              </DataGrid.Columns>
+            </DataGrid>
+            <TextBlock x:Name="TxtAddressRecovery" Margin="0,8,0,4"/>
+            <DataGrid x:Name="AddressRecoveryGrid" Height="100" AutoGenerateColumns="False" IsReadOnly="True" AutomationProperties.Name="Address recovery / 地址恢复">
+              <DataGrid.Columns>
+                <DataGridTextColumn Header="Adapter / 网卡" Binding="{Binding AdapterName}" Width="150"/>
+                <DataGridTextColumn Header="IPv4" Binding="{Binding IpAddress}" Width="130"/>
+                <DataGridTextColumn Header="Ownership state / 归属状态" Binding="{Binding State}" Width="120"/>
+                <DataGridTextColumn Header="Diagnostic / 诊断" Binding="{Binding Error}" Width="*"/>
+              </DataGrid.Columns>
+            </DataGrid>
+            <WrapPanel>
+              <Button x:Name="BtnAddressRecover" Click="AddressRecover_Click" help:HelpButtonService.HelpKey="help.address.recover"/>
+              <Button x:Name="BtnAddressCoexist" Click="AddressCoexist_Click" help:HelpButtonService.HelpKey="help.address.coexist"/>
+            </WrapPanel>
+          </StackPanel>
+        </ScrollViewer>
       </TabItem>
       <TabItem x:Name="TabScan">
         <Grid Margin="8">
@@ -311,7 +392,8 @@
                 <ComboBoxItem Tag="all" Content="All / 全部"/>
                 <ComboBoxItem Tag="online" Content="Online / 在线"/>
                 <ComboBoxItem Tag="offline" Content="Offline / 离线"/>
-                <ComboBoxItem Tag="assigned" Content="Assigned / 已配置"/>
+                <ComboBoxItem Tag="assigned" Content="Checking / 待探测"/>
+                <ComboBoxItem Tag="stopped" Content="Stopped / 已停止监测"/>
               </ComboBox>
               <TextBlock x:Name="TxtScanSummary" Foreground="#57606A" Margin="6,0,6,0"/>
               <Button x:Name="BtnClearScanFilter" help:HelpButtonService.HelpKey="help.clear.filter" Click="ClearScanFilter_Click" Content="Clear filter / 清除筛选" MinWidth="125"/>
@@ -328,13 +410,15 @@
               </DataGridTemplateColumn>
               <DataGridCheckBoxColumn Header="Ping / 连通" Binding="{Binding PingOk}" Width="85"/>
               <DataGridTextColumn Header="ms / 延迟" Binding="{Binding LatencyMs}" Width="85" ElementStyle="{StaticResource CellText}"/>
-              <DataGridTextColumn Header="Status / 状态" Binding="{Binding StatusText}" Width="125" ElementStyle="{StaticResource CellText}"/>
+              <DataGridTextColumn Header="Connectivity / 连通状态" Binding="{Binding Connectivity.Text}" Width="160" ElementStyle="{StaticResource ConnectivityText}"/>
+              <DataGridTextColumn Header="Changed at / 状态变化" Binding="{Binding Connectivity.ChangedAt, StringFormat={}{0:MM-dd HH:mm:ss}}" Width="160" ElementStyle="{StaticResource CellText}"/>
+              <DataGridTextColumn Header="Last probe / 最近探测" Binding="{Binding Connectivity.LastCheckedAt, StringFormat={}{0:HH:mm:ss}}" Width="130" ElementStyle="{StaticResource CellText}"/>
               <DataGridTextColumn Header="Web / 网页" Binding="{Binding WebText}" Width="95" ElementStyle="{StaticResource CellText}"/>
               <DataGridTextColumn Header="Local IP / 本机IP" Binding="{Binding ConfiguredLocalIp}" Width="130" ElementStyle="{StaticResource CellText}"/>
               <DataGridTextColumn Header="MAC" Binding="{Binding MacAddress}" Width="145" ElementStyle="{StaticResource CellText}"/>
               <DataGridTextColumn Header="Hostname / 主机名" Binding="{Binding Hostname}" Width="160" ElementStyle="{StaticResource CellText}"/>
-              <DataGridTextColumn Header="Last Seen / 最后发现" Binding="{Binding LastSeen}" Width="155" ElementStyle="{StaticResource CellText}"/>
-              <DataGridTextColumn Header="Remark / 备注" Binding="{Binding Remark}" Width="*" ElementStyle="{StaticResource CellText}"/>
+              <DataGridTextColumn Header="Last connected / 最后联通" Binding="{Binding LastSeenText}" Width="155" ElementStyle="{StaticResource CellText}"/>
+              <DataGridTextColumn Header="Remark / 备注" Binding="{Binding Remark}" Width="*" MinWidth="120" ElementStyle="{StaticResource CellText}"/>
             </DataGrid.Columns>
           </DataGrid>
           <TextBlock x:Name="TxtScanEmpty" Visibility="Collapsed" HorizontalAlignment="Center" VerticalAlignment="Center" TextAlignment="Center" Foreground="{DynamicResource MutedTextBrush}" FontSize="16" FontWeight="SemiBold" IsHitTestVisible="False"/>

@@ -1,6 +1,6 @@
 # NetBoot DHCP Tool
 
-Version: 1.1.1
+Version: 1.2.0
 
 Authors: Joel & Codex
 
@@ -8,13 +8,27 @@ Windows portable IPv4 DHCP, adapter IP configuration, IPv4/IPv6 static route rul
 
 ## Maintenance Entry / 维护入口
 
-Start with the [maintenance guide](docs/MAINTENANCE_GUIDE.md), then read only the selected [approved work item](docs/TODO.md) and its source references. [PROJECT_MEMORY.md](PROJECT_MEMORY.md) holds stable product/network boundaries; the [release process](docs/RELEASE_PROCESS.md) owns publication steps. The [change log](docs/FEATURE_CHANGELOG.md) records completed changes, not future work. T01-T30 implementation and acceptance status is tracked in the [work-item index](docs/TODO.md); the most recently published version is recorded in the [release process](docs/RELEASE_PROCESS.md).
+Codex sessions follow [AGENTS.md](AGENTS.md). Search [engineering lessons](docs/troubleshooting/engineering-lessons.md) before investigating failures and record reusable resolutions before handoff. Codex 修改遵循仓库 AGENTS.md；遇错先查已有经验，解决后在交付前记录可复用的方法。
 
-维护顺序：维护指南 → 待办索引 → 单个任务及相关代码。T01-T30 的实施与验收状态以[待办索引](docs/TODO.md)为准；发布步骤及远端发布证据以[发布流程](docs/RELEASE_PROCESS.md)为准。无需每次读取全部任务或历史日志。仅明确授权“发布/release”后才能提交、推送或发布。
+Start with the [maintenance guide](docs/MAINTENANCE_GUIDE.md), then read only the selected [approved work item](docs/TODO.md) and its source references. [PROJECT_MEMORY.md](PROJECT_MEMORY.md) holds stable product/network boundaries; the [release process](docs/RELEASE_PROCESS.md) owns publication steps. The [change log](docs/FEATURE_CHANGELOG.md) records completed changes, not future work. T01-T36 implementation and acceptance status is tracked in the [work-item index](docs/TODO.md); the most recently published version is recorded in the [release process](docs/RELEASE_PROCESS.md).
+
+维护顺序：维护指南 → 待办索引 → 单个任务及相关代码。T01-T36 的实施与验收状态以[待办索引](docs/TODO.md)为准；发布步骤及远端发布证据以[发布流程](docs/RELEASE_PROCESS.md)为准。无需每次读取全部任务或历史日志。仅明确授权“发布/release”后才能提交、推送或发布。
 
 At startup, the application claims a system-wide mutex keyed by the normalized full data-directory path before it migrates legacy files, creates defaults, or reads recovery journals. The owner keeps the mutex through asynchronous exit cleanup. A second process shows a bilingual notice and exits without changing shared files; an abnormal exit releases the mutex so a later run can inspect the preserved recovery data.
 
 启动时，程序先按规范化后的完整数据目录取得系统级互斥锁，再迁移旧文件、创建默认数据或读取恢复记录；窗口退出清理完成前持续持锁。第二个进程会提示已有实例并退出，不修改共享文件；异常退出后系统释放互斥锁，后续启动可检查保留的恢复数据。
+
+## Multiple IPv4 addresses / 同网卡多 IP
+
+The Multiple IPs page appends temporary addresses on one physical Ethernet adapter while preserving existing business addresses, gateways, DNS and metrics. Add role/IP/mask/optional-target drafts, preview/apply, or double-click an existing address to reuse it for source-specific scanning. Only newly created owned ActiveStore addresses are removed on exit; existing addresses remain. Saved profiles fill forms without applying network settings. Pending prior-run/uncertain/external-change records are available individually in Recovery Center.
+
+“多 IP 调试”支持业务和带外网段同时配置与检测，显示本机源地址、对端连通状态及变化时间。默认追加地址，不清空业务配置；只有本工具新建的临时地址会按归属清理。DHCP 客户端共存必须可靠读回系统开关，不能识别的 Windows 语言/版本会阻止修改。网卡已有地址可直接加入扫描草稿，不取得删除归属。不同 VLAN 仍需要交换机/网卡或第二网卡支持。
+
+Choose the adapter, add one draft per role/subnet, preview and apply, then scan with each assigned source address. Leave the optional target blank for a subnet scan (4096 combined targets maximum). The monitor revisits up to 32 discovered peers per round with eight concurrent probes. A fresh Ping or HTTP/HTTPS response establishes connectivity; no response is shown as offline and can also mean filtering. Existing gateways/DNS remain; overlapping another interface's route blocks an append. Prior-run records require explicit recovery and survive closing a new read-only session.
+
+操作顺序：选择网卡 → 分别添加“业务”“带外”的 IP/掩码和可选对端 → 预览并应用 → 按源地址扫描／监测。空对端扫描本网段，合计最多 4096 个目标；持续监测每轮最多 32 个已发现对端、并发 8 个。已联通、已离线、已停止监测和变化／探测时间分别显示；无应答也可能是对端过滤探测。追加前检查其他网卡的重叠路由；已有网关和 DNS 保留。之前会话的恢复项须逐项处理，关闭新开的只读窗口不会清除它们。
+
+The DHCP server's preserve-address option serves one selected scope on a gateway-free isolated static interface only. Do not use it on a shared business DHCP network. Multiple addresses cannot distinguish untagged DHCP broadcasts into different pools. The original fixed-IP replacement workflow remains available separately.
 
 ## Static Routes
 

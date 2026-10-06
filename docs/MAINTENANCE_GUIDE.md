@@ -16,7 +16,7 @@ The 2026-09-23 audit baseline and unperformed real-network checks are recorded i
 - Gitee distribution repository: `https://gitee.com/joel20230302/NetBootDhcpTool`
 - Default branch: `main`
 - Release tag format: `v<version>`
-- Current application version: `1.1.1`
+- Current application version: `1.2.0`
 - Publication state: v1.1.1 formally published and accepted on 2026-10-02 on GitHub and Gitee; exact CI, independent fresh official audits, production asset/public-readback and isolated Setup/Updater acceptance passed. v1.1.0 remains immutable.
 - Target framework: .NET 10; the repository pins SDK `10.0.401` in `global.json` with `latestFeature` roll-forward.
 - Resolve the SDK through `build/resolve-dotnet.ps1`; it honors the repository pin and bootstraps that SDK when needed. The first run may need network access.
@@ -53,6 +53,8 @@ New V2 clients use `latest-v2.json` and its detached signature. Keep the legacy 
 
 ## Change-Specific Review Checklist
 
+- Multiple-address drafts use `AdapterAddressPlan`; `AdapterAddressManager` owns immediate address/coexistence intents and exact removal; `AdapterAddressBackend` owns stable physical-interface resolution and fresh route/property checks; `MainWindow.Addresses` owns the form, workflow lease and bounded monitor. Preserve default routes, DNS source/values, metric, DHCP and unrelated addresses by before/after readback. `ProbeSource` binds both ICMP and TCP to the assigned source and rejects a target route on another interface. Test cancellation, unknown writes, externally changed properties, pre-existing addresses, corrupt journals, prior-run read-only close, client coexistence/renewal and single-scope isolated DORA separately. 多地址模式不能复用替换模式的整份快照恢复；未识别的系统共存状态禁止写入，异常原件与独立清理证据必须保留。
+
 - Network profiles are drafts until the DHCP, manual-scan, and route sections pass their shared validators. Save, load, and import must state draft/effective status; load fills forms only. Loading empty optional DHCP gateway/DNS fields also clears their text and restores the add-field buttons. Keep DHCP preview/start on the shared scope validator, manual scan on ScanRangePlan, and route preview/apply on shared route validation. Compare server/mask/pool/gateway/DNS/lease, manual IP/mask/target, and normalized route targets as an order-independent multiset with duplicate counts. Normalize IPv4 masks and route CIDRs; do not compare the runtime-computed interface metric as a fixed user input. Adapter ID is preferred, with the existing MAC/name relocation fallback.
 
 - For user-visible changes, cover Chinese and English strings, the initial/loading/empty/error/success states, progress and cancellation for long work, keyboard/accessibility names, and behavior at the 900x560 DIP minimum window size. Keep confirmations and previews on operations that can change network state.
@@ -82,7 +84,7 @@ git status -sb
 git pull --ff-only
 ```
 
-2. Make the scoped change.
+2. Make the scoped change. When a failure occurs, search existing lessons first and follow the [problem-resolution recording workflow](#problem-resolution-records--问题解决记录) before handoff.
 3. Update `docs/FEATURE_CHANGELOG.md` with:
 
 - date
@@ -106,18 +108,41 @@ Count the route smoke as passed only when it exits successfully and prints `ROUT
 
 For the combined T21/T22 administrator acceptance, run `build/admin-acceptance.ps1` from an elevated PowerShell after the Release solution build. It runs the Hyper-V route smoke first and only proceeds to cancellation and independent compensation on the specifically designated isolated Intel X722 adapter after the route gate succeeds. The machine-readable report is `artifacts\acceptance\admin-acceptance.json`; require `passed=true`, `routeSmoke=true`, `routeResourcesClean=true`, and `physicalAdapterCancelCompensation=true`. The wrapper checks for newly retained route-smoke switches, vEthernet adapters, and test-prefix routes even when the route smoke fails; a clean failure report proves cleanup only, not acceptance.
 
+## Problem Resolution Records / 问题解决记录
+
+For every nontrivial failure resolved during code, configuration, test, build, packaging, release or diagnostic work, recording the reusable method is part of completion. Codex follows this repository rule through [AGENTS.md](../AGENTS.md); it is an agent workflow requirement, not a background service or a guarantee that every external Codex session writes documents automatically.
+
+每次修改中解决了有复用价值的问题，必须在交付前记录方法；仅修好了代码或只写“测试通过”不满足本规则。此规则由仓库 AGENTS.md 引导后续 Codex 会话执行，不依赖聊天历史，也不等于全局永久记忆的自动写入。
+
+1. Search [engineering lessons](troubleshooting/engineering-lessons.md), the relevant task and `PROJECT_MEMORY.md` using the error text/module before trying a new workaround. / 先按错误文本与模块检索已有经验，核对是否仍适用。
+2. Extend the matching lesson with symptom, trigger, confirmed cause (or explicit uncertainty), effective steps, verification, applicability/limits and a source/evidence pointer. Keep an unresolved investigation in its task; do not label an unverified hypothesis as a solution. / 补充原条目，注明现象、触发条件、原因或不确定性、有效步骤、验证、适用边界和证据；未解决问题保留在任务中。
+3. Keep durable product/network boundaries in `PROJECT_MEMORY.md`, reusable troubleshooting in the lesson or focused troubleshooting page, chronological changes in `FEATURE_CHANGELOG.md`, and task status only in `TODO.md`. Link these instead of copying logs or creating competing status indexes. / 分别保存稳定边界、排障方法、变更事实和任务状态，通过链接衔接，不复制长日志。
+4. Retain original failures and separate later successful checks. Record regression coverage when it is needed to prevent recurrence; documentation-only work uses lightweight checks. Never document credentials, private keys or signed URL query strings. / 保留原失败，后续成功单独记录；按风险补充必要回归，纯文档使用轻量检查，敏感数据不得入文档。
+5. At handoff, link the updated lesson; if there is no new reusable lesson, state which existing method was reused or that no new conclusion was established. / 交付时链接经验记录；没有新增经验时说明复用来源或本次未得出新结论。
+
+### Reusing a resolution efficiently / 高效复用步骤
+
+1. Start with the [symptom lookup](troubleshooting/engineering-lessons.md#quick-lookup--按症状查找). Record the current commit, SDK/tool version, exact error, operation type (read/write/local fixture) and evidence directory before retrying. / 按症状定位，先固定版本、错误与操作类别，避免把不同失败混为同一原因。
+2. Verify the current contract and reuse the existing resolver/audit/transport/mirror/typed-request entry. If the fixture is invalid, correct the fixture and preserve its failed result; if a remote write is uncertain, query the exact remote identity before deciding whether to resume. / 先核对契约并复用入口；夹具错误先修夹具，未知写入先对账。
+3. Capture only the evidence needed for the unresolved step. Once applicable checks pass, repeat them only for new code/asset changes, failures or remaining uncertainty; inspect a retained exact-commit artifact instead of rebuilding an immutable release. / 先补缺失证据，已通过门禁按变更风险决定是否重跑；正式原件不可为收尾而重建。
+4. Update the matching lesson with the verified result and remaining limits. Keep counters per batch/source and distinguish confirmed repair, recovery observation and pending investigation. / 更新原条目，按批次/源记录数量，明确已修复、恢复观察或待诊断。
+
+The v1.1.1 retrospective is indexed in VERSION-001, AUDIT-001/002, HTTP-001/002, MIRROR-001, REHEARSAL-001, UISMOKE-001, CREDENTIAL-001, SCAN-001 and RECORD-001. DISCOVERY-001 links the separate pending T31 diagnostic; release acceptance does not close that investigation.
+
 ## Runtime Responsibility Map
 
 Keep background work with the narrow owner that can cancel it, observe it, and enforce its state boundary:
 
 | Responsibility | Owner | Boundary |
 |---|---|---|
-| PowerShell process start, timeout, cancellation, output drain, and child cleanup | `PowerShellProcessRunner` | Services keep their own scripts, ordering, ownership checks, and compensation. |
+| PowerShell process start, timeout, cancellation, output drain, and child cleanup | `PowerShellProcessRunner`, DHCP-scoped `PowerShellProcessSession` | Services keep their own scripts, ordering, ownership checks, and compensation. Successful DHCP start retains one warm child on private inherited pipes; failed/canceled start, normal/unexpected stop and exit release it. Each request remains separate from its immediate journal commit. Never replay writes after an uncertain response; stop/reap the child on failure. |
 | Fresh route-planning reads | `StaticRouteService` snapshot reader | Refresh for every preview/apply; preserve per-write identity and ownership checks. |
 | HTTP/HTTPS reachability | `HttpProbeService` | Reuse its owned transport, bound and cancel requests, preserve system TLS validation. |
 | Lease connectivity work | `LeaseProbeCoordinator` | Cap active probes at 8 and pending bindings at 64; validate session/client/IP/generation before applying results. |
+| Visible peer connectivity and known static-IP peers | `PeerConnectivity`, independent `LeaseProbeCoordinator` instance and MainWindow session guard | Keep lease protocol separate; record check/transition time. At most 32 known peers per two-second round-robin batch; cancel on adapter/session changes. Cached web details are not fresh Ping proof. |
+| First-use current route display and shutdown | MainWindow read generation, lifetime cancellation and background-stop task | Startup common tabs require adapters only; explicit refresh still reads all routes. Reject old/canceled display reads; cancel independent background tasks early while keeping real network restoration order and verification. |
 | Scan progress and ordinary operation history | `ScanProgressAccumulator`, `CoalescingSnapshotWriter` | Batch display and history only; critical recovery and DHCP persistence stay immediate. |
-| Session log file and display | `FileLogger`, MainWindow log queue | Keep every file row, bound display backlog at 500, and let support-package reads share an active log. |
+| Session log file and display | `FileLogger`, `LogDisplayBuffer`, MainWindow renderer | Keep every file row; the buffer owns locking, 500-row backlog, 128-row batches, omission count, clear and close. MainWindow owns visibility/rendering/scrolling and records rendered-row omissions. Support-package reads share an active log. |
 | Selected-adapter status refresh | `CoalescedRefreshCoordinator` and MainWindow request identity | Coalesce refresh work and reject stale adapter/workflow generations; never use display data to authorize a write. |
 | Update check/download lifecycle | `UpdateController` | Own tasks and cancellation; MainWindow handles confirmation and presentation. |
 
@@ -157,7 +182,9 @@ Update the version only in `build/Version.props`, review intentional old-version
 
 PE metadata and release transport checks are part of Windows CI. Run `build/tests/pe-version.tests.ps1` with NSIS 3.12, `build/tests/http-resilience.tests.ps1`, `build/tests/release-resilience.tests.ps1` and `python build/tests/python-http.tests.py` with the pinned fallback requirements, plus existing release/mirror/credential regressions. Complete bundle preparation must pass `Assert-NetBootReleaseVersions` before publication. Follow [release resilience rules](RELEASE_PROCESS.md) for retries, verified partial files and uncertain-write reconciliation.
 
-The 2026-10-01 maintenance delivery ended at source version 1.1.0. The 2026-10-02 follow-up prepares a local 1.1.1 draft, including write-redirect and anonymous-fallback regression fixes; formal publication still requires explicit authorization. Test N+1 uses a separate source snapshot, temporary test trust key and owned integration roots; it is not a formal 1.1.1 release. The immutable v1.1.0 tag/assets and frozen legacy manifests must not be rebuilt or replaced. [T30](tasks/T30.md) records implementation and local evidence; T19 remains DONE / ACCEPTED.
+The 2026-10-02 maintenance version 1.1.1 was formally published and accepted from immutable commit/tag `63ff41962737ff83674751776a28af5937fa312a` / `v1.1.1`; see [T30](tasks/T30.md#2026-10-02-正式发布完成--accepted) and [the release process](RELEASE_PROCESS.md) for the exact CI, fresh audits and public/runtime acceptance. Earlier draft, Test N+1 and local NU1900 records remain historical evidence; they do not describe the current publication state. Test-key assets are never formal assets. v1.1.0 and frozen legacy manifests remain immutable, and T19 remains DONE / ACCEPTED. Future publication still requires explicit authorization.
+
+2026-10-02 的 1.1.1 已正式发布并验收；此前未发布草案、Test N+1 和本机 NU1900 保留为历史记录。正式状态与证据见 T30 和发布流程，后续发布仍需明确授权。
 
 ## Local Cleanup Policy
 

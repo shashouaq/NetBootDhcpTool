@@ -12,6 +12,7 @@ public static class ProfileStore
         {
             profile.Dhcp ??= new DefaultDhcpSettings();
             profile.Routes ??= [];
+            profile.Addresses ??= [];
         }
         var status = result.Status == DataLoadStatus.Loaded && profiles.Count == 0
             ? DataLoadStatus.LoadedEmpty
@@ -49,6 +50,8 @@ public static class ProfileStore
             Dns = source.Dhcp.Dns,
             LeaseSeconds = source.Dhcp.LeaseSeconds
         },
+        Addresses = (source.Addresses ?? []).Select(x => x?.Clone() ?? throw new InvalidDataException("Invalid address entry / 无效地址条目")).ToList(),
+        DhcpPreserveAddresses = source.DhcpPreserveAddresses,
         ManualIp = source.ManualIp,
         ManualMask = source.ManualMask,
         ManualTargetIp = source.ManualTargetIp,

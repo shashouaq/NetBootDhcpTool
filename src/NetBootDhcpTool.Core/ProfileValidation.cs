@@ -31,7 +31,8 @@ public enum ProfileIssueCode
     RouteAdapterMissing,
     RouteInvalid,
     RouteAddressFamilyMismatch,
-    DuplicateRoute
+    DuplicateRoute,
+    AddressPlanInvalid
 }
 
 public sealed record ProfileSectionAssessment(ProfileSectionStatus Status, IReadOnlyList<ProfileIssueCode> Issues);
@@ -39,10 +40,11 @@ public sealed record ProfileSectionAssessment(ProfileSectionStatus Status, IRead
 public sealed record NetworkProfileAssessment(
     ProfileSectionAssessment Dhcp,
     ProfileSectionAssessment ManualScan,
-    ProfileSectionAssessment Routes)
+    ProfileSectionAssessment Routes,
+    ProfileSectionAssessment? Addresses = null)
 {
     public ProfileSectionStatus OverallStatus =>
-        Dhcp.Status == ProfileSectionStatus.Invalid || ManualScan.Status == ProfileSectionStatus.Invalid || Routes.Status == ProfileSectionStatus.Invalid
+        Addresses?.Status == ProfileSectionStatus.Invalid || Dhcp.Status == ProfileSectionStatus.Invalid || ManualScan.Status == ProfileSectionStatus.Invalid || Routes.Status == ProfileSectionStatus.Invalid
             ? ProfileSectionStatus.Invalid
             : Dhcp.Status == ProfileSectionStatus.Draft || ManualScan.Status == ProfileSectionStatus.Draft || Routes.Status == ProfileSectionStatus.Draft
                 ? ProfileSectionStatus.Draft
@@ -60,7 +62,15 @@ public static class ProfileValidation
         return new NetworkProfileAssessment(
             AssessDhcp(profile.Dhcp ?? new DefaultDhcpSettings()),
             AssessManualScan(profile.ManualIp, profile.ManualMask, profile.ManualTargetIp),
-            AssessRoutes(profile.Routes ?? []));
+            AssessRoutes(profile.Routes ?? []),
+            AssessAddresses(profile.Addresses ?? []));
+    }
+
+    public static ProfileSectionAssessment AssessAddresses(IReadOnlyList<AdapterAddressDraft> addresses)
+    {
+        if (addresses.Count == 0) return new(ProfileSectionStatus.Empty, []);
+        try { AdapterAddressPlan.Validate(addresses); return new(ProfileSectionStatus.Valid, []); }
+        catch { return new(ProfileSectionStatus.Invalid, [ProfileIssueCode.AddressPlanInvalid]); }
     }
 
     public static ProfileSectionAssessment AssessDhcp(DefaultDhcpSettings settings)

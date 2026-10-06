@@ -6,6 +6,7 @@
   </PropertyGroup>
   <ItemGroup>
     <InternalsVisibleTo Include="NetBootDhcpTool.App" />
+    <InternalsVisibleTo Include="NetBootDhcpTool" />
     <InternalsVisibleTo Include="NetBootDhcpTool.UnitTests" />
   </ItemGroup>
   <ItemGroup>

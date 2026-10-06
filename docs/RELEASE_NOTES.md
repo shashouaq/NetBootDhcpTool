@@ -1,5 +1,29 @@
 ﻿# Release Notes
 
+## v1.2.0
+
+### zh-CN / 简体中文
+
+本版本增加同网卡多 IP 调试，改善对端连通状态，并提升 DHCP 启动和恢复关闭效率。
+
+- 新增“多 IP 调试”页：分别配置业务、带外等网段，追加临时 IPv4 或复用已有地址，保留原地址、网关、DNS 和跃点。方案可保存和加载；加载不会直接修改网络。
+- 支持可验证的 Windows DHCP 客户端与固定 IP 共存。每个网段使用指定本机源地址进行 Ping／HTTP 探测，显示已联通、已离线、已停止监测和变化时间。
+- 只清理本工具新建且归属可确认的地址；异常、外部修改和此前会话的记录可在恢复中心逐项处理。
+- DHCP 服务可保留隔离网卡上的其他固定地址，仍只服务一个明确作用域。多 IP 不替代 VLAN，请勿在共享业务 DHCP 网络启动工具 DHCP 服务。
+- 同机隔离实测中，DHCP 启动中位数由约 30.8 秒降至 12.9 秒，带恢复关闭由约 20.1 秒降至 6.0 秒；实际耗时取决于环境。
+- 已迁移到 V2 的用户可继续使用应用内 Full 7z 更新；旧版用户先运行匹配的 Setup 完成一次完整安装。安装／更新保留用户配置、收藏、历史和日志。
+
+### en-US / English
+
+This release adds multiple-IP debugging on one adapter, clearer peer connectivity, and faster DHCP startup and restoration on close.
+
+- The Multiple IPs page appends temporary IPv4 addresses or reuses existing addresses for business and out-of-band subnets while preserving gateways, DNS and metrics. Profiles save/load drafts without applying network changes.
+- Verified Windows DHCP-client/static coexistence and source-specific Ping/HTTP probes show connected, offline and stopped-monitoring states with change timestamps.
+- Only tool-created addresses with confirmed ownership are cleaned up. Uncertain, externally changed and prior-session recovery records remain available individually in Recovery Center.
+- DHCP serving may retain other static addresses on an isolated interface, with one explicit scope. Multiple IPs do not replace VLANs; do not serve a shared business DHCP network.
+- Paired isolated measurements reduced median DHCP startup from about 30.8 to 12.9 seconds and restoration on close from about 20.1 to 6.0 seconds. Actual timing depends on the environment.
+- V2 users continue using in-app Full 7z updates. Older clients first run the matching Setup once; installation and updates preserve settings, favorites, history and logs.
+
 ## v1.1.1
 
 ### zh-CN

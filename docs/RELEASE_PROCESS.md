@@ -4,7 +4,13 @@ This project uses a single repeatable release path for local packaging, GitHub p
 
 For day-to-day maintenance, required change-log practice, GitHub synchronization, and upgrade work, start with `docs\MAINTENANCE_GUIDE.md`.
 
-## Current accepted formal release — v1.1.1 / 2026-10-02
+Before investigating a repeated release failure, use the [symptom lookup and verified lessons](troubleshooting/engineering-lessons.md#quick-lookup--按症状查找). It links SDK/PE/audit/transport/mirror/rehearsal/credential checks to existing tools; original failures and later successful evidence remain separate.
+
+## Authorized release preparation — v1.2.0 / 2026-10-06
+
+User explicitly authorized formal publication after T32–T36 local and isolated-network acceptance. The single product source now targets 1.2.0; final hosted exact-commit CI, production-signed assets, GitHub publication, independent Gitee synchronization and public/client acceptance are recorded in `D:\Release\_v120_formal_20261006`. Preparation is not completed publication. The previous accepted v1.1.1, older tags/assets and frozen legacy manifest/signature remain immutable; T31 second actual network sampling remains pending. 发布准备不等于发布成功，最终证据在收尾时回填。
+
+## Previous accepted formal release — v1.1.1 / 2026-10-02
 
 Immutable tag `v1.1.1` points to `63ff41962737ff83674751776a28af5937fa312a`. Exact Windows CI [37017710666](https://github.com/shashouaq/NetBootDhcpTool/actions/runs/37017710666) and Formal Release [37018087873](https://github.com/shashouaq/NetBootDhcpTool/actions/runs/37018087873) passed. Both independent audit artifacts cover all 11 source projects/frameworks using fresh official NuGet data and report no vulnerabilities. [GitHub v1.1.1](https://github.com/shashouaq/NetBootDhcpTool/releases/tag/v1.1.1) (401878068) and [Gitee v1.1.1](https://gitee.com/joel20230302/NetBootDhcpTool/releases/tag/v1.1.1) (1180348) are stable; Gitee source/tag match the immutable release commit.
 
@@ -18,7 +24,7 @@ Formal tag `v1.1.0` is immutable at `eee134989cb5a5d1bc787bdca84c838a3e7f82f5`, 
 
 Setup is 33,395,136 bytes, SHA-256 `6428a7e86ef18918f5ff8e176205c14c9890d29a0ce3dc1ab4ddb8f683a7dd66`; Full 7z is 58,271,600 bytes, SHA-256 `82bebcb8ab6b3dbf32b6f28e8e2120a1dbc8631fc0710b6f5cd27f9ecc7fbf06`. Legacy latest.json remained `10d2b102b615c007e81616b9abe15c939b43f212e9667910822b78975e9a48a7` before/after GitHub and Gitee. Latest-v2 and its production signature passed. Older users run Setup once; subsequent releases use in-app Full 7z updates. Both RCs remain prereleases. Keep legacy parsers/ZIP/rollback compatibility and historical releases intact; any retirement is a separate review.
 
-The existing current-user DPAPI credential was reused automatically and cleared in finally. Local GitHub API HTTPS reads experienced EOF before upload; this run used a tag-restricted, bounded read-only Python transport outside the repository, retaining the original mirror publisher's metadata/signature/digest/idempotency and all Gitee uploads/readbacks. This is an operational observation for a later tooling review, not a change to released product bytes. Extra cold-start strict dual-source diagnostics remain visible as failed evidence; required failover discovery/download and installation passed separately. Setup currently identifies 1.1.0 by filename, displayed version and embedded signed manifest; RC and stable have no PE version resource, which can be evaluated separately without rewriting these assets.
+The existing current-user DPAPI credential was reused automatically and cleared in finally. Local GitHub API HTTPS reads experienced EOF before upload; this run used a tag-restricted, bounded read-only Python transport outside the repository, retaining the original mirror publisher's metadata/signature/digest/idempotency and all Gitee uploads/readbacks. This is an operational observation for a later tooling review, not a change to released product bytes. Extra cold-start strict dual-source diagnostics remain visible as failed evidence; required failover discovery/download and installation passed separately. The original 1.1.0 Setup identified its version by filename, display and embedded signed manifest; its RC/stable assets lacked PE version resources. T30 subsequently corrected PE metadata for new 1.1.1 assets; the original 1.1.0 assets remain unchanged.
 
 Evidence: `D:\Release\_t19_formal_finalization_20261001\formal-acceptance-summary.json`, gate/audit/workflow/public-download logs, mirror status/telemetry and isolated typed transaction reports. Source/payload comparison and detailed acceptance are in [T19](tasks/T19.md). Post-publication documentation closure does not move the formal tag or rebuild its assets.
 
@@ -38,12 +44,13 @@ Evidence: `D:\Release\_t19_formal_finalization_20261001\formal-acceptance-summar
 Run these checks before publishing:
 
 ```powershell
-$dotnet = .\build\resolve-dotnet.ps1
-& $dotnet restore .\NetBootDhcpTool.sln
+$taskDotnet = & .\build\resolve-dotnet.ps1
+$auditEvidence = Join-Path ([IO.Path]::GetTempPath()) ('NetBootDhcpTool-audit-' + [Guid]::NewGuid().ToString('N'))
+& .\build\release-pipeline\Invoke-FreshNuGetAudit.ps1 -EvidenceDirectory $auditEvidence -DotnetPath $taskDotnet
 & .\build\verify-maintenance.ps1
-& $dotnet build .\NetBootDhcpTool.sln -c Release --no-restore
-& $dotnet test .\src\NetBootDhcpTool.UnitTests\NetBootDhcpTool.UnitTests.csproj -c Release --no-build --minimum-expected-tests 1
-& $dotnet run --project .\src\NetBootDhcpTool.Tests\NetBootDhcpTool.Tests.csproj -c Release --no-build
+& $taskDotnet build .\NetBootDhcpTool.sln -c Release --no-restore
+& $taskDotnet test .\src\NetBootDhcpTool.UnitTests\NetBootDhcpTool.UnitTests.csproj -c Release --no-build --minimum-expected-tests 1
+& $taskDotnet run --project .\src\NetBootDhcpTool.Tests\NetBootDhcpTool.Tests.csproj -c Release --no-build
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = [Security.Principal.WindowsPrincipal]::new($identity)
 if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -54,7 +61,7 @@ if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))
 git diff --check
 ```
 
-`NetBootDhcpTool.UnitTests` is the MSTest suite; `NetBootDhcpTool.Tests` is a console smoke and must be invoked with `dotnet run`. The UI smoke runs only from a standard-user Windows session; the command block records a skip when elevated, matching CI. Run each check separately and stop at the first failure.
+`NetBootDhcpTool.UnitTests` is the MSTest suite; `NetBootDhcpTool.Tests` is a console smoke and must be invoked with `dotnet run`. The UI smoke runs only from a standard-user Windows session; the command block records a skip when elevated, matching CI. Run each check separately and stop at the first failure; check `$LASTEXITCODE` immediately after each native command. The fresh-audit helper performs restore and rejects audit warnings even when restore exits zero. Keep its new evidence directory; a failed local audit is not a clean report and must remain in the task evidence. Hosted exact-commit CI and the formal job's independent audit are separate mandatory gates before production signing.
 
 For static-route-specific acceptance, follow the [maintenance guide](MAINTENANCE_GUIDE.md#standard-change-workflow); it defines the isolated Hyper-V route smoke and evidence required.
 
@@ -76,9 +83,9 @@ Offline regression entries: `build/tests/http-resilience.tests.ps1`, `release-re
 
 ## Fresh official dependency audit
 
-`build/release-pipeline/Invoke-FreshNuGetAudit.ps1` is shared by Windows CI, RC and the formal build job before signing. It creates a new evidence directory/HTTP cache, restores with --force-evaluate/--no-http-cache, uses only the official NuGet v3 source and audits all transitive dependencies at low severity. It records the dependency graph and a fresh vulnerable-package query, verifies every source project/framework is represented, and rejects NU1900..NU1905, query errors and reported vulnerabilities. Existing evidence is never overwritten; the HTTP cache environment is restored in finally. An unavailable feed is a failed audit, not a clean report. Offline gate regressions are in `build/tests/nuget-audit.tests.ps1`.
+`build/release-pipeline/Invoke-FreshNuGetAudit.ps1` is shared by Windows CI, RC and the formal build job before signing. It creates a new evidence directory/HTTP cache, restores with --force-evaluate/--no-http-cache, uses only the official NuGet v3 source and audits all transitive dependencies at low severity. It verifies all source project paths in both reports and nonempty framework coverage in the unfiltered dependency graph; the separate filtered `--vulnerable` report supplies findings and may omit healthy frameworks. NU1900..NU1905, query errors, missing coverage and reported vulnerabilities fail the gate. Existing evidence is never overwritten; the HTTP cache environment is restored in finally. An unavailable feed is a failed audit, not a clean report. Offline gate regressions are in `build/tests/nuget-audit.tests.ps1`; see AUDIT-001/002 in the [engineering lessons](troubleshooting/engineering-lessons.md).
 
-The 2026-10-02 local 1.1.1 preparation has successful product/tool regressions and test-key bundle checks, but local NuGet TLS/NU1900 prevents fresh audit acceptance. The user subsequently authorized the complete release workflow. Require exact source CI plus the formal job's independent fresh audit before production signing/publication. The current accepted official release remains v1.1.0 until new publication and public acceptance succeed. Test-key assets cannot be uploaded.
+Historical preparation stage, 2026-10-02: local 1.1.1 product/tool regressions and test-key bundle checks passed, while local NuGet TLS/NU1900 blocked audit acceptance. After complete release authorization, exact source CI and the formal job's independent fresh official audit both passed; production signing, GitHub/Gitee publication and public/runtime acceptance then completed. The current accepted release is v1.1.1 as recorded above and in [T30](tasks/T30.md). The original local failure remains evidence, not a current publication status or a repaired-network claim. Test-key assets cannot be uploaded.
 
 ## Installer result and isolation
 

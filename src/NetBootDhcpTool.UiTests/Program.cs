@@ -76,12 +76,21 @@ internal static class Program
         var application = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown };
         var slowLeaseProbeStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var releaseSlowLeaseProbe = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        long manualLatency = 18;
+        var blockManualProbe = false;
+        var manualProbeStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseManualProbe = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var updateRequestStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var uiLogger = new FileLogger(paths);
         var updateHttpClient = new HttpClient(new CancelableUpdateHandler(updateRequestStarted));
         var updateController = new UpdateController(new VersionUpdateService(updateHttpClient), new Version(1, 0, 14));
         var window = new MainWindow(paths, uiLogger, async (request, _) =>
         {
+            if (request.Identity.SessionId.StartsWith("manual-", StringComparison.Ordinal))
+            {
+                if (blockManualProbe) { manualProbeStarted.TrySetResult(); await releaseManualProbe.Task; }
+                return new LeaseProbeResult(request.Identity, manualLatency, null, null);
+            }
             if (request.Identity.ClientKey == "slow-client")
             {
                 slowLeaseProbeStarted.TrySetResult();
@@ -90,6 +99,7 @@ internal static class Program
             return new LeaseProbeResult(request.Identity, 18, request.IncludeWeb ? true : null, request.IncludeWeb ? true : null);
         }, updateController);
         ExerciseAdapterRefreshCommitGuards(window);
+        ExerciseAddressDrafts(window);
         // Model an already-expanded log panel so the periodic (non-forced) 128-row drain is testable.
         ((RichTextBox)window.FindName("LogBox")!).Visibility = Visibility.Visible;
         var observedLogFloodRows = 0;
@@ -492,11 +502,33 @@ internal static class Program
                 }
 
                 var leaseGrid = window.FindName("LeaseGrid") as DataGrid ?? throw new InvalidOperationException("missing DHCP lease grid");
-                if (leaseGrid.Columns.Count != 10
-                    || (leaseGrid.Columns[6] as DataGridTextColumn)?.Binding is not System.Windows.Data.Binding { Path.Path: "StatusText" }
-                    || (leaseGrid.Columns[7] as DataGridTextColumn)?.Binding is not System.Windows.Data.Binding { Path.Path: "SessionText" }
-                    || (leaseGrid.Columns[8] as DataGridTextColumn)?.Binding is not System.Windows.Data.Binding { Path.Path: "PingLatencyMs" })
+                var leaseBindings = leaseGrid.Columns.OfType<DataGridTextColumn>()
+                    .Select(column => (column.Binding as System.Windows.Data.Binding)?.Path.Path).ToArray();
+                if (leaseGrid.Columns.Count != 13
+                    || new[] { "StatusText", "SessionText", "PingLatencyMs", "Connectivity.Text", "Connectivity.ChangedAt", "Connectivity.LastCheckedAt" }.Any(path => !leaseBindings.Contains(path)))
                     throw new InvalidOperationException("DHCP lease state, session history, and Ping must be displayed in separate columns.");
+                var connectionColumn = leaseGrid.Columns.OfType<DataGridTextColumn>().Single(column => column.Binding is System.Windows.Data.Binding { Path.Path: "Connectivity.Text" });
+                if (new[] { "Online", "Offline", "Pending", "Stopped" }.Any(state => !connectionColumn.ElementStyle.Triggers.OfType<DataTrigger>().Any(trigger => Equals(trigger.Value, state))))
+                    throw new InvalidOperationException("connectivity colors do not cover every visible state");
+                var olderRoutes = new TaskCompletionSource<IReadOnlyList<CurrentStaticRoute>>(TaskCreationOptions.RunContinuationsAsynchronously);
+                var newerRoutes = new TaskCompletionSource<IReadOnlyList<CurrentStaticRoute>>(TaskCreationOptions.RunContinuationsAsynchronously);
+                var oldRead = (Task)InvokePrivate(window, "LoadCurrentStaticRoutesAsync", window.Adapters.ToArray(), CancellationToken.None, olderRoutes.Task)!;
+                var newRead = (Task)InvokePrivate(window, "LoadCurrentStaticRoutesAsync", window.Adapters.ToArray(), CancellationToken.None, newerRoutes.Task)!;
+                newerRoutes.SetResult([new CurrentStaticRoute { DestinationPrefix = "198.51.100.0/24", AddressFamily = "IPv4", InterfaceIndex = "99998" }]);
+                await newRead;
+                olderRoutes.SetResult([new CurrentStaticRoute { DestinationPrefix = "192.0.2.0/24", AddressFamily = "IPv4", InterfaceIndex = "99998" }]);
+                await oldRead;
+                if (window.CurrentStaticRoutes.Single().DestinationPrefix != "198.51.100.0/24")
+                    throw new InvalidOperationException("late first-tab route display overwrote the newer snapshot");
+                using (var routeCancel = new CancellationTokenSource())
+                {
+                    var blockedRoutes = new TaskCompletionSource<IReadOnlyList<CurrentStaticRoute>>(TaskCreationOptions.RunContinuationsAsynchronously);
+                    var canceledRead = (Task)InvokePrivate(window, "LoadCurrentStaticRoutesAsync", window.Adapters.ToArray(), routeCancel.Token, blockedRoutes.Task.WaitAsync(routeCancel.Token))!;
+                    routeCancel.Cancel();
+                    await canceledRead.WaitAsync(TimeSpan.FromSeconds(2));
+                    if (window.CurrentStaticRoutes.Count != 0) throw new InvalidOperationException("canceled route read applied a display snapshot");
+                }
+                Console.WriteLine("ROUTE_DISPLAY_LIFETIME_OK late older snapshot rejected; blocked read canceled");
                 var leaseMac = "02-11-22-33-44-55";
                 var oldLease = new NetBootDhcpTool.Dhcp.DhcpLease
                 {
@@ -562,6 +594,77 @@ internal static class Program
                 window.WaitForLeaseProbesAsync().WaitAsync(TimeSpan.FromSeconds(2)).GetAwaiter().GetResult();
                 if (slowRow.Status != "Released" || slowRow.PingLatencyMs != -1 || slowRow.HttpOk || slowRow.HttpsOk)
                     throw new InvalidOperationException("a late probe result restored reachability after its lease was released");
+
+                var connectedLease = new NetBootDhcpTool.Dhcp.DhcpLease
+                {
+                    ClientKey = "connectivity-client", IpAddress = "192.0.2.92", SessionId = probeSession,
+                    Status = "Assigned", LeaseEnd = DateTime.Now.AddHours(1)
+                };
+                window.ProcessLeaseEvent(connectedLease);
+                await window.WaitForLeaseProbesAsync().WaitAsync(TimeSpan.FromSeconds(2));
+                var lastOnline = connectedLease.Time;
+                InvokePrivate(window, "ApplyLeaseProbeResult", new LeaseProbeResult(new(probeSession, connectedLease.ClientKey, connectedLease.IpAddress, 1), -1, null, null));
+                if (connectedLease.Connectivity.State != "Offline" || connectedLease.Status != "Assigned" || connectedLease.Time != lastOnline || connectedLease.HttpOk || connectedLease.HttpsOk)
+                    throw new InvalidOperationException("DHCP disconnection did not update independent connectivity or retained stale web/last-online state");
+                InvokePrivate(window, "ApplyLeaseProbeResult", new LeaseProbeResult(new(probeSession, connectedLease.ClientKey, connectedLease.IpAddress, 1), 2, null, null));
+                if (connectedLease.Connectivity.State != "Online" || connectedLease.Connectivity.LastCheckedAt is null)
+                    throw new InvalidOperationException("DHCP reconnection was not visible");
+
+                var scanGrid = (DataGrid)window.FindName("ScanGrid")!;
+                if (scanGrid.Columns.OfType<DataGridTextColumn>().All(column => column.Binding is not System.Windows.Data.Binding { Path.Path: "Connectivity.Text" }))
+                    throw new InvalidOperationException("manual peer connectivity column missing");
+                var previousAdapter = ((ComboBox)window.FindName("AdapterBox")!).SelectedItem;
+                var previousAdapterSource = ((ComboBox)window.FindName("AdapterBox")!).ItemsSource;
+                ((ComboBox)window.FindName("AdapterBox")!).ItemsSource = window.Adapters;
+                var monitorAdapter = new NetworkAdapterInfo { Id = "synthetic-peer-monitor", InterfaceIndex = "99998", IPv4Address = "192.0.2.1", Name = "Synthetic peer monitor" };
+                window.Adapters.Add(monitorAdapter);
+                ((ComboBox)window.FindName("AdapterBox")!).SelectedItem = monitorAdapter;
+                var monitorRow = new ScanResult { IpAddress = "192.0.2.2", ConfiguredLocalIp = "192.0.2.1", PingOk = true, LatencyMs = 18, HttpOk = true, LastSeen = DateTime.Now };
+                window.ScanResults.Add(monitorRow);
+                window.StartManualPeerMonitoring(monitorAdapter, monitorRow.ConfiguredLocalIp);
+                // The underlying fake workflow remains reserved, so no actual operation can run.
+                // First verify pause, then temporarily clear only the window's owner pointer to exercise monitoring.
+                manualLatency = -1;
+                window.RefreshManualPeerPing();
+                await window.WaitForManualPeerProbesAsync().WaitAsync(TimeSpan.FromSeconds(2));
+                if (monitorRow.Connectivity.State != "Online") throw new InvalidOperationException("monitoring continued during an active workflow");
+                manualLatency = 18;
+                var workflowField = window.GetType().GetField("_activeNetworkWorkflow", BindingFlags.Instance | BindingFlags.NonPublic)!;
+                var heldWorkflow = workflowField.GetValue(window);
+                workflowField.SetValue(window, null);
+                try
+                {
+                var changeTime = monitorRow.Connectivity.ChangedAt;
+                window.RefreshManualPeerPing();
+                await window.WaitForManualPeerProbesAsync().WaitAsync(TimeSpan.FromSeconds(2));
+                if (monitorRow.Connectivity.State != "Online" || monitorRow.Connectivity.ChangedAt != changeTime)
+                    throw new InvalidOperationException($"unchanged online check reset the transition timestamp: state={monitorRow.Connectivity.State}, before={changeTime:o}, after={monitorRow.Connectivity.ChangedAt:o}, selected={(((ComboBox)window.FindName("AdapterBox")!).SelectedItem is NetworkAdapterInfo selectedMonitor ? selectedMonitor.Id + "/" + selectedMonitor.IPv4Address : "none")}");
+                var lastSeen = monitorRow.LastSeen;
+                manualLatency = -1;
+                window.RefreshManualPeerPing();
+                await window.WaitForManualPeerProbesAsync().WaitAsync(TimeSpan.FromSeconds(2));
+                if (monitorRow.Connectivity.State != "Offline" || monitorRow.PingOk || monitorRow.HttpOk || monitorRow.LastSeen != lastSeen)
+                    throw new InvalidOperationException("manual peer disconnection remained assigned/online or advanced last-online time");
+                manualLatency = 3;
+                window.RefreshManualPeerPing();
+                await window.WaitForManualPeerProbesAsync().WaitAsync(TimeSpan.FromSeconds(2));
+                if (monitorRow.Connectivity.State != "Online" || !monitorRow.PingOk)
+                    throw new InvalidOperationException("manual peer reconnection was not visible");
+                blockManualProbe = true;
+                window.RefreshManualPeerPing();
+                await manualProbeStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+                ((ComboBox)window.FindName("AdapterBox")!).SelectedItem = previousAdapter;
+                releaseManualProbe.TrySetResult();
+                await window.WaitForManualPeerProbesAsync().WaitAsync(TimeSpan.FromSeconds(2));
+                if (monitorRow.Connectivity.State != "Stopped")
+                    throw new InvalidOperationException("late manual peer result revived a stopped adapter session");
+                window.ScanResults.Remove(monitorRow);
+                window.Adapters.Remove(monitorAdapter);
+                ((ComboBox)window.FindName("AdapterBox")!).ItemsSource = previousAdapterSource;
+                ((ComboBox)window.FindName("AdapterBox")!).SelectedItem = previousAdapter;
+                }
+                finally { workflowField.SetValue(window, heldWorkflow); }
+                Console.WriteLine("PEER_CONNECTIVITY_OK DHCP online/offline/reconnected; manual online/offline/reconnected/stopped; late results rejected");
 
                 var currentSessionMac = "02-11-22-33-44-66";
                 window.GetType().GetField("_activeDhcpUiSessionId", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(window, "current-session");
@@ -917,6 +1020,8 @@ internal static class Program
                 closeRequested = true;
                 closeRequestedAt = DateTime.UtcNow;
                 window.Close();
+                if (window.GetType().GetField("_backgroundStopTask", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(window) is not Task)
+                    throw new InvalidOperationException("closing waited for the active workflow before beginning background cancellation");
                 return;
             }
             catch (Exception ex) when (!fixturesStarted && (DateTime.UtcNow - started).TotalSeconds < 15)
@@ -971,6 +1076,11 @@ internal static class Program
                 failed = true;
                 Console.Error.WriteLine("UI_SMOKE_FAILED: close did not cancel and wait for the active operation.");
             }
+            if (updateController.State.IsChecking)
+            {
+                failed = true;
+                Console.Error.WriteLine("UI_SMOKE_FAILED: update check was not canceled while awaiting network recovery.");
+            }
             InvokePrivate(window, "EndNetworkWorkflow", owner);
             ownerReleased = true;
         };
@@ -978,6 +1088,48 @@ internal static class Program
         timer.Start();
         application.Run();
         return failed ? 1 : 0;
+    }
+
+    private static void ExerciseAddressDrafts(MainWindow window)
+    {
+        var before = InvokePrivate<NetworkProfile>(window, "CaptureCurrentProfile", "before", "");
+        try
+        {
+            var profile = ProfileStore.Clone(before);
+            profile.Addresses = [new() { AdapterId = "ui-address-adapter", Name = "OOB", IpAddress = "198.51.100.10", SubnetMask = "255.255.255.0", TargetIp = "198.51.100.20" }];
+            profile.DhcpPreserveAddresses = true;
+            InvokePrivate(window, "LoadProfileIntoForms", profile);
+            var captured = InvokePrivate<NetworkProfile>(window, "CaptureCurrentProfile", "captured", "");
+            if (captured.Addresses.Count != 1 || captured.Addresses[0].Name != "OOB" || !captured.DhcpPreserveAddresses
+                || captured.Addresses[0].TargetIp != "198.51.100.20") throw new InvalidOperationException("Multi-address UI profile lost data");
+            var preview = InvokePrivate<string>(window, "BuildAddressPreview");
+            if (!preview.Contains("198.51.100.10/24")) throw new InvalidOperationException("Address preview missing planned IP");
+            var grid = (DataGrid)window.FindName("AddressDraftGrid")!;
+            grid.SelectedItem = captured.Addresses[0];
+            if (window.FindName("TabAddresses") is not TabItem || window.FindName("BtnAddressProbe") is not Button)
+                throw new InvalidOperationException("Multi-address controls missing");
+            var managerField = window.GetType().GetField("_addressManager", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            var originalManager = (AdapterAddressManager)managerField.GetValue(window)!;
+            var startupIds = (HashSet<string>)window.GetType().GetField("_startupAddressRecoveryIds", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(window)!;
+            var entry = new OwnedAdapterAddress { AdapterId = "ui-prior-address-adapter", IpAddress = "198.51.100.10", PrefixLength = 24, State = "Applied" };
+            var priorJournal = new AdapterAddressJournal { Addresses = [entry] };
+            var temporaryManager = new AdapterAddressManager(new WindowsAdapterAddressBackend(new NetworkAdapterService((ILogger)window.GetType().GetField("_logger", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(window)!)), priorJournal, _ => { });
+            try
+            {
+                managerField.SetValue(window, temporaryManager); startupIds.Add(entry.Id);
+                var recoveries = InvokePrivate<List<RecoveryEntryViewModel>>(window, "BuildRecoveryEntries");
+                if (!recoveries.Any(x => x.Kind == RecoveryEntryKind.AdapterAddress)) throw new InvalidOperationException("Address absent in Recovery Center");
+                InvokePrivate<Task>(window, "CleanupOwnedAddressesAsync", CancellationToken.None).GetAwaiter().GetResult();
+                if (priorJournal.Addresses.Count != 1) throw new InvalidOperationException("Read-only exit removed prior-session address recovery");
+            }
+            finally
+            {
+                startupIds.Remove(entry.Id); managerField.SetValue(window, originalManager);
+                JsonStore.Save(InvokePrivate<string>(window, "get_AddressJournalPath"), originalManager.Journal);
+            }
+            Console.WriteLine("MULTI_ADDRESS_UI_OK profileRoundtrip=1 draftOnly=1 preview=1 priorRecoveryPreserved=1 recoveryCenter=1");
+        }
+        finally { InvokePrivate(window, "LoadProfileIntoForms", before); }
     }
 
     private static AutomationElement? FindByName(AutomationElement root, string name) =>
@@ -1168,7 +1320,7 @@ internal static class Program
         var beforeAdapters = adapterService.GetAdapters(logAdapters: false);
         var beforeRoutes = await routeService.GetCurrentStaticRoutesAsync();
 
-        var refresh = (Task)InvokePrivate(window, "RefreshAdaptersAsync", true, CancellationToken.None)!;
+        var refresh = (Task)InvokePrivate(window, "RefreshAdaptersAsync", true, CancellationToken.None, true)!;
         await refresh.WaitAsync(TimeSpan.FromSeconds(20));
 
         var afterAdapters = adapterService.GetAdapters(logAdapters: false);

@@ -27,6 +27,10 @@ public static class ProfileComparer
         Diff("ManualMask", Mask(saved.ManualMask), Mask(current.ManualMask));
         Diff("ManualTargetIp", Ip(saved.ManualTargetIp), Ip(current.ManualTargetIp));
 
+        Diff("DhcpPreserveAddresses", saved.DhcpPreserveAddresses.ToString(), current.DhcpPreserveAddresses.ToString());
+        string AddressKey(AdapterAddressDraft x) => string.Join("|", x.AdapterId.Trim(), x.Name.Trim(), Ip(x.IpAddress), Mask(x.SubnetMask), Ip(x.TargetIp));
+        Diff("Addresses", string.Join(";", (saved.Addresses ?? []).Select(AddressKey).Order(StringComparer.OrdinalIgnoreCase)),
+            string.Join(";", (current.Addresses ?? []).Select(AddressKey).Order(StringComparer.OrdinalIgnoreCase)));
         var savedRoutes = (saved.Routes ?? []).Select(RouteKey).GroupBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
             .ToDictionary(x => x.Key, x => x.Select(y => y.Display).ToList(), StringComparer.OrdinalIgnoreCase);
         var currentRoutes = (current.Routes ?? []).Select(RouteKey).GroupBy(x => x.Key, StringComparer.OrdinalIgnoreCase)

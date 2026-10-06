@@ -50,8 +50,8 @@ ShowUnInstDetails show
 !define MUI_ABORTWARNING
 !define MUI_CUSTOMFUNCTION_ABORT OnUserCancel
 !define MUI_LANGDLL_ALLLANGUAGES
-!define MUI_WELCOMEPAGE_TEXT "This release introduces the new automatic update system. Run this Setup.exe once; it will verify and download the matching Full 7z from the available release mirrors. For offline installation, place the matching Full 7z beside Setup.exe. User settings and data in LocalAppData are preserved. Future updates use the in-app 7z updater.$\r$\n$\r$\n本版本升级了更新机制。运行本 Setup.exe 一次即可；安装程序会校验并从可用发布镜像下载对应的 Full 7z。离线安装时，可将匹配的 Full 7z 放在 Setup.exe 同目录。用户配置和 LocalAppData 中的数据会保留；后续版本使用应用内 7z 自动更新。"
-!define MUI_DIRECTORYPAGE_TEXT_TOP "Choose the existing NetBootDhcpTool folder to migrate it in place. If this is an older portable copy and setup cannot detect it, browse to that folder. Do not choose the LocalAppData user-data folder.$\r$\n请选择现有 NetBootDhcpTool 程序目录以原位迁移。若旧便携版未被自动识别，请浏览选择旧程序目录。不要选择 LocalAppData 用户数据目录。"
+!define MUI_WELCOMEPAGE_TEXT "New install: choose a program folder. Older ZIP version: run Setup once to migrate, then use in-app updates. With the new updater: update in-app or use Setup to update in place.$\r$\n$\r$\nSetup verifies the matching Full 7z from release mirrors or beside Setup.exe (offline). User settings and data are preserved.$\r$\n$\r$\n新安装：选择程序目录。旧 ZIP 版：运行一次 Setup 迁移，后续使用应用内更新。已有新版更新器：可应用内更新，也可用 Setup 原位更新。$\r$\n$\r$\nSetup 会校验发布镜像或同目录的匹配 Full 7z（离线）。已有用户配置和数据会保留。"
+!define MUI_DIRECTORYPAGE_TEXT_TOP "New installation: use the default or another program folder. Migration or update: select the existing NetBootDhcpTool program folder; browse to it if detection missed it. Do not select the LocalAppData user-data folder.$\r$\n新安装：使用默认目录或其他程序目录。迁移或更新：选择现有 NetBootDhcpTool 程序目录；未自动识别时请手动选择。不要选择 LocalAppData 用户数据目录。"
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES

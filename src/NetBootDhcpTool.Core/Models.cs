@@ -209,6 +209,8 @@ public sealed class NetworkProfile
     public string ManualMask { get; set; } = "";
     public string ManualTargetIp { get; set; } = "";
     public List<StaticRouteRule> Routes { get; set; } = [];
+    public List<AdapterAddressDraft> Addresses { get; set; } = [];
+    public bool DhcpPreserveAddresses { get; set; }
     public DateTime CreatedAt { get; set; } = DateTime.Now;
     public DateTime UpdatedAt { get; set; } = DateTime.Now;
 
@@ -232,6 +234,8 @@ public sealed class AdapterMacBackup
 public sealed class ScanResult
 {
     private string _statusOverride = "";
+    [JsonIgnore]
+    public PeerConnectivity Connectivity { get; } = new();
     public string ConfiguredLocalIp { get; set; } = "";
     public string IpAddress { get; set; } = "";
     public bool PingOk { get; set; }
@@ -240,11 +244,13 @@ public sealed class ScanResult
     public string Hostname { get; set; } = "";
     public bool HttpOk { get; set; }
     public bool HttpsOk { get; set; }
-    public string StatusText => !string.IsNullOrWhiteSpace(_statusOverride) ? _statusOverride : PingOk ? "Online / 在线" : "Offline / 离线";
+    public string StatusText => Connectivity.LastCheckedAt.HasValue || Connectivity.State == "Stopped"
+        ? Connectivity.Text : !string.IsNullOrWhiteSpace(_statusOverride) ? _statusOverride : PingOk ? "Connected / 已联通" : "Offline / 已离线";
     public string WebText => HttpOk && HttpsOk ? "HTTP, HTTPS" : HttpOk ? "HTTP" : HttpsOk ? "HTTPS" : "";
-    public DateTime LastSeen { get; set; } = DateTime.Now;
+    public DateTime LastSeen { get; set; } = DateTime.MinValue;
+    public string LastSeenText => LastSeen == DateTime.MinValue ? "" : LastSeen.ToString("MM-dd HH:mm:ss");
     public string Remark { get; set; } = "";
-    public void SetWaitingStatus() => _statusOverride = "Assigned / 已配置";
+    public void SetWaitingStatus() => _statusOverride = "Checking / 待探测";
     public void ClearStatusOverride() => _statusOverride = "";
 }
 

@@ -11,3 +11,6 @@ artifacts/release-repair/
 *.suo
 __pycache__/
 *.pyc
+# Local administrator handoffs, diagnostic caches and acceptance evidence.
+.codex/
+artifacts/
