@@ -82,6 +82,8 @@ This is an index of reusable methods, not a task-status list. Follow the [record
 
 ## MIRROR-001 — Gitee attachments use a separate API / Gitee 附件不能套用 GitHub 响应结构
 
+2026-10-06 文档收尾复用补充：外部源码读回脚本在 Gitee main 快进推送 exit 0 后报 tag mismatch，单 tag REST 入口也不可用。精确匿名 Git refs 显示 main 为文档提交 `f9b5d435b85886c55b93959e8e172bfe139146c5`、annotated tag 为 `91b008943cec433509515906a7feacf377a05836`、peeled commit 仍为正式 `a92898c9981a8e09d6222a9eb53be826dbfe1d84`。已确认外部消费方式错误：`Get-MirrorJson` 用 `return ,array` 保留根数组，直接将函数输出管给 Where-Object 会把整个数组当一项，得到零 tag；先赋值再枚举该数组得到唯一匹配，branch/tag API 与 Git refs 一致。原推送不重放、标签／附件不重建；保留失败与 `gitee-closure-readback.json`。后续调用需复用当前响应根形态，不删掉 empty-array 保护，不将夹具误判写成发布缺失；证据 `D:\Release\_v120_formal_20261006`。
+
 - Symptom / 现象：仓库外补充验收脚本读取 `.assets.links` 或 `.assets`，在真实 Gitee Release metadata 中找不到预期资产。
 - Confirmed cause / 已确认原因：补充脚本假设错误，不是已发布包缺失。Gitee Release 附件由 `/releases/{releaseId}/attach_files` 独立接口提供，不能直接套用 GitHub assets 对象。
 - Effective steps / 有效步骤：先读取当前响应与仓库已实现契约，复用 [Publish-GiteeMirror.ps1](../../scripts/Publish-GiteeMirror.ps1) 的 `Get-GiteeAttachmentsForMirror`、`Get-GiteeMirrorDownloadUrl`；按当前正式资产清单精确文件名/附件 ID 核对。排除 Gitee 自动生成的源码 zip/tar.gz，同名重复或不同字节硬失败，不为“修验收”删除附件或重新上传。
