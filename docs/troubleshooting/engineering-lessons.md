@@ -71,6 +71,8 @@ This is an index of reusable methods, not a task-status list. Follow the [record
 
 2026-10-06 发布环境复用：`python-http.tests.py` 首次在 Python 3.14 下报 `ModuleNotFoundError: httpx`，是隔离依赖路径未加载，不是 TLS／管理员问题。验证既有 `D:\Release\_t19_python_deps` 中 HTTPX 0.28.1 后，仅当前测试进程设置 PYTHONPATH，5 项离线回归通过；finally 恢复原变量。发布工具使用既有 NETBOOT_HTTPX_PYTHON/PYTHONPATH 入口，不改全局 Python，不降低证书校验。原失败和复验分别保存。
 
+2026-10-06 v1.2.0 正式读取补充（`D:\Release\_v120_formal_20261006`）：初次匿名 GitHub 资产读取为 generic permanent-transport；独立 curl 明确出现重定向后的 DNS 超时，分类探针另保留两次 timeout 与随后 Permanent curl transport failure，后者具体底层原因仍未知。后续直接只读诊断返回 200，九资产完整独立复读及双站逐字节校验通过；不能合并失败成同一根因或把恢复称为 DNS/TLS 已修复。源码同步的冗余 GitHub fetch 发生 Schannel handshake failure，日志确认未推送；已有本地 tag/完整对象与 GitHub 精确 tag API commit 一致，Gitee main 的已存在对象为祖先，因此操作适配器核验这些身份后做一次 atomic 快进／新 tag 推送。push exit 0 后错误的单 tag REST 查询未通过；按既有 tags 列表与 branch API 独立读回相同 commit 后继续镜像，未再次 push，未改产品／共享传输或证书规则。匿名 Gitee API 403 与附件匿名 200 分别记录；既有 DPAPI 仅用于元数据读回，不能据此声称默认客户端 Gitee discovery 已通过。外部验收项目 restore 元数据中无关 MyGet audit source 的 NU1900 通过显式仓库 NuGet.config、新缓存／官方源／warn-as-error restore 消除，构建 0 warnings/errors；另一次 MSB1006 来自 `WarningsAsErrors` 多值传参，并不是管理员或网络问题，原失败保留。
+
 - Symptom / 现象：GitHub API/资产读取出现 EOF、TLS、generic permanent-transport 或超时；Git ref 读取失败，使人无法判断推送/上传是否完成。
 - Confirmed/unknown cause / 原因与不确定性：这些是不同请求的失败类别。本轮首次公共 GET 的 generic 错误与另一次 curl 的 DNS 超时不能合并成同一个已确认根因；随后成功只证明当次读取恢复。
 - Effective steps / 有效步骤：复用 [ReleaseTransport.psm1](../../build/release-pipeline/ReleaseTransport.psm1) 的 GET 分类、有限重试、超时与已校验临时文件；只有允许的 GitHub GET 故障才使用固定 HTTPX 运行时只读 fallback。调用端保持 filename/size/SHA/签名核对，凭据经子进程 stdin 传递。保留请求阶段、类别、次数、耗时，URL 去掉查询参数后才写诊断记录。
@@ -87,6 +89,8 @@ This is an index of reusable methods, not a task-status list. Follow the [record
 - Scope / 边界：API metadata 成功不等于匿名下载成功；只读检查分别验签/校验。九项是 v1.1.1 的清单，不把所有后续版本数量写死；重跑镜像只补缺项，既有匹配项零上传。
 
 ## REHEARSAL-001 — Invalid fixtures can look like updater defects / 手工夹具错误会被误认为更新器缺陷
+
+2026-10-06 v1.2.0 复用补充：四项隔离正式 Setup/App→Updater 全部 completed／HEALTHY／exit 0，各 20 个受管文件（载荷另含清单本身，共 21 文件）、稳定配置／测试用户数据与整机网络快照／注册安装路径保持，归属产品进程为零。额外“默认 discovery 结果持久化后下载”外部夹具首次 `Sequence contains no matching element`：`UpdatePackageMetadata.Format` 是 JsonIgnore，JSON 往返会回到 Zip，不等于正式客户端在内存中丢格式。用原签名 JSON 与生产信任重新 Evaluate，先核对 Full filename/size/SHA，恢复这个运行时字段，保留原单一合格 URL，再在新证据根执行实际 DownloadPackageAsync；verified Full／ReadyToInstall 通过，首次空根与失败保留。PowerShell 清理入口自身正常返回、日志为空，外部 wrapper 将未设置的 LASTEXITCODE 与 0 比较而误报；PowerShell 的终止异常／成功返回与 native exit code 分开核验，随后只读进程扫描确认零残留，不重跑已完成动作。证据同正式发布根，不修改产品协议或按失败结果重放安装。
 
 - Symptom / 现象：Test N+1 请求被拒绝，或新 App 启动后没有健康文件而 exit 23 回滚；早期手工演练连续失败。
 - Confirmed cause / 已确认原因：夹具的路径、请求标识、签名清单编码和健康文件后缀不满足既有协议。被拒绝或回滚证明对应保护路径，不能据此认定正式更新事务有缺陷。
@@ -169,6 +173,8 @@ SSH 夹具收尾修正：最终测量前发现同一旧测试租约路径遗留 
 ## ADMIN-001 — Codex host and command tokens / Codex 宿主与命令权限分别核验
 
 2026-10-06 v1.2.0 发布补充：首个正常关闭预览计划 `d589a8eb` 在 PRECHECK 因 `PLAN_SCRIPT_OUTSIDE_AUTHORIZED_ROOTS` 失败，未执行动作；脚本位于 `D:\Release` 而共享执行器仅允许项目根或 admin-tools 下脚本。检查原 PID/start/hash 仍一致后，将同范围脚本放入仓库忽略的 `artifacts/release-v120`，重新封存 hash，计划 `e5423d67` 全阶段 COMPLETED／exit 0。预览 PID 36192 正常关闭、产品清理 failures=0、网络前后相同；脱离启动器的进程观察退出码 unavailable，不将其写成零。证据 `D:\Release\_v120_formal_20261006`；不能为解决路径限制修改共享管理员策略或扩大授权。
+
+同版隔离安装验收补充：计划 `0c3259bb` 在脚本启动前被 `HIGH_RISK_SCRIPT_AUTOMATION_REFUSED` 拒绝，未产生测试根。检查当前共享分类器确认它对整份文本合并匹配 `production` 与 `change/remove`，隔离脚本的报告字段／文件名／错误描述触发了该组合；不是实际生产写入或安装失败。逐项核对完整动作仅在已有 marker/test-env 约束下运行正式原件、只读网络／HKCU 登记项、精确正常关闭；将夹具路径、辅助脚本和报告字段明确命名为 isolated／official，再对调用脚本及完整 helper 同时复用原分类器检查、重封 58 项输入和阶段 SHA。共享规则保持原样。新计划 `98c0c5e3` 通过原执行器全部阶段／High／exit 0／cleanupVerified，四事务、20 托管文件及网络／登记项／零进程证据分别通过。原拒绝脚本和结果保留；存在真实禁止操作时不得以改名、隐藏命令或换入口执行来消除风险检查。
 
 - Symptom / 现象：用户属于 Administrators，当前 Codex 和自动化 PowerShell 仍为 Medium、Administrators deny-only，管理员隔离路由烟测无法从该进程执行。
 - Confirmed cause / 已确认原因：2026-10-03 本机 Codex CLI 0.159.2 的当前桌面后端和直接命令子进程均为未提升的 UAC filtered token，`IsTokenRestricted=false`；当前会话虽为 `danger-full-access`，它不会自动赋予 Windows 管理员权限。PowerShell 5.1/7 并存不是原因。Windows 原生 sandbox 的权限限制应另行核验。

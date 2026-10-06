@@ -33,6 +33,14 @@ The initial formal v1.1.1 ordinary check reported `gitee.com: A task was cancele
 
 机器当前仅一条可用外网上联，另一个物理接口为 APIPA/无网关；Hyper-V 虚拟网卡共用该上联，不算第二网络。没有修改办公网络来制造条件。第二实际网络未提供，T31 仍按 TODO 保持待验收。本次已补齐本机阶段证据和可复用 harness，历史 TLS 根因仍未知。
 
+## 2026-10-06 v1.2.0 formal release observation / 正式发布读取观察
+
+独立于上述 v1.1.1 observer 数据集，`v1.2.0` 的精确发布提交为 `a92898c9981a8e09d6222a9eb53be826dbfe1d84`，本轮 external harness 使用当前相同源码 Core／SDK 10.0.401，证据 `D:\Release\_v120_formal_20261006`。首个真实默认 CheckAsync：Gitee latest API 返回 403、GitHub latest 清单在每源 8 秒预算内取消，Succeeded=false／未验签／零镜像。首个 canonical GitHub 单源同样取消，两个失败根分别保存；不算通过。
+
+独立 Resolve-DnsName 只读查询 github.com、release-assets.githubusercontent.com、gitee.com 均成功，各约 11 秒。随后 canonical 两站实际 CheckAsync 均验签成功并各测速一个来源；两个原签名 JSON/签名完全相同，再以生产验证器取得原已批准两个 URL，控制仅首包请求失败和其优先级，实际 DownloadPackageAsync 两向切换及完整 size/SHA 校验通过。这证明当次明确版本直达读取／下载，不替代默认 latest API。独立默认复查 Succeeded=true／签名通过／v1.2.0，但仅一个 GitHub 合格镜像；其真实持久化结果的 Full 下载也通过。严格双源默认检查仍失败，原始报告保留。DNS 查询与失败是不同请求，不能据此认定 .NET 每次取消或旧 TLS 错误的原因已确认；后续恢复亦不证明冷启动已修复。
+
+Gitee API 元数据独立匿名读回出现 403，使用既有 DPAPI 正当认证完成发布／附件身份对账；九项附件下载均无凭据、经公开 HTTPS 成功。客户端检查与下载完全匿名，不把发布工具认证/fallback 注入产品。第二个真实网络未采样，历史 TLS 原因未知；本版发布和四项隔离安装验收不关闭 TODO 中 T31，不将 v1.2.0 数据合并到上方 v1.1.1 的 30 次统计。
+
 ## Repeat the observation / 复查方法（原观察入口）
 
 First check the source/environment and use a new output filename. The saved external Observer source/project and original results remain in the evidence root. Resolve the pinned SDK through the repository entry; do not use PATH `dotnet` as proof that SDK 10.0.401 is installed.

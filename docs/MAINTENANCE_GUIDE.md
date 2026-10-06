@@ -17,7 +17,7 @@ The 2026-09-23 audit baseline and unperformed real-network checks are recorded i
 - Default branch: `main`
 - Release tag format: `v<version>`
 - Current application version: `1.2.0`
-- Publication state: v1.1.1 formally published and accepted on 2026-10-02 on GitHub and Gitee; exact CI, independent fresh official audits, production asset/public-readback and isolated Setup/Updater acceptance passed. v1.1.0 remains immutable.
+- Publication state: v1.2.0 formally published on 2026-10-06 on GitHub and Gitee; exact CI, independent fresh official audits, nine public assets/byte comparison, canonical client checks/download failover and four isolated Setup/Updater transactions passed. Default discovery recheck qualified one GitHub mirror; initial cold failures and Gitee API 403 remain separate T31 observations. v1.1.1 and earlier releases remain immutable. See RELEASE_PROCESS for evidence and boundaries.
 - Target framework: .NET 10; the repository pins SDK `10.0.401` in `global.json` with `latestFeature` roll-forward.
 - Resolve the SDK through `build/resolve-dotnet.ps1`; it honors the repository pin and bootstraps that SDK when needed. The first run may need network access.
 - Legacy GitHub manifest URL (frozen for ZIP-only clients):
@@ -182,9 +182,9 @@ Update the version only in `build/Version.props`, review intentional old-version
 
 PE metadata and release transport checks are part of Windows CI. Run `build/tests/pe-version.tests.ps1` with NSIS 3.12, `build/tests/http-resilience.tests.ps1`, `build/tests/release-resilience.tests.ps1` and `python build/tests/python-http.tests.py` with the pinned fallback requirements, plus existing release/mirror/credential regressions. Complete bundle preparation must pass `Assert-NetBootReleaseVersions` before publication. Follow [release resilience rules](RELEASE_PROCESS.md) for retries, verified partial files and uncertain-write reconciliation.
 
-The 2026-10-02 maintenance version 1.1.1 was formally published and accepted from immutable commit/tag `63ff41962737ff83674751776a28af5937fa312a` / `v1.1.1`; see [T30](tasks/T30.md#2026-10-02-正式发布完成--accepted) and [the release process](RELEASE_PROCESS.md) for the exact CI, fresh audits and public/runtime acceptance. Earlier draft, Test N+1 and local NU1900 records remain historical evidence; they do not describe the current publication state. Test-key assets are never formal assets. v1.1.0 and frozen legacy manifests remain immutable, and T19 remains DONE / ACCEPTED. Future publication still requires explicit authorization.
+The current formal version 1.2.0 was published from immutable commit/tag `a92898c9981a8e09d6222a9eb53be826dbfe1d84` / `v1.2.0`; see [the release process](RELEASE_PROCESS.md) for exact CI, fresh audits, public/client/runtime acceptance and distinct T31 discovery observations. The accepted 2026-10-02 v1.1.1 commit/tag `63ff41962737ff83674751776a28af5937fa312a` / `v1.1.1` remains historical and immutable; see [T30](tasks/T30.md#2026-10-02-正式发布完成--accepted). Earlier draft, Test N+1 and local NU1900 records do not describe the current publication state. Test-key assets are never formal assets. Older releases and frozen legacy manifests remain immutable, and T19 remains DONE / ACCEPTED. Future publication still requires explicit authorization.
 
-2026-10-02 的 1.1.1 已正式发布并验收；此前未发布草案、Test N+1 和本机 NU1900 保留为历史记录。正式状态与证据见 T30 和发布流程，后续发布仍需明确授权。
+2026-10-06 的 1.2.0 已正式发布并完成双站原件、客户端直达清单／下载切换及四项隔离安装升级验收；默认发现复查只有一个合格镜像，不关闭 T31。1.1.1 及此前草案、Test N+1、本机 NU1900 保留为历史记录；正式状态与证据见发布流程，后续发布仍需明确授权。
 
 ## Local Cleanup Policy
 
